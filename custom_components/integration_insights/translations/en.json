@@ -1,0 +1,12 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "description": "Measure how much CPU time each integration uses on the event loop and in threads."
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Integration Insights is already set up."
+    }
+  }
+}
