@@ -39,6 +39,11 @@ platform = "linux"
 strict = true
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+# Home Assistant re-exports names from its component packages.
+module = "homeassistant.*"
+implicit_reexport = true
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"

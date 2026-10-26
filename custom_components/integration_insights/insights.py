@@ -13,7 +13,7 @@ from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.loader import IntegrationNotLoaded, async_get_loaded_integration
 
 from .attribution import PackageIndex, build_library_map, load_package_index
-from .collector import Collector
+from .collector import WINDOW_MINUTES, Collector
 from .sampler import Sampler, SamplerError
 
 _LOGGER = logging.getLogger(__name__)
@@ -144,8 +144,8 @@ class Insights:
             requirements[domain] = integration.requirements
         self.collector.library_map = build_library_map(requirements, index)
 
-    def report(self) -> dict[str, Any]:
-        """Return the current report."""
+    def report(self, minutes: int = WINDOW_MINUTES) -> dict[str, Any]:
+        """Return the report over the last `minutes`."""
         self.drain()
         sampler = self.sampler
         samples = max(sampler.count, 1)
@@ -159,5 +159,5 @@ class Insights:
                 "backoffs": sampler.backoffs,
                 "running_minutes": round((time.monotonic() - self.started) / 60, 1),
             },
-            **self.collector.report(time.monotonic(), self.started),
+            **self.collector.report(time.monotonic(), self.started, minutes),
         }

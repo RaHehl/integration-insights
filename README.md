@@ -12,6 +12,8 @@ A custom integration for Home Assistant that shows how much CPU time each integr
 
 The report contains code locations only (file, function, line). It contains no arguments, local variables or local paths.
 
+- The sidebar panel "Integration Insights" (admins only) shows the same numbers live, for the last 5, 15 or 60 minutes. Each integration opens to its hot spots, libraries, triggers, config entries and stacks, and can be copied as text for a bug report.
+
 Planned: CPU of executor jobs and threads, a watchdog for event loop blocks, and a report with code excerpts and hints.
 
 Linux only, 64-bit (Home Assistant OS, Container, Core on Linux).

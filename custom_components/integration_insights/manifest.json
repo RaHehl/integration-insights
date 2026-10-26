@@ -3,6 +3,7 @@
   "name": "Integration Insights",
   "codeowners": ["@RaHehl"],
   "config_flow": true,
+  "dependencies": ["frontend", "http", "panel_custom", "websocket_api"],
   "documentation": "https://github.com/RaHehl/integration-insights",
   "integration_type": "service",
   "iot_class": "calculated",

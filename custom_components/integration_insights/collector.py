@@ -179,11 +179,13 @@ class Collector:
         line = table[2][index] if index >= 0 else None
         return line if line is not None else code.co_firstlineno
 
-    def report(self, now: float, started: float) -> dict[str, Any]:
-        """Build the report over the window."""
-        first_minute = int(now // 60) - WINDOW_MINUTES + 1
+    def report(
+        self, now: float, started: float, minutes: int = WINDOW_MINUTES
+    ) -> dict[str, Any]:
+        """Build the report over the last `minutes` (the current one included)."""
+        first_minute = int(now // 60) - min(minutes, WINDOW_MINUTES) + 1
         window_start = max(started, first_minute * 60)
-        minutes = max((now - window_start) / 60, 1 / 60)
+        span = max((now - window_start) / 60, 1 / 60)
         cpu_ns = samples = dropped_ns = 0
         domains: dict[str, _Domain] = {}
         for bucket in self._buckets:
@@ -198,7 +200,7 @@ class Collector:
                 total.merge(stats)
 
         def per_minute(ns: int) -> float:
-            return round(ns / 1e6 / minutes, 1)
+            return round(ns / 1e6 / span, 1)
 
         def top(counter: Counter[str], n: int | None = None) -> dict[str, float]:
             return {key: per_minute(ns) for key, ns in counter.most_common(n)}
@@ -232,7 +234,7 @@ class Collector:
 
         idle = domains.get("idle")
         return {
-            "window_minutes": round(minutes, 1),
+            "window_minutes": round(span, 1),
             "loop_cpu_ms_per_min": per_minute(cpu_ns),
             "idle_ms_per_min": per_minute(idle.cpu_ns if idle else 0),
             "samples": samples,
