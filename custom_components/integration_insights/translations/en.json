@@ -2,11 +2,20 @@
   "config": {
     "step": {
       "user": {
-        "description": "Measure how much CPU time each integration uses on the event loop and in threads."
+        "description": "Measure how much CPU time each integration uses on the event loop."
       }
     },
     "abort": {
-      "single_instance_allowed": "Integration Insights is already set up."
+      "single_instance_allowed": "Integration Insights is already set up.",
+      "not_supported": "Integration Insights needs Home Assistant on 64-bit Linux, for example Home Assistant OS or the container image."
+    }
+  },
+  "exceptions": {
+    "not_supported": {
+      "message": "Integration Insights needs Home Assistant on 64-bit Linux."
+    },
+    "sampler_failed": {
+      "message": "Integration Insights could not start its sampler: {error}"
     }
   }
 }

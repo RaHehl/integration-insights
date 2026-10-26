@@ -1,0 +1,31 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - run: pip install -r requirements_test.txt
+      - run: python -m pytest -q
+
+  pytest-musl:
+    runs-on: ubuntu-latest
+    container: python:3.14-alpine
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - run: pip install -r requirements_test.txt
+      - run: python -m pytest -q
