@@ -9,6 +9,7 @@ from typing import Any
 from homeassistant.config_entries import current_entry
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import CALLBACK_TYPE, Event, HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.loader import IntegrationNotLoaded, async_get_loaded_integration
 
@@ -18,6 +19,7 @@ from .sampler import Sampler, SamplerError
 
 _LOGGER = logging.getLogger(__name__)
 DRAIN_INTERVAL = timedelta(seconds=10)
+TOP_ENTITIES = 20
 
 
 def _wakeup_fd(hass: HomeAssistant) -> int | None:
@@ -149,6 +151,22 @@ class Insights:
         self.drain()
         sampler = self.sampler
         samples = max(sampler.count, 1)
+        report = self.collector.report(time.monotonic(), self.started, minutes)
+        registry = er.async_get(self.hass)
+        for item in report["integrations"]:
+            entities: dict[str, float] = item["entities"]
+            devices: dict[str, float] = {}
+            for entity_id, ms in entities.items():
+                if (
+                    entry := registry.async_get(entity_id)
+                ) is not None and entry.device_id is not None:
+                    devices[entry.device_id] = round(
+                        devices.get(entry.device_id, 0) + ms, 1
+                    )
+            item["devices"] = dict(
+                sorted(devices.items(), key=lambda kv: kv[1], reverse=True)
+            )
+            item["entities"] = dict(list(entities.items())[:TOP_ENTITIES])
         return {
             "sampler": {
                 "interval_ms": sampler.interval_ns / 1e6,
@@ -159,5 +177,5 @@ class Insights:
                 "backoffs": sampler.backoffs,
                 "running_minutes": round((time.monotonic() - self.started) / 60, 1),
             },
-            **self.collector.report(time.monotonic(), self.started, minutes),
+            **report,
         }

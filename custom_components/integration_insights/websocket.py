@@ -7,6 +7,7 @@ import probatio as vol
 
 from homeassistant.components import websocket_api
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import device_registry as dr
 from homeassistant.loader import IntegrationNotLoaded, async_get_loaded_integration
 
 from .collector import WINDOW_MINUTES
@@ -34,7 +35,7 @@ def websocket_report(
     connection: websocket_api.connection.ActiveConnection,
     msg: dict[str, Any],
 ) -> None:
-    """Return the report, with names for integrations and config entries."""
+    """Return the report, with names for integrations, entries, devices, entities."""
     if not (entries := hass.config_entries.async_loaded_entries(DOMAIN)):
         connection.send_error(
             msg["id"], websocket_api.ERR_NOT_FOUND, "Integration Insights is not loaded"
@@ -44,6 +45,9 @@ def websocket_report(
     report = entry.runtime_data.report(msg["minutes"])
     names: dict[str, str] = {}
     titles: dict[str, str] = {}
+    device_names: dict[str, str] = {}
+    entity_names: dict[str, str] = {}
+    devices = dr.async_get(hass)
     for item in report["integrations"]:
         with suppress(IntegrationNotLoaded):
             names[item["domain"]] = async_get_loaded_integration(
@@ -54,12 +58,20 @@ def websocket_report(
                 config_entry := hass.config_entries.async_get_entry(entry_id)
             ) is not None:
                 titles[entry_id] = config_entry.title
+        for device_id in item["devices"]:
+            if (device := devices.async_get(device_id)) is not None:
+                device_names[device_id] = device.name_by_user or device.name or ""
+        for entity_id in item["entities"]:
+            if (state := hass.states.get(entity_id)) is not None:
+                entity_names[entity_id] = state.name
     connection.send_result(
         msg["id"],
         {
             "report": report,
             "names": names,
             "entry_titles": titles,
+            "device_names": device_names,
+            "entity_names": entity_names,
             "entry_id": entry.entry_id,
         },
     )

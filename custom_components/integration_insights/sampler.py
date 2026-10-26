@@ -66,6 +66,7 @@ class Record(NamedTuple):
     entry_id: str | None
     entry_domain: str | None
     cpu_ns: int
+    entity_id: str | None = None  # innermost entity whose method is on the stack
 
 
 class _sigevent(ctypes.Structure):
@@ -369,6 +370,7 @@ class Sampler:
         library_frames = 0
         skipped = False
         idle = False
+        entity_id: str | None = None
         if frame is not None and frame.f_code.co_name == "select":
             caller = frame.f_back
             idle = (
@@ -406,13 +408,21 @@ class Sampler:
                 f = f.f_back
                 continue
             is_platform = kind == K_PLATFORM
-            if is_platform and code.co_argcount and code.co_varnames[0] == "self":
-                # Platform base classes run on behalf of the integration that
-                # owns the entity: charge hue, not light.
-                owner = self._owner_domain(f)
-                if owner is not None:
-                    name = owner
-                    is_platform = False
+            if (
+                (is_platform or entity_id is None)
+                and code.co_argcount
+                and code.co_varnames[0] == "self"
+            ):
+                obj = f.f_locals.get("self")
+                if is_platform and obj is not None:
+                    # Platform base classes run on behalf of the integration
+                    # that owns the entity: charge hue, not light.
+                    owner = self._owner_domain(obj)
+                    if owner is not None:
+                        name = owner
+                        is_platform = False
+                if entity_id is None and obj is not None:
+                    entity_id = _entity_id(obj)
             # The frame to blame is always kept, even past the cap.
             recorded = len(frames) < 2 * MAX_RECORDED_FRAMES or (
                 name is not None and not is_platform and domain is None
@@ -458,15 +468,25 @@ class Sampler:
             entry_id,
             entry_domain,
             cpu_ns,
+            entity_id,
         )
 
-    def _owner_domain(self, frame: FrameType) -> str | None:
-        try:
-            owner = frame.f_locals["self"]
-        except KeyError:
-            return None
+    def _owner_domain(self, owner: object) -> str | None:
         module = type(owner).__module__
         cache = self._module_cache
         if module not in cache:
             cache[module] = module_domain(module)
         return cache[module]
+
+
+def _entity_id(obj: object) -> str | None:
+    """Return the entity id of an entity object, without running any code.
+
+    Reading the instance dict skips properties and __getattr__, which must not
+    run inside the signal handler.
+    """
+    try:
+        value = object.__getattribute__(obj, "__dict__").get("entity_id")
+    except AttributeError:
+        return None
+    return value if type(value) is str else None

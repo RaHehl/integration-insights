@@ -441,6 +441,12 @@ class IntegrationInsightsPanel extends HTMLElement {
       lines.push("", `${title}:`);
       for (const [key, value] of entries) lines.push(`- ${key}: ${value} ms/min`);
     };
+    const names = (values, lookup) =>
+      Object.fromEntries(
+        Object.entries(values).map(([key, value]) => [lookup[key] ? `${lookup[key]} (${key})` : key, value])
+      );
+    pairs("Devices", names(item.devices, this._data.device_names));
+    pairs("Entities", names(item.entities, this._data.entity_names));
     pairs("Libraries", item.libraries);
     pairs("Triggered by", item.triggered_by);
     item.stacks.forEach((stack, index) => {
@@ -571,6 +577,15 @@ class IntegrationInsightsPanel extends HTMLElement {
         .join("");
       parts.push(`<h3>${title}</h3><div class="pairs">${chips}</div>`);
     };
+    pairs("Devices", item.devices, (key) => this._data.device_names[key] || key);
+    pairs(
+      "Entities",
+      item.entities,
+      (key) => {
+        const name = this._data.entity_names[key];
+        return name ? `${name} (${key})` : key;
+      }
+    );
     pairs("Libraries", item.libraries, undefined, true);
     pairs("Triggered by", item.triggered_by, (key) => this._data.names[key] || key);
     pairs("Config entries", item.config_entries, (key) => this._data.entry_titles[key] || key);

@@ -99,3 +99,53 @@ def test_platform_base_class_without_owner_falls_back() -> None:
         Sampler(), "/usr/src/homeassistant/homeassistant/components/light/__init__.py"
     )
     assert record.domain == "light"
+
+
+ENTITY = """\
+class Entity:
+    entity_id = None
+
+    def update(self, sampler):
+        import sys
+        return sampler.walk(sys._getframe(), 0)
+
+    def outer(self, other, sampler):
+        return other.update(sampler)
+
+
+class Template:
+    def render(self, entity, sampler):
+        return entity.update(sampler)
+"""
+
+
+def test_innermost_entity_is_recorded() -> None:
+    """The entity whose method runs is kept; objects without one are skipped."""
+    namespace = compile_at("/config/custom_components/foo/sensor.py", ENTITY)
+    inner = namespace["Entity"]()
+    inner.entity_id = "sensor.inner"
+    outer = namespace["Entity"]()
+    outer.entity_id = "sensor.outer"
+    sampler = Sampler()
+    assert outer.outer(inner, sampler).entity_id == "sensor.inner"
+    assert namespace["Template"]().render(inner, sampler).entity_id == "sensor.inner"
+    assert namespace["Entity"]().update(sampler).entity_id is None
+
+
+def test_entity_id_property_is_not_called() -> None:
+    """An entity_id behind a property is ignored instead of running code."""
+    namespace = compile_at(
+        "/config/custom_components/foo/sensor.py",
+        "class Entity:\n"
+        "    calls = 0\n"
+        "    @property\n"
+        "    def entity_id(self):\n"
+        "        type(self).calls += 1\n"
+        "        return 'sensor.x'\n"
+        "    def update(self, sampler):\n"
+        "        import sys\n"
+        "        return sampler.walk(sys._getframe(), 0)\n",
+    )
+    entity = namespace["Entity"]()
+    assert entity.update(Sampler()).entity_id is None
+    assert namespace["Entity"].calls == 0

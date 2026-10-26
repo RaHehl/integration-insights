@@ -26,10 +26,19 @@ def _record(
     trigger: str | None = None,
     libraries: tuple[str, ...] = (),
     entry: tuple[str, str] | None = None,
+    entity_id: str | None = None,
 ) -> Record:
     entry_id, entry_domain = entry or (None, None)
     return Record(
-        frames, self_index, domain, trigger, libraries, entry_id, entry_domain, cpu_ns
+        frames,
+        self_index,
+        domain,
+        trigger,
+        libraries,
+        entry_id,
+        entry_domain,
+        cpu_ns,
+        entity_id,
     )
 
 
@@ -143,3 +152,21 @@ def test_gap_marker_is_shown() -> None:
         "custom_components/foo/x.py:6 spin",
     ]
     assert foo["hot_spots"][0]["function"] == "custom_components/foo/x.py spin"
+
+
+def test_entities_are_summed_per_domain() -> None:
+    """CPU is summed per entity of the charged integration, hottest first."""
+    spin = spin_at("/config/custom_components/foo/sensor.py")
+    frames = _frames((spin, 6))
+    collector = Collector()
+    collector.add(
+        [
+            _record(frames, "foo", 2 * MS, entity_id="sensor.a"),
+            _record(frames, "foo", 5 * MS, entity_id="sensor.b"),
+            _record(frames, "foo", 1 * MS, entity_id="sensor.a"),
+            _record(frames, "foo", 4 * MS),
+        ],
+        now=60.0,
+    )
+    report = collector.report(now=120.0, started=60.0)
+    assert report["integrations"][0]["entities"] == {"sensor.b": 5.0, "sensor.a": 3.0}

@@ -28,6 +28,7 @@ class _Domain:
     via_library_ns: int = 0
     triggers: Counter[str] = field(default_factory=Counter)
     entries: Counter[str] = field(default_factory=Counter)
+    entities: Counter[str] = field(default_factory=Counter)
     libraries: Counter[str] = field(default_factory=Counter)
     hot_spots: Counter[Location] = field(default_factory=Counter)
     hot_spot_samples: Counter[Location] = field(default_factory=Counter)
@@ -39,6 +40,7 @@ class _Domain:
         self.via_library_ns += other.via_library_ns
         self.triggers.update(other.triggers)
         self.entries.update(other.entries)
+        self.entities.update(other.entities)
         self.libraries.update(other.libraries)
         self.hot_spots.update(other.hot_spots)
         self.hot_spot_samples.update(other.hot_spot_samples)
@@ -107,6 +109,8 @@ class Collector:
         # entry's setup, so only count it for its own integration.
         if record.entry_id is not None and record.entry_domain == domain:
             stats.entries[record.entry_id] += ns
+        if record.entity_id is not None:
+            stats.entities[record.entity_id] += ns
         if record.libraries:
             stats.libraries[record.libraries[0]] += ns
         if domain == "idle":
@@ -221,6 +225,8 @@ class Collector:
                 item["via_library_ms_per_min"] = per_minute(stats.via_library_ns)
             item["triggered_by"] = top(stats.triggers, TOP_TRIGGERS)
             item["config_entries"] = top(stats.entries)
+            # All of them: the caller groups them by device before trimming.
+            item["entities"] = top(stats.entities)
             item["libraries"] = top(stats.libraries)
             item["hot_spots"] = _hot_spots(stats, per_minute)
             item["stacks"] = [
