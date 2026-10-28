@@ -1,8 +1,16 @@
 """Tests for the collector and its report."""
 
+import random
 from typing import Any
 
-from custom_components.integration_insights.collector import Collector
+import pytest
+
+from custom_components.integration_insights.background import (
+    JobRecord,
+    Owner,
+    ThreadRecord,
+)
+from custom_components.integration_insights.collector import KEPT_WINDOWS, Collector
 from custom_components.integration_insights.sampler import Record
 
 from .helpers import offset_of_line, spin_at
@@ -170,3 +178,62 @@ def test_entities_are_summed_per_domain() -> None:
     )
     report = collector.report(now=120.0, started=60.0)
     assert report["integrations"][0]["entities"] == {"sensor.b": 5.0, "sensor.a": 3.0}
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_kept_windows_match_a_fresh_sum(seed: int) -> None:
+    """Running window sums always equal summing the minutes from scratch."""
+    rng = random.Random(seed)
+    spins = [spin_at(f"/config/custom_components/d{i}/x.py") for i in range(4)]
+    collector = Collector()
+    collector.library_map = {"aiofoo": "d1"}
+    now = 600.0
+    for _ in range(400):
+        # Mostly a drain every 10 s, sometimes a gap of several minutes.
+        now += rng.choice([10] * 9 + [rng.randint(60, 900)])
+        records = []
+        for _ in range(rng.randint(0, 30)):
+            spin = rng.choice(spins)
+            domain = rng.choice(["d0", "d1", "d2", "d3", "core", "idle"])
+            records.append(
+                _record(
+                    _frames((spin, rng.choice([3, 4, 5, 6]))),
+                    domain,
+                    rng.randint(1, 30) * MS,
+                    libraries=rng.choice([(), ("aiofoo",)]),
+                    entity_id=rng.choice([None, "sensor.a", "sensor.b"]),
+                )
+            )
+        collector.add(records, now)
+        collector.add_jobs(
+            [
+                JobRecord(Owner(rng.choice(["d0", "d2", "core"]), ()), "f", MS, 2 * MS)
+                for _ in range(rng.randint(0, 3))
+            ],
+            now,
+        )
+        collector.add_threads(
+            [ThreadRecord(Owner("d3", ()), "t", MS)] * rng.randint(0, 2), now
+        )
+        collector.add_loop_busy(rng.randint(0, 50) * MS, now)
+        for minutes in KEPT_WINDOWS:
+            kept = collector.report(now, 0.0, minutes)
+            collector._windows.pop(minutes)  # noqa: SLF001
+            assert kept == collector.report(now, 0.0, minutes)
+
+
+def test_summary_matches_report() -> None:
+    """The summary carries the same numbers as the full report."""
+    collector = Collector()
+    spin = spin_at("/config/custom_components/busy/x.py")
+    collector.add([_record(_frames((spin, 4)), "busy", 30 * MS)], 600.0)
+    collector.add([_record(_frames((spin, 4)), "busy", 30 * MS)], 670.0)
+    report = collector.report(680.0, 0.0, 5)
+    summary = collector.summary(680.0, 0.0, 5)
+    brief = summary["integrations"][0]
+    assert {k: v for k, v in report.items() if k != "integrations"} == {
+        k: v for k, v in summary.items() if k != "integrations"
+    }
+    assert {k: report["integrations"][0][k] for k in brief} == brief
+    assert collector.detail("busy", 680.0, 0.0, 5) == report["integrations"][0]
+    assert collector.detail("missing", 680.0, 0.0, 5) is None

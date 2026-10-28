@@ -3,7 +3,6 @@
 // and `panel` on it.
 
 const WINDOWS = [5, 15, 60];
-const REFRESH_MS = 10000;
 const MENU_ICON =
   "M3,6H21V8H3V6M3,11H21V13H3V11M3,16H21V18H3V16Z";
 
@@ -267,7 +266,7 @@ class IntegrationInsightsPanel extends HTMLElement {
     this._error = undefined;
     this._expanded = new Set();
     this._openStacks = new Set();
-    this._loading = false;
+    this._details = new Map();
     this._onClick = this._onClick.bind(this);
     this._onKeyDown = this._onKeyDown.bind(this);
     this._onToggle = this._onToggle.bind(this);
@@ -277,7 +276,7 @@ class IntegrationInsightsPanel extends HTMLElement {
   set hass(hass) {
     const first = !this._hass;
     this._hass = hass;
-    if (first && this.isConnected) this._load();
+    if (first && this.isConnected) this._subscribe();
   }
 
   set narrow(narrow) {
@@ -293,11 +292,8 @@ class IntegrationInsightsPanel extends HTMLElement {
     this.shadowRoot.addEventListener("keydown", this._onKeyDown);
     this.shadowRoot.addEventListener("toggle", this._onToggle, true);
     document.addEventListener("visibilitychange", this._onVisibility);
-    this._timer = setInterval(() => {
-      if (!document.hidden) this._load();
-    }, REFRESH_MS);
     this._render();
-    if (this._hass) this._load();
+    if (this._hass) this._subscribe();
   }
 
   disconnectedCallback() {
@@ -305,27 +301,59 @@ class IntegrationInsightsPanel extends HTMLElement {
     this.shadowRoot.removeEventListener("keydown", this._onKeyDown);
     this.shadowRoot.removeEventListener("toggle", this._onToggle, true);
     document.removeEventListener("visibilitychange", this._onVisibility);
-    clearInterval(this._timer);
+    this._unsubscribe();
   }
 
+  // The server pushes the summary after every drain; nothing runs while the
+  // panel is hidden or closed.
   _onVisibility() {
-    if (!document.hidden) this._load();
+    if (document.hidden) this._unsubscribe();
+    else this._subscribe();
   }
 
-  async _load() {
-    if (!this._hass || this._loading) return;
-    this._loading = true;
+  async _subscribe() {
+    if (!this._hass || this._token || document.hidden) return;
+    const token = (this._token = {});
     try {
-      this._data = await this._hass.connection.sendMessagePromise({
-        type: "integration_insights/report",
+      const unsub = await this._hass.connection.subscribeMessage(
+        (message) => this._onSummary(message),
+        { type: "integration_insights/subscribe", minutes: this._minutes }
+      );
+      if (this._token !== token) unsub();
+      else this._unsub = unsub;
+    } catch (err) {
+      if (this._token === token) this._token = undefined;
+      this._error = err && err.message ? err.message : String(err);
+      this._render();
+    }
+  }
+
+  _unsubscribe() {
+    this._token = undefined;
+    if (this._unsub) {
+      this._unsub();
+      this._unsub = undefined;
+    }
+  }
+
+  _onSummary(message) {
+    this._data = message;
+    this._error = undefined;
+    this._updated = new Date();
+    for (const domain of this._expanded) this._loadDetail(domain);
+    this._render();
+  }
+
+  async _loadDetail(domain) {
+    try {
+      const detail = await this._hass.connection.sendMessagePromise({
+        type: "integration_insights/detail",
+        domain,
         minutes: this._minutes,
       });
-      this._error = undefined;
-      this._updated = new Date();
+      if (this._expanded.has(domain)) this._details.set(domain, detail);
     } catch (err) {
       this._error = err && err.message ? err.message : String(err);
-    } finally {
-      this._loading = false;
     }
     this._render();
   }
@@ -340,11 +368,18 @@ class IntegrationInsightsPanel extends HTMLElement {
       );
     } else if (action === "window") {
       this._minutes = Number(value);
+      this._unsubscribe();
+      this._details.clear();
       this._render();
-      this._load();
+      this._subscribe();
     } else if (action === "toggle") {
-      if (this._expanded.has(value)) this._expanded.delete(value);
-      else this._expanded.add(value);
+      if (this._expanded.has(value)) {
+        this._expanded.delete(value);
+        this._details.delete(value);
+      } else {
+        this._expanded.add(value);
+        this._loadDetail(value);
+      }
       this._render();
     } else if (action === "download") {
       this._download();
@@ -368,10 +403,21 @@ class IntegrationInsightsPanel extends HTMLElement {
     else this._openStacks.delete(key);
   }
 
-  _download() {
+  async _download() {
     if (!this._data) return;
+    let full;
+    try {
+      full = await this._hass.connection.sendMessagePromise({
+        type: "integration_insights/report",
+        minutes: this._minutes,
+      });
+    } catch (err) {
+      this._error = err && err.message ? err.message : String(err);
+      this._render();
+      return;
+    }
     // Same content as the diagnostics download: no entry titles or names.
-    const blob = new Blob([JSON.stringify(this._data.report, null, 2)], {
+    const blob = new Blob([JSON.stringify(full.report, null, 2)], {
       type: "application/json",
     });
     const url = URL.createObjectURL(blob);
@@ -385,9 +431,9 @@ class IntegrationInsightsPanel extends HTMLElement {
   }
 
   async _copy(domain, button) {
-    const item = this._item(domain);
-    if (!item) return;
-    const text = this._describe(item);
+    const detail = this._details.get(domain);
+    if (!detail || !detail.item) return;
+    const text = this._describe(detail);
     let done = false;
     try {
       await navigator.clipboard.writeText(text);
@@ -409,12 +455,9 @@ class IntegrationInsightsPanel extends HTMLElement {
     }, 1500);
   }
 
-  _item(domain) {
-    return this._data?.report.integrations.find((i) => i.domain === domain);
-  }
-
   // A plain text summary for a bug report or an LLM.
-  _describe(item) {
+  _describe(detail) {
+    const item = detail.item;
     const report = this._data.report;
     const lines = [
       `Integration Insights: ${item.domain}`,
@@ -460,8 +503,8 @@ class IntegrationInsightsPanel extends HTMLElement {
       Object.fromEntries(
         Object.entries(values).map(([key, value]) => [lookup[key] ? `${lookup[key]} (${key})` : key, value])
       );
-    pairs("Devices", names(item.devices, this._data.device_names));
-    pairs("Entities", names(item.entities, this._data.entity_names));
+    pairs("Devices", names(item.devices, detail.device_names));
+    pairs("Entities", names(item.entities, detail.entity_names));
     pairs("Libraries", item.libraries);
     pairs("Triggered by", item.triggered_by);
     item.stacks.forEach((stack, index) => {
@@ -568,7 +611,11 @@ class IntegrationInsightsPanel extends HTMLElement {
       <div class="footer">CPU time on the event loop, sampled every ${sampler.interval_ms} ms of loop CPU. Background is CPU in executor jobs and threads, measured exactly. Updated ${updated}${this._error ? ` · <span class="error">${escapeHtml(this._error)}</span>` : ""}</div>`;
   }
 
-  _renderDetail(item) {
+  _renderDetail(brief) {
+    const detail = this._details.get(brief.domain);
+    if (!detail) return `<div class="detail"><p class="note">Loading…</p></div>`;
+    const item = detail.item;
+    if (!item) return `<div class="detail"><p class="note">No data in this window.</p></div>`;
     const parts = [];
     if (item.domain === "core") parts.push(`<p class="note">${CORE_NOTE}</p>`);
     if (item.via_library_ms_per_min) {
@@ -619,18 +666,18 @@ class IntegrationInsightsPanel extends HTMLElement {
         .join("");
       parts.push(`<h3>${title}</h3><div class="pairs">${chips}</div>`);
     };
-    pairs("Devices", item.devices, (key) => this._data.device_names[key] || key);
+    pairs("Devices", item.devices, (key) => detail.device_names[key] || key);
     pairs(
       "Entities",
       item.entities,
       (key) => {
-        const name = this._data.entity_names[key];
+        const name = detail.entity_names[key];
         return name ? `${name} (${key})` : key;
       }
     );
     pairs("Libraries", item.libraries, undefined, true);
     pairs("Triggered by", item.triggered_by, (key) => this._data.names[key] || key);
-    pairs("Config entries", item.config_entries, (key) => this._data.entry_titles[key] || key);
+    pairs("Config entries", item.config_entries, (key) => detail.entry_titles[key] || key);
     if (item.stacks.length) {
       const stacks = item.stacks
         .map((stack, index) => {

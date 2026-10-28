@@ -377,8 +377,12 @@ class Sampler:
             caller = frame.f_back
             if caller is not None and caller.f_code is self.select_wrapper:
                 caller = caller.f_back
+            # A signal after epoll returns can land in the wrapper itself.
             idle = (
-                frame.f_code.co_filename.endswith("selectors.py")
+                (
+                    frame.f_code.co_filename.endswith("selectors.py")
+                    or frame.f_code is self.select_wrapper
+                )
                 and caller is not None
                 and caller.f_code.co_name == "_run_once"
             )

@@ -4,6 +4,7 @@ from bisect import bisect_right
 from collections import Counter, deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
+import heapq
 from typing import Any
 
 from .attribution import short_path
@@ -19,6 +20,8 @@ TOP_TRIGGERS = 5
 TOP_LINES = 5
 TOP_JOBS = 5
 TOP_THREADS = 5
+# Windows the panel offers; their sums are kept between reports.
+KEPT_WINDOWS = (5, 15, 60)
 
 type Location = tuple[str, str, int]  # short path, qualname, line
 type Stack = tuple[Location, ...]
@@ -61,6 +64,36 @@ class _Domain:
         self.thread_cpu_ns += other.thread_cpu_ns
         self.threads.update(other.threads)
 
+    def subtract(self, other: _Domain) -> None:
+        # Counter -= drops keys that reach zero, so a window that loses every
+        # minute it gained ends up empty again.
+        self.cpu_ns -= other.cpu_ns
+        self.samples -= other.samples
+        self.via_library_ns -= other.via_library_ns
+        self.triggers -= other.triggers
+        self.entries -= other.entries
+        self.entities -= other.entities
+        self.libraries -= other.libraries
+        self.hot_spots -= other.hot_spots
+        self.hot_spot_samples -= other.hot_spot_samples
+        self.stacks -= other.stacks
+        self.executor_cpu_ns -= other.executor_cpu_ns
+        self.executor_wall_ns -= other.executor_wall_ns
+        self.jobs -= other.jobs
+        self.job_counts -= other.job_counts
+        self.thread_cpu_ns -= other.thread_cpu_ns
+        self.threads -= other.threads
+
+    def is_empty(self) -> bool:
+        return not (
+            self.samples
+            or self.cpu_ns
+            or self.executor_wall_ns
+            or self.job_counts
+            or self.thread_cpu_ns
+            or self.threads
+        )
+
     @property
     def total_cpu_ns(self) -> int:
         return self.cpu_ns + self.executor_cpu_ns + self.thread_cpu_ns
@@ -77,6 +110,39 @@ class _Bucket:
     stack_count: int = 0
     dropped_stack_ns: int = 0
     domains: dict[str, _Domain] = field(default_factory=dict)
+
+    def merge(self, other: _Bucket) -> None:
+        self.cpu_ns += other.cpu_ns
+        self.loop_busy_ns += other.loop_busy_ns
+        self.executor_cpu_ns += other.executor_cpu_ns
+        self.thread_cpu_ns += other.thread_cpu_ns
+        self.samples += other.samples
+        self.dropped_stack_ns += other.dropped_stack_ns
+        for domain, stats in other.domains.items():
+            if (total := self.domains.get(domain)) is None:
+                total = self.domains[domain] = _Domain()
+            total.merge(stats)
+
+    def subtract(self, other: _Bucket) -> None:
+        self.cpu_ns -= other.cpu_ns
+        self.loop_busy_ns -= other.loop_busy_ns
+        self.executor_cpu_ns -= other.executor_cpu_ns
+        self.thread_cpu_ns -= other.thread_cpu_ns
+        self.samples -= other.samples
+        self.dropped_stack_ns -= other.dropped_stack_ns
+        for domain, stats in other.domains.items():
+            total = self.domains[domain]
+            total.subtract(stats)
+            if total.is_empty():
+                del self.domains[domain]
+
+
+@dataclass(slots=True)
+class _Window:
+    """Running sum of the finished minutes in a window."""
+
+    total: _Bucket = field(default_factory=lambda: _Bucket(-1))
+    minutes: dict[int, _Bucket] = field(default_factory=dict)
 
 
 GAP: Location = ("...", "", 0)
@@ -96,6 +162,7 @@ class Collector:
         self._locations: dict[tuple[int, int], tuple[Any, Location]] = {}
         self._lines: dict[int, tuple[Any, list[int], list[int | None]]] = {}
         self._prefixes: dict[str, tuple[str, str]] = {}
+        self._windows: dict[int, _Window] = {}
 
     def _bucket(self, now: float) -> _Bucket:
         minute = int(now // 60)
@@ -249,99 +316,117 @@ class Collector:
         line = table[2][index] if index >= 0 else None
         return line if line is not None else code.co_firstlineno
 
-    def report(
-        self, now: float, started: float, minutes: int = WINDOW_MINUTES
-    ) -> dict[str, Any]:
-        """Build the report over the last `minutes` (the current one included)."""
-        first_minute = int(now // 60) - min(minutes, WINDOW_MINUTES) + 1
+    def _window(self, minutes: int, now: float) -> _Window:
+        """Return the sum of the finished minutes of the last `minutes`."""
+        current = int(now // 60)
+        first = current - minutes + 1
+        window = self._windows.get(minutes) if minutes in KEPT_WINDOWS else None
+        if window is None:
+            window = _Window()
+            if minutes in KEPT_WINDOWS:
+                self._windows[minutes] = window
+        finished = {
+            bucket.minute: bucket
+            for bucket in self._buckets
+            if first <= bucket.minute < current
+        }
+        for minute in [m for m in window.minutes if m not in finished]:
+            window.total.subtract(window.minutes.pop(minute))
+        for minute, bucket in finished.items():
+            if minute not in window.minutes:
+                window.total.merge(bucket)
+                window.minutes[minute] = bucket
+        return window
+
+    def _view(
+        self, now: float, started: float, minutes: int
+    ) -> tuple[float, _Bucket, _Bucket | None]:
+        """Return the span in minutes, the finished minutes and the current one."""
+        minutes = min(minutes, WINDOW_MINUTES)
+        first_minute = int(now // 60) - minutes + 1
         window_start = max(started, first_minute * 60)
         span = max((now - window_start) / 60, 1 / 60)
-        cpu_ns = samples = dropped_ns = busy_ns = executor_ns = thread_ns = 0
-        domains: dict[str, _Domain] = {}
-        for bucket in self._buckets:
-            if bucket.minute < first_minute:
-                continue
-            cpu_ns += bucket.cpu_ns
-            busy_ns += bucket.loop_busy_ns
-            executor_ns += bucket.executor_cpu_ns
-            thread_ns += bucket.thread_cpu_ns
-            samples += bucket.samples
-            dropped_ns += bucket.dropped_stack_ns
-            for domain, stats in bucket.domains.items():
-                if (total := domains.get(domain)) is None:
-                    total = domains[domain] = _Domain()
-                total.merge(stats)
+        current = (
+            self._buckets[-1]
+            if self._buckets and self._buckets[-1].minute == int(now // 60)
+            else None
+        )
+        return span, self._window(minutes, now).total, current
+
+    def summary(
+        self, now: float, started: float, minutes: int = WINDOW_MINUTES
+    ) -> dict[str, Any]:
+        """Return totals and the load per integration, without details."""
+        span, finished, current = self._view(now, started, minutes)
+        parts = [finished] if current is None else [finished, current]
 
         def per_minute(ns: int) -> float:
             return round(ns / 1e6 / span, 1)
 
-        def top(counter: Counter[str], n: int | None = None) -> dict[str, float]:
-            return {key: per_minute(ns) for key, ns in counter.most_common(n)}
-
+        sums: dict[str, list[int]] = {}
+        for part in parts:
+            for domain, stats in part.domains.items():
+                row = sums.setdefault(domain, [0, 0, 0, 0])
+                row[0] += stats.cpu_ns
+                row[1] += stats.executor_cpu_ns + stats.thread_cpu_ns
+                row[2] += stats.samples
+                row[3] += stats.via_library_ns
+        idle = sums.pop("idle", [0, 0, 0, 0])
         integrations = []
-        for domain, stats in sorted(
-            domains.items(), key=lambda item: item[1].total_cpu_ns, reverse=True
+        for domain, (loop_ns, background_ns, samples, via_ns) in sorted(
+            sums.items(), key=lambda item: (-(item[1][0] + item[1][1]), item[0])
         ):
-            if domain == "idle":
-                continue
             item: dict[str, Any] = {
                 "domain": domain,
-                "cpu_ms_per_min": per_minute(stats.total_cpu_ns),
-                "loop_cpu_ms_per_min": per_minute(stats.cpu_ns),
-                "background_cpu_ms_per_min": per_minute(
-                    stats.executor_cpu_ns + stats.thread_cpu_ns
-                ),
-                "samples": stats.samples,
-                "low_confidence": 0 < stats.samples < MIN_CONFIDENT_SAMPLES,
+                "cpu_ms_per_min": per_minute(loop_ns + background_ns),
+                "loop_cpu_ms_per_min": per_minute(loop_ns),
+                "background_cpu_ms_per_min": per_minute(background_ns),
+                "samples": samples,
+                "low_confidence": 0 < samples < MIN_CONFIDENT_SAMPLES,
             }
-            if stats.via_library_ns:
-                item["via_library_ms_per_min"] = per_minute(stats.via_library_ns)
-            item["triggered_by"] = top(stats.triggers, TOP_TRIGGERS)
-            item["config_entries"] = top(stats.entries)
-            # All of them: the caller groups them by device before trimming.
-            item["entities"] = top(stats.entities)
-            item["libraries"] = top(stats.libraries)
-            item["hot_spots"] = _hot_spots(stats, per_minute)
-            item["stacks"] = [
-                {
-                    "loop_cpu_ms_per_min": per_minute(ns),
-                    "frames": [_format(location) for location in stack],
-                }
-                for stack, ns in stats.stacks.most_common(TOP_STACKS)
-            ]
-            if stats.job_counts:
-                item["executor"] = {
-                    "cpu_ms_per_min": per_minute(stats.executor_cpu_ns),
-                    "wall_ms_per_min": per_minute(stats.executor_wall_ns),
-                    "jobs_per_min": round(stats.job_counts.total() / span, 1),
-                    "jobs": [
-                        {
-                            "function": label,
-                            "cpu_ms_per_min": per_minute(ns),
-                            "per_min": round(stats.job_counts[label] / span, 1),
-                        }
-                        for label, ns in stats.jobs.most_common(TOP_JOBS)
-                    ],
-                }
-            if stats.threads:
-                item["threads"] = {
-                    "cpu_ms_per_min": per_minute(stats.thread_cpu_ns),
-                    "by_name": top(stats.threads, TOP_THREADS),
-                }
+            if via_ns:
+                item["via_library_ms_per_min"] = per_minute(via_ns)
             integrations.append(item)
-
-        idle = domains.get("idle")
         return {
             "window_minutes": round(span, 1),
-            "loop_cpu_ms_per_min": per_minute(cpu_ns),
-            "loop_busy_ms_per_min": per_minute(busy_ns),
-            "executor_cpu_ms_per_min": per_minute(executor_ns),
-            "thread_cpu_ms_per_min": per_minute(thread_ns),
-            "idle_ms_per_min": per_minute(idle.cpu_ns if idle else 0),
-            "samples": samples,
-            "stacks_not_kept_ms_per_min": per_minute(dropped_ns),
+            "loop_cpu_ms_per_min": per_minute(sum(p.cpu_ns for p in parts)),
+            "loop_busy_ms_per_min": per_minute(sum(p.loop_busy_ns for p in parts)),
+            "executor_cpu_ms_per_min": per_minute(
+                sum(p.executor_cpu_ns for p in parts)
+            ),
+            "thread_cpu_ms_per_min": per_minute(sum(p.thread_cpu_ns for p in parts)),
+            "idle_ms_per_min": per_minute(idle[0]),
+            "samples": sum(p.samples for p in parts),
+            "stacks_not_kept_ms_per_min": per_minute(
+                sum(p.dropped_stack_ns for p in parts)
+            ),
             "integrations": integrations,
         }
+
+    def detail(
+        self, domain: str, now: float, started: float, minutes: int = WINDOW_MINUTES
+    ) -> dict[str, Any] | None:
+        """Return everything known about one integration, or None."""
+        span, finished, current = self._view(now, started, minutes)
+        stats = _Domain()
+        found = False
+        for part in (finished, current):
+            if part is not None and (part_stats := part.domains.get(domain)):
+                stats.merge(part_stats)
+                found = True
+        return _item(domain, stats, span) if found and domain != "idle" else None
+
+    def report(
+        self, now: float, started: float, minutes: int = WINDOW_MINUTES
+    ) -> dict[str, Any]:
+        """Build the full report over the last `minutes` (the current one included)."""
+        report = self.summary(now, started, minutes)
+        report["integrations"] = [
+            item
+            for brief in report["integrations"]
+            if (item := self.detail(brief["domain"], now, started, minutes)) is not None
+        ]
+        return report
 
 
 def _hot_spots(
@@ -349,14 +434,14 @@ def _hot_spots(
 ) -> list[dict[str, Any]]:
     """Group hot locations by function, with the hottest lines of each."""
     functions: dict[tuple[str, str], list[Any]] = {}
-    for location, ns in stats.hot_spots.most_common():
+    for location, ns in _ranked(stats.hot_spots):
         path, qualname, line = location
         entry = functions.setdefault((path, qualname), [0, 0, {}])
         entry[0] += ns
         entry[1] += stats.hot_spot_samples[location]
         if len(entry[2]) < TOP_LINES:
             entry[2][line] = ns
-    ranked = sorted(functions.items(), key=lambda item: item[1][0], reverse=True)
+    ranked = sorted(functions.items(), key=lambda item: (-item[1][0], item[0]))
     return [
         {
             "function": f"{path} {qualname}",
@@ -366,6 +451,69 @@ def _hot_spots(
         }
         for (path, qualname), (ns, samples, lines) in ranked[:TOP_HOT_SPOTS]
     ]
+
+
+def _ranked[K](counter: Counter[K], n: int | None = None) -> list[tuple[K, int]]:
+    """Return the largest entries, ties ordered by key so every sum ranks alike."""
+    if n is None:
+        return sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))
+    return heapq.nsmallest(n, counter.items(), key=lambda kv: (-kv[1], kv[0]))
+
+
+def _item(domain: str, stats: _Domain, span: float) -> dict[str, Any]:
+    """Return the report entry of one integration."""
+
+    def per_minute(ns: int) -> float:
+        return round(ns / 1e6 / span, 1)
+
+    def top(counter: Counter[str], n: int | None = None) -> dict[str, float]:
+        return {key: per_minute(ns) for key, ns in _ranked(counter, n)}
+
+    item: dict[str, Any] = {
+        "domain": domain,
+        "cpu_ms_per_min": per_minute(stats.total_cpu_ns),
+        "loop_cpu_ms_per_min": per_minute(stats.cpu_ns),
+        "background_cpu_ms_per_min": per_minute(
+            stats.executor_cpu_ns + stats.thread_cpu_ns
+        ),
+        "samples": stats.samples,
+        "low_confidence": 0 < stats.samples < MIN_CONFIDENT_SAMPLES,
+    }
+    if stats.via_library_ns:
+        item["via_library_ms_per_min"] = per_minute(stats.via_library_ns)
+    item["triggered_by"] = top(stats.triggers, TOP_TRIGGERS)
+    item["config_entries"] = top(stats.entries)
+    # All of them: the caller groups them by device before trimming.
+    item["entities"] = top(stats.entities)
+    item["libraries"] = top(stats.libraries)
+    item["hot_spots"] = _hot_spots(stats, per_minute)
+    item["stacks"] = [
+        {
+            "loop_cpu_ms_per_min": per_minute(ns),
+            "frames": [_format(location) for location in stack],
+        }
+        for stack, ns in _ranked(stats.stacks, TOP_STACKS)
+    ]
+    if stats.job_counts:
+        item["executor"] = {
+            "cpu_ms_per_min": per_minute(stats.executor_cpu_ns),
+            "wall_ms_per_min": per_minute(stats.executor_wall_ns),
+            "jobs_per_min": round(stats.job_counts.total() / span, 1),
+            "jobs": [
+                {
+                    "function": label,
+                    "cpu_ms_per_min": per_minute(ns),
+                    "per_min": round(stats.job_counts[label] / span, 1),
+                }
+                for label, ns in _ranked(stats.jobs, TOP_JOBS)
+            ],
+        }
+    if stats.threads:
+        item["threads"] = {
+            "cpu_ms_per_min": per_minute(stats.thread_cpu_ns),
+            "by_name": top(stats.threads, TOP_THREADS),
+        }
+    return item
 
 
 def _format(location: Location) -> str:

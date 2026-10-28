@@ -57,6 +57,7 @@ class Insights:
         self._unsub_drain: CALLBACK_TYPE | None = None
         self._unsub_stop: CALLBACK_TYPE | None = None
         self._polling = False
+        self._subscribers: list[tuple[int, Callable[[dict[str, Any]], None]]] = []
         self._wall_ns = 0
         self._waiting_ns = 0
 
@@ -131,6 +132,8 @@ class Insights:
     @callback
     def _async_drain(self, _now: Any = None) -> None:
         self.drain()
+        if self._subscribers:
+            self._async_publish()
         if not self._polling:
             self._polling = True
             skip = self.background.executor_threads(self._executors())
@@ -226,37 +229,82 @@ class Insights:
         )
         return owners, library_owners(libraries, owners, self._packages)
 
-    def report(self, minutes: int = WINDOW_MINUTES) -> dict[str, Any]:
-        """Return the report over the last `minutes`."""
-        self.drain()
+    def _sampler_stats(self) -> dict[str, Any]:
         sampler = self.sampler
         samples = max(sampler.count, 1)
-        report = self.collector.report(time.monotonic(), self.started, minutes)
-        registry = er.async_get(self.hass)
-        for item in report["integrations"]:
-            entities: dict[str, float] = item["entities"]
-            devices: dict[str, float] = {}
-            for entity_id, ms in entities.items():
-                if (
-                    entry := registry.async_get(entity_id)
-                ) is not None and entry.device_id is not None:
-                    devices[entry.device_id] = round(
-                        devices.get(entry.device_id, 0) + ms, 1
-                    )
-            item["devices"] = dict(
-                sorted(devices.items(), key=lambda kv: kv[1], reverse=True)
-            )
-            item["entities"] = dict(list(entities.items())[:TOP_ENTITIES])
         return {
-            "sampler": {
-                "interval_ms": sampler.interval_ns / 1e6,
-                "samples_total": sampler.count,
-                "handler_cpu_us_avg": round(sampler.cost_ns / samples / 1e3, 1),
-                "handler_errors": sampler.errors,
-                "samples_lost": sampler.lost,
-                "backoffs": sampler.backoffs,
-                "executor_jobs_total": self.background.jobs_total,
-                "running_minutes": round((time.monotonic() - self.started) / 60, 1),
-            },
-            **report,
+            "interval_ms": sampler.interval_ns / 1e6,
+            "samples_total": sampler.count,
+            "handler_cpu_us_avg": round(sampler.cost_ns / samples / 1e3, 1),
+            "handler_errors": sampler.errors,
+            "samples_lost": sampler.lost,
+            "backoffs": sampler.backoffs,
+            "executor_jobs_total": self.background.jobs_total,
+            "running_minutes": round((time.monotonic() - self.started) / 60, 1),
         }
+
+    def _with_devices(self, item: dict[str, Any]) -> dict[str, Any]:
+        """Group an item's entities by device and keep the top entities."""
+        registry = er.async_get(self.hass)
+        entities: dict[str, float] = item["entities"]
+        devices: dict[str, float] = {}
+        for entity_id, ms in entities.items():
+            if (
+                entry := registry.async_get(entity_id)
+            ) is not None and entry.device_id is not None:
+                devices[entry.device_id] = round(
+                    devices.get(entry.device_id, 0) + ms, 1
+                )
+        item["devices"] = dict(
+            sorted(devices.items(), key=lambda kv: kv[1], reverse=True)
+        )
+        item["entities"] = dict(list(entities.items())[:TOP_ENTITIES])
+        return item
+
+    def summary(self, minutes: int = WINDOW_MINUTES) -> dict[str, Any]:
+        """Return totals and the load per integration over the last `minutes`."""
+        self.drain()
+        return {
+            "sampler": self._sampler_stats(),
+            **self.collector.summary(time.monotonic(), self.started, minutes),
+        }
+
+    def detail(
+        self, domain: str, minutes: int = WINDOW_MINUTES
+    ) -> dict[str, Any] | None:
+        """Return everything known about one integration, or None."""
+        self.drain()
+        item = self.collector.detail(domain, time.monotonic(), self.started, minutes)
+        return None if item is None else self._with_devices(item)
+
+    def report(self, minutes: int = WINDOW_MINUTES) -> dict[str, Any]:
+        """Return the full report over the last `minutes`."""
+        self.drain()
+        report = self.collector.report(time.monotonic(), self.started, minutes)
+        for item in report["integrations"]:
+            self._with_devices(item)
+        return {"sampler": self._sampler_stats(), **report}
+
+    @callback
+    def async_subscribe(
+        self, minutes: int, send: Callable[[dict[str, Any]], None]
+    ) -> CALLBACK_TYPE:
+        """Send the summary now and after every drain until unsubscribed."""
+        subscriber = (minutes, send)
+        self._subscribers.append(subscriber)
+        send(self.summary(minutes))
+
+        @callback
+        def unsubscribe() -> None:
+            self._subscribers.remove(subscriber)
+
+        return unsubscribe
+
+    @callback
+    def _async_publish(self) -> None:
+        # One summary per window, however many panels show it.
+        summaries: dict[int, dict[str, Any]] = {}
+        for minutes, send in list(self._subscribers):
+            if (summary := summaries.get(minutes)) is None:
+                summary = summaries[minutes] = self.summary(minutes)
+            send(summary)

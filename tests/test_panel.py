@@ -133,3 +133,50 @@ async def test_entities_grouped_by_device(
     per_minute = foo["entities"][first] + foo["entities"][second]
     assert foo["devices"][device.id] == pytest.approx(per_minute, abs=0.2)
     assert result["device_names"] == {device.id: "Boiler"}
+
+
+async def test_detail_command(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
+    """Details come for one integration, None for an unknown one."""
+    await _setup(hass)
+    spin_at("/config/custom_components/busy/coordinator.py")(0.3)
+    client = await hass_ws_client(hass)
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/detail", "domain": "busy", "minutes": 5}
+    )
+    result = (await client.receive_json())["result"]
+    assert result["item"]["domain"] == "busy"
+    assert result["item"]["hot_spots"]
+    assert {"device_names", "entity_names", "entry_titles"} <= result.keys()
+
+    await client.send_json_auto_id({"type": f"{DOMAIN}/detail", "domain": "nope"})
+    assert (await client.receive_json())["result"] == {"item": None}
+
+
+async def test_subscribe_pushes_summary_after_drain(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
+    """The summary comes right away and after every drain, until unsubscribed."""
+    entry = await _setup(hass)
+    insights = entry.runtime_data
+    spin_at("/config/custom_components/busy/coordinator.py")(0.3)
+    client = await hass_ws_client(hass)
+    await client.send_json_auto_id({"type": f"{DOMAIN}/subscribe", "minutes": 5})
+    msg_id = (await client.receive_json())["id"]
+    first = await client.receive_json()
+    assert first["id"] == msg_id
+    summary = first["event"]["report"]
+    assert summary["integrations"][0]["domain"] == "busy"
+    assert "hot_spots" not in summary["integrations"][0]
+    assert first["event"]["names"]
+    assert "sampler" in summary
+
+    insights._async_drain()  # noqa: SLF001
+    assert (await client.receive_json())["id"] == msg_id
+
+    await client.send_json_auto_id(
+        {"type": "unsubscribe_events", "subscription": msg_id}
+    )
+    assert (await client.receive_json())["success"]
+    assert insights._subscribers == []  # noqa: SLF001

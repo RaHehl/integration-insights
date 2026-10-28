@@ -12,47 +12,50 @@ from homeassistant.loader import IntegrationNotLoaded, async_get_loaded_integrat
 
 from .collector import WINDOW_MINUTES
 from .const import DOMAIN
+from .insights import Insights
+
+MINUTES = vol.All(int, vol.Range(min=1, max=WINDOW_MINUTES))
 
 
 @callback
 def async_setup(hass: HomeAssistant) -> None:
     """Register the commands."""
     websocket_api.async_register_command(hass, websocket_report)
+    websocket_api.async_register_command(hass, websocket_detail)
+    websocket_api.async_register_command(hass, websocket_subscribe)
 
 
-@callback
-@websocket_api.require_admin
-@websocket_api.websocket_command(
-    {
-        vol.Required("type"): f"{DOMAIN}/report",
-        vol.Optional("minutes", default=WINDOW_MINUTES): vol.All(
-            int, vol.Range(min=1, max=WINDOW_MINUTES)
-        ),
-    }
-)
-def websocket_report(
-    hass: HomeAssistant,
-    connection: websocket_api.connection.ActiveConnection,
-    msg: dict[str, Any],
-) -> None:
-    """Return the report, with names for integrations, entries, devices, entities."""
+def _insights(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg_id: int
+) -> Insights | None:
     if not (entries := hass.config_entries.async_loaded_entries(DOMAIN)):
         connection.send_error(
-            msg["id"], websocket_api.ERR_NOT_FOUND, "Integration Insights is not loaded"
+            msg_id, websocket_api.ERR_NOT_FOUND, "Integration Insights is not loaded"
         )
-        return
-    entry = entries[0]
-    report = entry.runtime_data.report(msg["minutes"])
+        return None
+    insights: Insights = entries[0].runtime_data
+    return insights
+
+
+def _integration_names(
+    hass: HomeAssistant, items: list[dict[str, Any]]
+) -> dict[str, str]:
     names: dict[str, str] = {}
-    titles: dict[str, str] = {}
-    device_names: dict[str, str] = {}
-    entity_names: dict[str, str] = {}
-    devices = dr.async_get(hass)
-    for item in report["integrations"]:
+    for item in items:
         with suppress(IntegrationNotLoaded):
             names[item["domain"]] = async_get_loaded_integration(
                 hass, item["domain"]
             ).name
+    return names
+
+
+def _detail_names(hass: HomeAssistant, items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Return names for the entries, devices and entities of items."""
+    titles: dict[str, str] = {}
+    device_names: dict[str, str] = {}
+    entity_names: dict[str, str] = {}
+    devices = dr.async_get(hass)
+    for item in items:
         for entry_id in item["config_entries"]:
             if (
                 config_entry := hass.config_entries.async_get_entry(entry_id)
@@ -64,14 +67,95 @@ def websocket_report(
         for entity_id in item["entities"]:
             if (state := hass.states.get(entity_id)) is not None:
                 entity_names[entity_id] = state.name
+    return {
+        "entry_titles": titles,
+        "device_names": device_names,
+        "entity_names": entity_names,
+    }
+
+
+@callback
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/report",
+        vol.Optional("minutes", default=WINDOW_MINUTES): MINUTES,
+    }
+)
+def websocket_report(
+    hass: HomeAssistant,
+    connection: websocket_api.connection.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Return the full report, with names for integrations, entries, devices, entities."""
+    if (insights := _insights(hass, connection, msg["id"])) is None:
+        return
+    report = insights.report(msg["minutes"])
     connection.send_result(
         msg["id"],
         {
             "report": report,
-            "names": names,
-            "entry_titles": titles,
-            "device_names": device_names,
-            "entity_names": entity_names,
-            "entry_id": entry.entry_id,
+            "names": _integration_names(hass, report["integrations"]),
+            **_detail_names(hass, report["integrations"]),
+            "entry_id": hass.config_entries.async_loaded_entries(DOMAIN)[0].entry_id,
         },
     )
+
+
+@callback
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/detail",
+        vol.Required("domain"): str,
+        vol.Optional("minutes", default=WINDOW_MINUTES): MINUTES,
+    }
+)
+def websocket_detail(
+    hass: HomeAssistant,
+    connection: websocket_api.connection.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Return the details of one integration."""
+    if (insights := _insights(hass, connection, msg["id"])) is None:
+        return
+    if (item := insights.detail(msg["domain"], msg["minutes"])) is None:
+        connection.send_result(msg["id"], {"item": None})
+        return
+    connection.send_result(msg["id"], {"item": item, **_detail_names(hass, [item])})
+
+
+@callback
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/subscribe",
+        vol.Optional("minutes", default=WINDOW_MINUTES): MINUTES,
+    }
+)
+def websocket_subscribe(
+    hass: HomeAssistant,
+    connection: websocket_api.connection.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Send the summary now and after every drain."""
+    if (insights := _insights(hass, connection, msg["id"])) is None:
+        return
+    msg_id = msg["id"]
+    entry_id = hass.config_entries.async_loaded_entries(DOMAIN)[0].entry_id
+
+    @callback
+    def send(summary: dict[str, Any]) -> None:
+        connection.send_message(
+            websocket_api.event_message(
+                msg_id,
+                {
+                    "report": summary,
+                    "names": _integration_names(hass, summary["integrations"]),
+                    "entry_id": entry_id,
+                },
+            )
+        )
+
+    connection.send_result(msg_id)
+    connection.subscriptions[msg_id] = insights.async_subscribe(msg["minutes"], send)

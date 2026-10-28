@@ -81,6 +81,21 @@ def test_select_wrapper_still_counts_as_idle() -> None:
     assert run_once(wrapper, walk, sampler).domain == "idle"
 
 
+def test_sample_inside_the_select_wrapper_is_idle() -> None:
+    """A sample that lands in the wrapper right after select() returns is idle."""
+    sampler = Sampler()
+    wrapper = compile_at(
+        "/config/custom_components/integration_insights/background.py",
+        "def select(sampler):\n    import sys\n    return sampler.walk(sys._getframe(), 0)\n",
+    )["select"]
+    run_once = compile_at(BASE_EVENTS, "def _run_once(w, s):\n    return w(s)\n")[
+        "_run_once"
+    ]
+    assert run_once(wrapper, sampler).domain == "integration_insights"
+    sampler.select_wrapper = wrapper.__code__
+    assert run_once(wrapper, sampler).domain == "idle"
+
+
 def test_deep_library_stack_keeps_the_integration() -> None:
     """A deep library recursion neither loses the integration nor its line."""
     sampler = Sampler()
