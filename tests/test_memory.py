@@ -22,6 +22,7 @@ from custom_components.integration_insights.memory import (
     Resources,
     Snapshot,
     count_resources,
+    imported_packages,
     make_callable_owner,
     make_heap_owner,
     make_module_owner,
@@ -286,3 +287,10 @@ def test_walk_runs_no_python_code() -> None:
     mock.child.grandchild.value = 1
     accounts = walk([Root("mocked", DATA, {"mock": mock})], [], lambda cls: "core")
     assert accounts[("mocked", DATA)].count > 0
+
+
+def test_imported_packages_are_third_party() -> None:
+    """Only third party packages count, not Python or Home Assistant itself."""
+    packages = imported_packages()
+    assert "aiohttp" in packages
+    assert {"asyncio", "homeassistant", "custom_components"}.isdisjoint(packages)

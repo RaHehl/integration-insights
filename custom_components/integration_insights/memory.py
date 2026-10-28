@@ -228,6 +228,18 @@ def count_resources(
     }
 
 
+def imported_packages() -> set[str]:
+    """Return the top level packages of third party modules that are imported."""
+    packages = {top_package(name) for name in list(sys.modules)}
+    return {
+        package
+        for package in packages
+        if package not in sys.stdlib_module_names
+        and not package.startswith("_")
+        and package not in ("homeassistant", "custom_components")
+    }
+
+
 def make_heap_owner(library_map: Mapping[str, str]) -> Callable[[str], str]:
     """Return a function that names the owner of a module for the heap.
 

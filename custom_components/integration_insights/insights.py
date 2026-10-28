@@ -25,6 +25,7 @@ from .memory import (
     account_heap,
     count_resources,
     heap_roots,
+    imported_packages,
     make_callable_owner,
     make_heap_owner,
     make_module_owner,
@@ -63,7 +64,7 @@ class Insights:
         self.started = 0.0
         self._position = 0
         self._mapped_components: frozenset[str] | None = None
-        self._mapping = False
+        self._mapping_lock = asyncio.Lock()
         self._packages = Packages()
         self._owners: dict[str, str] = {}
         self._checked_libraries: set[str] = set()
@@ -165,11 +166,10 @@ class Insights:
                 _LOGGER.warning("Could not re-arm the sampler: %s", err)
                 self._rearm_failed = True
         components = frozenset(self.hass.config.top_level_components)
-        if not self._mapping and (
+        if not self._mapping_lock.locked() and (
             components != self._mapped_components
             or not self.collector.seen_libraries <= self._checked_libraries
         ):
-            self._mapping = True
             self.hass.async_create_background_task(
                 self._async_update_library_map(components),
                 "integration_insights library map",
@@ -201,9 +201,15 @@ class Insights:
         self.collector.add_threads(threads, time.monotonic())
 
     async def _async_update_library_map(self, components: frozenset[str]) -> None:
-        # Only libraries that showed up in samples are looked up. Integrations
-        # set up at runtime may have installed packages, so a new set of
-        # integrations maps everything again (the package cache stays).
+        async with self._mapping_lock:
+            await self._async_update_library_map_locked(components)
+
+    async def _async_update_library_map_locked(
+        self, components: frozenset[str]
+    ) -> None:
+        # Only libraries that showed up are looked up. Integrations set up at
+        # runtime may have installed packages, so a new set of integrations
+        # maps everything again (the package cache stays).
         changed = components != self._mapped_components
         requirements: dict[str, list[str]] | None = None
         if changed:
@@ -217,6 +223,8 @@ class Insights:
             libraries = set(self.collector.seen_libraries)
         else:
             libraries = self.collector.seen_libraries - self._checked_libraries
+        if not changed and not libraries:
+            return
         try:
             owners, mapped = await self.hass.async_add_executor_job(
                 self._map_libraries, requirements, libraries
@@ -224,8 +232,6 @@ class Insights:
         except Exception:
             _LOGGER.debug("Could not read the installed packages", exc_info=True)
             return
-        finally:
-            self._mapping = False
         if changed:
             self._mapped_components = components
             self._owners = owners
@@ -305,6 +311,12 @@ class Insights:
     async def async_take_snapshot(self) -> Snapshot:
         """Take a memory snapshot; the object walk runs in the executor."""
         async with self._snapshot_lock:
+            # The heap holds every imported library, not only those seen in
+            # samples; map them all so code lands with its integration.
+            self.collector.seen_libraries.update(imported_packages())
+            await self._async_update_library_map(
+                frozenset(self.hass.config.top_level_components)
+            )
             library_map = self.collector.library_map
             module_owner = make_module_owner(library_map)
             heap_owner = make_heap_owner(library_map)

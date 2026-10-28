@@ -64,34 +64,23 @@ class _Domain:
         self.thread_cpu_ns += other.thread_cpu_ns
         self.threads.update(other.threads)
 
-    def subtract(self, other: _Domain) -> None:
-        # Counter -= drops keys that reach zero, so a window that loses every
-        # minute it gained ends up empty again.
-        self.cpu_ns -= other.cpu_ns
-        self.samples -= other.samples
-        self.via_library_ns -= other.via_library_ns
-        self.triggers -= other.triggers
-        self.entries -= other.entries
-        self.entities -= other.entities
-        self.libraries -= other.libraries
-        self.hot_spots -= other.hot_spots
-        self.hot_spot_samples -= other.hot_spot_samples
-        self.stacks -= other.stacks
-        self.executor_cpu_ns -= other.executor_cpu_ns
-        self.executor_wall_ns -= other.executor_wall_ns
-        self.jobs -= other.jobs
-        self.job_counts -= other.job_counts
-        self.thread_cpu_ns -= other.thread_cpu_ns
-        self.threads -= other.threads
+    def merge_totals(self, other: _Domain, sign: int = 1) -> None:
+        """Add (or with sign -1 remove) only the numbers, not the counters."""
+        self.cpu_ns += sign * other.cpu_ns
+        self.samples += sign * other.samples
+        self.via_library_ns += sign * other.via_library_ns
+        self.executor_cpu_ns += sign * other.executor_cpu_ns
+        self.executor_wall_ns += sign * other.executor_wall_ns
+        self.thread_cpu_ns += sign * other.thread_cpu_ns
 
-    def is_empty(self) -> bool:
+    def totals_are_zero(self) -> bool:
         return not (
-            self.samples
-            or self.cpu_ns
+            self.cpu_ns
+            or self.samples
+            or self.via_library_ns
+            or self.executor_cpu_ns
             or self.executor_wall_ns
-            or self.job_counts
             or self.thread_cpu_ns
-            or self.threads
         )
 
     @property
@@ -111,35 +100,29 @@ class _Bucket:
     dropped_stack_ns: int = 0
     domains: dict[str, _Domain] = field(default_factory=dict)
 
-    def merge(self, other: _Bucket) -> None:
-        self.cpu_ns += other.cpu_ns
-        self.loop_busy_ns += other.loop_busy_ns
-        self.executor_cpu_ns += other.executor_cpu_ns
-        self.thread_cpu_ns += other.thread_cpu_ns
-        self.samples += other.samples
-        self.dropped_stack_ns += other.dropped_stack_ns
+    def merge_totals(self, other: _Bucket, sign: int = 1) -> None:
+        """Add (or remove) the numbers of another bucket, without counters."""
+        self.cpu_ns += sign * other.cpu_ns
+        self.loop_busy_ns += sign * other.loop_busy_ns
+        self.executor_cpu_ns += sign * other.executor_cpu_ns
+        self.thread_cpu_ns += sign * other.thread_cpu_ns
+        self.samples += sign * other.samples
+        self.dropped_stack_ns += sign * other.dropped_stack_ns
         for domain, stats in other.domains.items():
             if (total := self.domains.get(domain)) is None:
                 total = self.domains[domain] = _Domain()
-            total.merge(stats)
-
-    def subtract(self, other: _Bucket) -> None:
-        self.cpu_ns -= other.cpu_ns
-        self.loop_busy_ns -= other.loop_busy_ns
-        self.executor_cpu_ns -= other.executor_cpu_ns
-        self.thread_cpu_ns -= other.thread_cpu_ns
-        self.samples -= other.samples
-        self.dropped_stack_ns -= other.dropped_stack_ns
-        for domain, stats in other.domains.items():
-            total = self.domains[domain]
-            total.subtract(stats)
-            if total.is_empty():
+            total.merge_totals(stats, sign)
+            if total.totals_are_zero():
                 del self.domains[domain]
 
 
 @dataclass(slots=True)
 class _Window:
-    """Running sum of the finished minutes in a window."""
+    """Running sum of the numbers of the finished minutes in a window.
+
+    Counters (stacks, hot spots, entities) stay in the minute buckets only;
+    details merge them for one integration when asked.
+    """
 
     total: _Bucket = field(default_factory=lambda: _Bucket(-1))
     minutes: dict[int, _Bucket] = field(default_factory=dict)
@@ -163,6 +146,7 @@ class Collector:
         self._lines: dict[int, tuple[Any, list[int], list[int | None]]] = {}
         self._prefixes: dict[str, tuple[str, str]] = {}
         self._windows: dict[int, _Window] = {}
+        self._stacks: dict[Stack, Stack] = {}
 
     def _bucket(self, now: float) -> _Bucket:
         minute = int(now // 60)
@@ -216,6 +200,8 @@ class Collector:
         if len(self._locations) > 50_000:
             self._locations.clear()
             self._lines.clear()
+        if len(self._stacks) > 20_000:
+            self._stacks.clear()
 
     def _add(self, bucket: _Bucket, record: Record) -> None:
         ns = record.cpu_ns
@@ -249,6 +235,8 @@ class Collector:
         if domain == "idle":
             return
         stack = self._stack(record.frames)
+        # One tuple per distinct stack, shared by every minute that saw it.
+        stack = self._stacks.setdefault(stack, stack)
         if (
             location := self._hot_location(domain, stack, record.self_index)
         ) is not None:
@@ -331,10 +319,10 @@ class Collector:
             if first <= bucket.minute < current
         }
         for minute in [m for m in window.minutes if m not in finished]:
-            window.total.subtract(window.minutes.pop(minute))
+            window.total.merge_totals(window.minutes.pop(minute), -1)
         for minute, bucket in finished.items():
             if minute not in window.minutes:
-                window.total.merge(bucket)
+                window.total.merge_totals(bucket)
                 window.minutes[minute] = bucket
         return window
 
@@ -407,11 +395,14 @@ class Collector:
         self, domain: str, now: float, started: float, minutes: int = WINDOW_MINUTES
     ) -> dict[str, Any] | None:
         """Return everything known about one integration, or None."""
-        span, finished, current = self._view(now, started, minutes)
+        span, _finished, _current = self._view(now, started, minutes)
+        first_minute = int(now // 60) - min(minutes, WINDOW_MINUTES) + 1
         stats = _Domain()
         found = False
-        for part in (finished, current):
-            if part is not None and (part_stats := part.domains.get(domain)):
+        for bucket in self._buckets:
+            if bucket.minute >= first_minute and (
+                part_stats := bucket.domains.get(domain)
+            ):
                 stats.merge(part_stats)
                 found = True
         return _item(domain, stats, span) if found and domain != "idle" else None
