@@ -697,4 +697,7 @@ class IntegrationInsightsPanel extends HTMLElement {
   }
 }
 
-customElements.define("integration-insights-panel", IntegrationInsightsPanel);
+// An open tab keeps the old module after an update until it reloads.
+if (!customElements.get("integration-insights-panel")) {
+  customElements.define("integration-insights-panel", IntegrationInsightsPanel);
+}
