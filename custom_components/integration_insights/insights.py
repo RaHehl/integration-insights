@@ -1,5 +1,7 @@
 """Run the sampler and feed the collector."""
 
+import asyncio
+from collections import deque
 from collections.abc import Callable
 from datetime import timedelta
 import logging
@@ -13,15 +15,28 @@ from homeassistant.core import CALLBACK_TYPE, Event, HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.loader import IntegrationNotLoaded, async_get_loaded_integration
+from homeassistant.util import dt as dt_util
 
 from .attribution import Packages, distribution_owners, library_owners
 from .background import Background, LoopWait, ThreadRecord
 from .collector import WINDOW_MINUTES, Collector
+from .memory import (
+    Snapshot,
+    account_heap,
+    count_resources,
+    heap_roots,
+    make_callable_owner,
+    make_heap_owner,
+    make_module_owner,
+    read_process,
+    to_report,
+)
 from .sampler import Sampler, SamplerError
 
 _LOGGER = logging.getLogger(__name__)
 DRAIN_INTERVAL = timedelta(seconds=10)
 TOP_ENTITIES = 20
+KEPT_SNAPSHOTS = 10
 
 
 def _wakeup_fd(hass: HomeAssistant) -> int | None:
@@ -58,6 +73,8 @@ class Insights:
         self._unsub_stop: CALLBACK_TYPE | None = None
         self._polling = False
         self._subscribers: list[tuple[int, Callable[[dict[str, Any]], None]]] = []
+        self.snapshots: deque[Snapshot] = deque(maxlen=KEPT_SNAPSHOTS)
+        self._snapshot_lock = asyncio.Lock()
         self._wall_ns = 0
         self._waiting_ns = 0
 
@@ -284,6 +301,35 @@ class Insights:
         for item in report["integrations"]:
             self._with_devices(item)
         return {"sampler": self._sampler_stats(), **report}
+
+    async def async_take_snapshot(self) -> Snapshot:
+        """Take a memory snapshot; the object walk runs in the executor."""
+        async with self._snapshot_lock:
+            library_map = self.collector.library_map
+            module_owner = make_module_owner(library_map)
+            heap_owner = make_heap_owner(library_map)
+            resources = count_resources(
+                self.hass, make_callable_owner(library_map), module_owner
+            )
+            roots, stoppers = heap_roots(self.hass, heap_owner, module_owner)
+            heap, walk_ms = await self.hass.async_add_executor_job(
+                account_heap, roots, stoppers, heap_owner
+            )
+            del roots, stoppers
+            process = await self.hass.async_add_executor_job(read_process)
+            snapshot = Snapshot(dt_util.utcnow(), walk_ms, process, heap, resources)
+            self.snapshots.append(snapshot)
+            return snapshot
+
+    def memory_report(self) -> dict[str, Any]:
+        """Return the latest snapshot compared with the one before, and all times."""
+        if not self.snapshots:
+            return {"snapshots": []}
+        previous = self.snapshots[-2] if len(self.snapshots) > 1 else None
+        return {
+            "snapshots": [s.taken.isoformat() for s in self.snapshots],
+            "latest": to_report(self.snapshots[-1], previous),
+        }
 
     @callback
     def async_subscribe(

@@ -2,10 +2,13 @@
 
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping
+import functools
 from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
 import re
 import sys
+from types import ModuleType
+from typing import Any
 
 from homeassistant.const import BASE_PLATFORMS
 
@@ -62,6 +65,49 @@ def module_domain(module: str) -> str | None:
         if module.startswith(prefix):
             return module[len(prefix) :].split(".", 1)[0]
     return None
+
+
+def top_package(module: str) -> str:
+    """Return the top level package of a module name."""
+    return module.split(".", 1)[0]
+
+
+def callable_owner(fn: Any) -> tuple[str | None, tuple[str, ...], str]:
+    """Return the domain, packages and label of a callable, without calling it.
+
+    The class of a bound method wins over the function: Entity.update runs for
+    the integration that owns the entity.
+    """
+    while isinstance(fn, functools.partial):
+        fn = fn.func
+    func = getattr(fn, "__func__", fn)
+    name = getattr(func, "__name__", None) or type(func).__name__
+    owner = getattr(fn, "__self__", None)
+    modules: list[str] = []
+    if owner is not None and not isinstance(owner, ModuleType):
+        cls = type(owner)
+        modules.append(cls.__module__)
+        label = f"{cls.__module__}.{cls.__qualname__}.{name}"
+    else:
+        label = f"{getattr(func, '__module__', None) or '?'}.{getattr(func, '__qualname__', name)}"
+    if isinstance(module := getattr(func, "__module__", None), str):
+        modules.append(module)
+    for module in modules:
+        if (domain := module_domain(module)) is not None:
+            return domain, (), label
+    return None, tuple(dict.fromkeys(top_package(m) for m in modules)), label
+
+
+def owner_domain(
+    domain: str | None, libraries: Iterable[str], library_map: Mapping[str, str]
+) -> str:
+    """Return the integration for a resolved owner, "core" if there is none."""
+    if domain is not None:
+        return domain
+    for library in libraries:
+        if (mapped := library_map.get(library)) is not None:
+            return mapped
+    return "core"
 
 
 def short_path(filename: str) -> str:

@@ -7,11 +7,11 @@ import time
 
 import pytest
 
+from custom_components.integration_insights.attribution import callable_owner
 from custom_components.integration_insights.background import (
     Background,
     LoopWait,
     Owner,
-    callable_owner,
 )
 from custom_components.integration_insights.collector import Collector
 from custom_components.integration_insights.sampler import Sampler, is_supported

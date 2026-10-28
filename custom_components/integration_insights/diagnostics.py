@@ -14,4 +14,5 @@ async def async_get_config_entry_diagnostics(
 
     It holds code locations only, no arguments or local variables.
     """
-    return entry.runtime_data.report()
+    insights = entry.runtime_data
+    return {**insights.report(), "memory": insights.memory_report()}

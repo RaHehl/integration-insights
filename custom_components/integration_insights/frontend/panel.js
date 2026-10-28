@@ -149,6 +149,10 @@ const STYLE = `
     border-bottom: 1px solid var(--divider-color);
   }
   .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .card-head.mem, .row.mem { grid-template-columns: 1fr 100px 100px 84px 70px 60px; }
+  .delta { display: block; font-size: 12px; color: var(--secondary-text-color); }
+  .delta.up { color: var(--error-color, #db4437); }
+  .delta.down { color: var(--success-color, #43a047); }
   .row {
     display: grid;
     grid-template-columns: 1fr 96px 110px 90px 70px;
@@ -251,6 +255,8 @@ const STYLE = `
   @media (max-width: 600px) {
     main { padding: 12px; }
     .card-head, .row { grid-template-columns: 1fr 64px 76px 56px; gap: 8px; }
+    .card-head.mem, .row.mem { grid-template-columns: 1fr 64px 64px 56px; }
+    .col-wide { display: none; }
     .col-samples { display: none; }
     .detail { padding-left: 16px; }
     .header-button { display: none; }
@@ -267,6 +273,10 @@ class IntegrationInsightsPanel extends HTMLElement {
     this._expanded = new Set();
     this._openStacks = new Set();
     this._details = new Map();
+    this._view = "cpu";
+    this._memory = undefined;
+    this._memExpanded = new Set();
+    this._snapshotting = false;
     this._onClick = this._onClick.bind(this);
     this._onKeyDown = this._onKeyDown.bind(this);
     this._onToggle = this._onToggle.bind(this);
@@ -312,7 +322,7 @@ class IntegrationInsightsPanel extends HTMLElement {
   }
 
   async _subscribe() {
-    if (!this._hass || this._token || document.hidden) return;
+    if (!this._hass || this._token || document.hidden || this._view !== "cpu") return;
     const token = (this._token = {});
     try {
       const unsub = await this._hass.connection.subscribeMessage(
@@ -341,6 +351,23 @@ class IntegrationInsightsPanel extends HTMLElement {
     this._error = undefined;
     this._updated = new Date();
     for (const domain of this._expanded) this._loadDetail(domain);
+    this._render();
+  }
+
+  async _loadMemory(take) {
+    if (this._snapshotting) return;
+    this._snapshotting = take;
+    this._render();
+    try {
+      this._memory = await this._hass.connection.sendMessagePromise({
+        type: take ? "integration_insights/memory_snapshot" : "integration_insights/memory",
+      });
+      this._error = undefined;
+    } catch (err) {
+      this._error = err && err.message ? err.message : String(err);
+    } finally {
+      this._snapshotting = false;
+    }
     this._render();
   }
 
@@ -381,6 +408,20 @@ class IntegrationInsightsPanel extends HTMLElement {
         this._loadDetail(value);
       }
       this._render();
+    } else if (action === "view") {
+      this._view = value;
+      if (value === "cpu") this._subscribe();
+      else {
+        this._unsubscribe();
+        if (!this._memory) this._loadMemory(false);
+      }
+      this._render();
+    } else if (action === "snapshot") {
+      this._loadMemory(true);
+    } else if (action === "memtoggle") {
+      if (this._memExpanded.has(value)) this._memExpanded.delete(value);
+      else this._memExpanded.add(value);
+      this._render();
     } else if (action === "download") {
       this._download();
     } else if (action === "copy") {
@@ -390,7 +431,7 @@ class IntegrationInsightsPanel extends HTMLElement {
 
   _onKeyDown(ev) {
     if (ev.key !== "Enter" && ev.key !== " ") return;
-    const row = ev.target.closest('.row[data-action="toggle"]');
+    const row = ev.target.closest('.row[data-action="toggle"], .row[data-action="memtoggle"]');
     if (!row) return;
     ev.preventDefault();
     row.click();
@@ -531,13 +572,28 @@ class IntegrationInsightsPanel extends HTMLElement {
       (minutes) =>
         `<button data-action="window" data-value="${minutes}" aria-pressed="${minutes === this._minutes}">${minutes} min</button>`
     ).join("");
+    const views = [
+      ["cpu", "CPU"],
+      ["memory", "Memory"],
+    ]
+      .map(
+        ([view, label]) =>
+          `<button data-action="view" data-value="${view}" aria-pressed="${view === this._view}">${label}</button>`
+      )
+      .join("");
+    const tools =
+      this._view === "cpu"
+        ? `<div class="segmented" role="group" aria-label="Time window">${windows}</div>
+      <button class="header-button" data-action="download" ${this._data ? "" : "disabled"}>Download report</button>`
+        : `<button class="header-button" data-action="snapshot" ${this._snapshotting ? "disabled" : ""}>${this._snapshotting ? "Taking snapshot…" : "Take snapshot"}</button>`;
     return `<header>${menu}<h1>Integration Insights</h1>
-      <div class="segmented" role="group" aria-label="Time window">${windows}</div>
-      <button class="header-button" data-action="download" ${this._data ? "" : "disabled"}>Download report</button>
+      <div class="segmented" role="group" aria-label="View">${views}</div>
+      ${tools}
     </header>`;
   }
 
   _renderBody() {
+    if (this._view === "memory") return this._renderMemory();
     if (!this._data) {
       return this._error
         ? `<div class="message error">${escapeHtml(this._error)}</div>`
@@ -609,6 +665,74 @@ class IntegrationInsightsPanel extends HTMLElement {
         ${rows}
       </div>
       <div class="footer">CPU time on the event loop, sampled every ${sampler.interval_ms} ms of loop CPU. Background is CPU in executor jobs and threads, measured exactly. Updated ${updated}${this._error ? ` · <span class="error">${escapeHtml(this._error)}</span>` : ""}</div>`;
+  }
+
+  _ownerName(owner) {
+    if (owner.startsWith("lib:")) return `Library ${owner.slice(4)}`;
+    if (owner.startsWith("core:")) return `Core: ${owner.slice(5)}`;
+    if (owner === "core") return "Home Assistant core code";
+    if (owner === "python") return "Python standard library";
+    if (owner === "shared") return "Shared strings and bytes";
+    return this._memory.names[owner] || owner;
+  }
+
+  _renderMemory() {
+    const error = this._error ? `<div class="message error">${escapeHtml(this._error)}</div>` : "";
+    if (!this._memory) return error || `<div class="message">Loading…</div>`;
+    const latest = this._memory.memory.latest;
+    if (!latest) {
+      return `${error}<div class="card"><div class="message">No snapshot yet. A snapshot walks the Python heap once and splits it into what each integration holds, its code and the parts of Home Assistant core. Take two some time apart to see what grows.</div></div>`;
+    }
+    const delta = (value, unit = "") => {
+      if (value === undefined || value === null || value === 0) return "";
+      const cls = value > 0 ? "up" : "down";
+      return `<span class="delta ${cls}">${value > 0 ? "+" : ""}${value.toLocaleString()}${unit}</span>`;
+    };
+    const balance = latest.balance;
+    const mibTile = (label, value, sub) =>
+      value === undefined
+        ? ""
+        : `<div class="tile"><div class="label">${label}</div>
+        <div class="value">${value.toLocaleString()} MiB</div><div class="sub">${sub}</div></div>`;
+    const share = (value) =>
+      balance.rss_mib ? `${Math.round((value / balance.rss_mib) * 100)} % of resident` : "&nbsp;";
+    const taken = new Date(latest.taken).toLocaleString();
+    const since = latest.previous_taken
+      ? `compared with ${new Date(latest.previous_taken).toLocaleString()}`
+      : "first snapshot, take another one to compare";
+    const tiles = `<div class="summary">
+      ${mibTile("Resident memory", balance.rss_mib, delta((latest.process_change || {}).rss_mib, " MiB") || "&nbsp;")}
+      ${mibTile("Integrations", balance.integration_mib, share(balance.integration_mib))}
+      ${mibTile("Libraries", balance.library_mib, share(balance.library_mib))}
+      ${mibTile("Home Assistant core", balance.core_mib, share(balance.core_mib))}
+      ${mibTile("Outside Python objects", balance.not_in_python_mib, "interpreter, native code, allocator")}
+      <div class="tile"><div class="label">Snapshot</div>
+        <div class="value">${escapeHtml(taken)}</div>
+        <div class="sub">${escapeHtml(since)} · walk ${latest.walk_ms.toLocaleString()} ms</div></div>
+    </div>`;
+    const rows = latest.owners
+      .map((row) => {
+        const expanded = this._memExpanded.has(row.owner);
+        const c = row.change || {};
+        const detail = expanded
+          ? `<div class="detail"><p class="note">Data ${row.data_kib.toLocaleString()} KiB · code ${row.code_kib.toLocaleString()} KiB · not reached from a root ${row.unreached_kib.toLocaleString()} KiB · dispatcher connections ${row.dispatcher}${delta(c.dispatcher)}</p></div>`
+          : "";
+        return `<div class="row mem" data-action="memtoggle" data-value="${escapeHtml(row.owner)}" role="button" tabindex="0" aria-expanded="${expanded}">
+            <div class="name"><div class="title"><svg class="chev" viewBox="0 0 24 24"><path fill="currentColor" d="M8.59,16.58L13.17,12L8.59,7.41L10,6L16,12L10,18L8.59,16.58Z"></path></svg>
+              <span>${escapeHtml(this._ownerName(row.owner))}</span></div><div class="domain">${escapeHtml(row.owner)}</div></div>
+            <div class="num">${row.kib.toLocaleString()}${delta(c.kib)}</div>
+            <div class="num">${row.data_kib.toLocaleString()}</div>
+            <div class="num">${row.listeners}${delta(c.listeners)}</div>
+            <div class="num col-wide">${row.timers}${delta(c.timers)}</div>
+            <div class="num col-wide">${row.tasks}${delta(c.tasks)}</div>
+          </div>${detail}`;
+      })
+      .join("");
+    return `${error}${tiles}<div class="card">
+        <div class="card-head mem"><div>Owner</div><div class="num">KiB</div><div class="num">Data KiB</div><div class="num">Listeners</div><div class="num col-wide">Timers</div><div class="num col-wide">Tasks</div></div>
+        ${rows}
+      </div>
+      <div class="footer">Every Python object counted once, for the first owner that holds it: integrations through their config entries, hass.data and entities; code per module; then Home Assistant core. Sizes are shallow, so memory held by native code shows only in "Outside Python objects".</div>`;
   }
 
   _renderDetail(brief) {

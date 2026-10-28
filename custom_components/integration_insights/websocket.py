@@ -23,6 +23,8 @@ def async_setup(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, websocket_report)
     websocket_api.async_register_command(hass, websocket_detail)
     websocket_api.async_register_command(hass, websocket_subscribe)
+    websocket_api.async_register_command(hass, websocket_memory)
+    websocket_api.async_register_command(hass, websocket_memory_snapshot)
 
 
 def _insights(
@@ -159,3 +161,42 @@ def websocket_subscribe(
 
     connection.send_result(msg_id)
     connection.subscriptions[msg_id] = insights.async_subscribe(msg["minutes"], send)
+
+
+@callback
+@websocket_api.require_admin
+@websocket_api.websocket_command({vol.Required("type"): f"{DOMAIN}/memory"})
+def websocket_memory(
+    hass: HomeAssistant,
+    connection: websocket_api.connection.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Return the latest memory snapshot compared with the one before."""
+    if (insights := _insights(hass, connection, msg["id"])) is None:
+        return
+    connection.send_result(msg["id"], _memory_result(hass, insights))
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command({vol.Required("type"): f"{DOMAIN}/memory_snapshot"})
+@websocket_api.async_response
+async def websocket_memory_snapshot(
+    hass: HomeAssistant,
+    connection: websocket_api.connection.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Take a memory snapshot and return it compared with the one before."""
+    if (insights := _insights(hass, connection, msg["id"])) is None:
+        return
+    await insights.async_take_snapshot()
+    connection.send_result(msg["id"], _memory_result(hass, insights))
+
+
+def _memory_result(hass: HomeAssistant, insights: Insights) -> dict[str, Any]:
+    memory = insights.memory_report()
+    rows = [
+        {"domain": row["owner"]}
+        for row in memory.get("latest", {}).get("owners", [])
+        if row["group"] == "integration"
+    ]
+    return {"memory": memory, "names": _integration_names(hass, rows)}
