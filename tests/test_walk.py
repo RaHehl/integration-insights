@@ -62,6 +62,25 @@ def test_idle_only_inside_the_loops_select() -> None:
     assert select(lambda: None) is None
 
 
+def test_select_wrapper_still_counts_as_idle() -> None:
+    """The loop wait wrapper between _run_once and select() keeps it idle."""
+    sampler = Sampler()
+    walk = compile_at(
+        SELECTORS,
+        "def select(sampler):\n    import sys\n    return sampler.walk(sys._getframe(), 0)\n",
+    )["select"]
+    wrapper = compile_at(
+        "/config/custom_components/integration_insights/background.py",
+        "def select(f, s):\n    return f(s)\n",
+    )["select"]
+    run_once = compile_at(BASE_EVENTS, "def _run_once(w, f, s):\n    return w(f, s)\n")[
+        "_run_once"
+    ]
+    assert run_once(wrapper, walk, sampler).domain != "idle"
+    sampler.select_wrapper = wrapper.__code__
+    assert run_once(wrapper, walk, sampler).domain == "idle"
+
+
 def test_deep_library_stack_keeps_the_integration() -> None:
     """A deep library recursion neither loses the integration nor its line."""
     sampler = Sampler()

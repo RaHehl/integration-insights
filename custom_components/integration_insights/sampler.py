@@ -198,6 +198,8 @@ class Sampler:
         self._in_handler = False
         self._backed_off = False
         self._since_drain = 0
+        # Code of a wrapper around the selector's select(), still idle time.
+        self.select_wrapper: Any = None
         self._platforms = platform_domains()
         self._file_cache: dict[str, tuple[int, str | None]] = {}
         self._module_cache: dict[str, str | None] = {}
@@ -373,6 +375,8 @@ class Sampler:
         entity_id: str | None = None
         if frame is not None and frame.f_code.co_name == "select":
             caller = frame.f_back
+            if caller is not None and caller.f_code is self.select_wrapper:
+                caller = caller.f_back
             idle = (
                 frame.f_code.co_filename.endswith("selectors.py")
                 and caller is not None

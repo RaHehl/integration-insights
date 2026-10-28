@@ -140,7 +140,7 @@ const STYLE = `
   }
   .card-head {
     display: grid;
-    grid-template-columns: 1fr 120px 90px 70px;
+    grid-template-columns: 1fr 96px 110px 90px 70px;
     gap: 12px;
     padding: 10px 16px;
     font-size: 12px;
@@ -152,7 +152,7 @@ const STYLE = `
   .num { text-align: right; font-variant-numeric: tabular-nums; }
   .row {
     display: grid;
-    grid-template-columns: 1fr 120px 90px 70px;
+    grid-template-columns: 1fr 96px 110px 90px 70px;
     gap: 12px;
     align-items: center;
     padding: 10px 16px;
@@ -251,7 +251,7 @@ const STYLE = `
   .footer { margin-top: 12px; font-size: 13px; color: var(--secondary-text-color); }
   @media (max-width: 600px) {
     main { padding: 12px; }
-    .card-head, .row { grid-template-columns: 1fr 76px 56px; gap: 8px; }
+    .card-head, .row { grid-template-columns: 1fr 64px 76px 56px; gap: 8px; }
     .col-samples { display: none; }
     .detail { padding-left: 16px; }
     .header-button { display: none; }
@@ -423,6 +423,21 @@ class IntegrationInsightsPanel extends HTMLElement {
         `${item.samples} samples over ${report.window_minutes} min` +
         (item.low_confidence ? " (few samples)" : ""),
     ];
+    if (item.executor) {
+      const ex = item.executor;
+      lines.push(
+        `Executor jobs: ${ex.cpu_ms_per_min} ms/min CPU, ${ex.wall_ms_per_min} ms/min wall, ${ex.jobs_per_min} jobs/min`
+      );
+      for (const job of ex.jobs) {
+        lines.push(`- ${job.function}: ${job.cpu_ms_per_min} ms/min CPU, ${job.per_min} per min`);
+      }
+    }
+    if (item.threads) {
+      lines.push(`Threads: ${item.threads.cpu_ms_per_min} ms/min CPU`);
+      for (const [name, value] of Object.entries(item.threads.by_name)) {
+        lines.push(`- ${name}: ${value} ms/min`);
+      }
+    }
     if (item.via_library_ms_per_min) {
       lines.push(
         `Charged through libraries only this integration uses: ${item.via_library_ms_per_min} ms/min`
@@ -491,12 +506,19 @@ class IntegrationInsightsPanel extends HTMLElement {
     const samplerCost = (sampler.handler_cpu_us_avg * samplesPerMinute) / 1000;
     const problems = sampler.samples_lost + sampler.handler_errors;
     const integrations = report.integrations;
-    const top = integrations.length ? integrations[0].loop_cpu_ms_per_min : 0;
+    const top = integrations.length ? integrations[0].cpu_ms_per_min : 0;
+    const background = report.executor_cpu_ms_per_min + report.thread_cpu_ms_per_min;
 
     const tiles = `<div class="summary">
-      <div class="tile"><div class="label">Event loop busy</div>
+      <div class="tile"><div class="label">Event loop CPU</div>
         <div class="value">${ms(report.loop_cpu_ms_per_min)} ms/min</div>
         <div class="sub">${corePercent(report.loop_cpu_ms_per_min)} of one core</div></div>
+      <div class="tile"><div class="label">Event loop busy</div>
+        <div class="value">${ms(report.loop_busy_ms_per_min)} ms/min</div>
+        <div class="sub">wall time, includes waits for the GIL or blocking calls</div></div>
+      <div class="tile"><div class="label">Background CPU</div>
+        <div class="value">${ms(background)} ms/min</div>
+        <div class="sub">executor ${ms(report.executor_cpu_ms_per_min)} · threads ${ms(report.thread_cpu_ms_per_min)}</div></div>
       <div class="tile"><div class="label">Window</div>
         <div class="value">${report.window_minutes} min</div>
         <div class="sub">${report.samples.toLocaleString()} samples</div></div>
@@ -519,7 +541,7 @@ class IntegrationInsightsPanel extends HTMLElement {
           item.domain === "core"
             ? "Home Assistant core and unassigned work"
             : this._data.names[item.domain] || item.domain;
-        const width = top ? Math.max((item.loop_cpu_ms_per_min / top) * 100, 1) : 0;
+        const width = top ? Math.max((item.cpu_ms_per_min / top) * 100, 1) : 0;
         const badge = item.low_confidence
           ? `<span class="badge" title="Fewer than 20 samples: the number is rough">few samples</span>`
           : "";
@@ -531,7 +553,8 @@ class IntegrationInsightsPanel extends HTMLElement {
               <div class="bar" style="width:${width.toFixed(1)}%"></div>
             </div>
             <div class="num">${ms(item.loop_cpu_ms_per_min)}</div>
-            <div class="num">${corePercent(item.loop_cpu_ms_per_min)}</div>
+            <div class="num">${ms(item.background_cpu_ms_per_min)}</div>
+            <div class="num">${corePercent(item.cpu_ms_per_min)}</div>
             <div class="num col-samples">${item.samples}</div>
           </div>${expanded ? this._renderDetail(item) : ""}`;
       })
@@ -539,10 +562,10 @@ class IntegrationInsightsPanel extends HTMLElement {
 
     const updated = this._updated ? this._updated.toLocaleTimeString() : "";
     return `${tiles}<div class="card">
-        <div class="card-head"><div>Integration</div><div class="num">ms/min</div><div class="num">of a core</div><div class="num col-samples">Samples</div></div>
+        <div class="card-head"><div>Integration</div><div class="num">Loop ms/min</div><div class="num">Background</div><div class="num">of a core</div><div class="num col-samples">Samples</div></div>
         ${rows}
       </div>
-      <div class="footer">CPU time on the event loop, sampled every ${sampler.interval_ms} ms of loop CPU. Updated ${updated}${this._error ? ` · <span class="error">${escapeHtml(this._error)}</span>` : ""}</div>`;
+      <div class="footer">CPU time on the event loop, sampled every ${sampler.interval_ms} ms of loop CPU. Background is CPU in executor jobs and threads, measured exactly. Updated ${updated}${this._error ? ` · <span class="error">${escapeHtml(this._error)}</span>` : ""}</div>`;
   }
 
   _renderDetail(item) {
@@ -552,6 +575,25 @@ class IntegrationInsightsPanel extends HTMLElement {
       parts.push(
         `<p class="note">${ms(item.via_library_ms_per_min)} ms/min of this ran in libraries that only this integration uses.</p>`
       );
+    }
+    if (item.executor) {
+      const ex = item.executor;
+      const jobs = ex.jobs
+        .map(
+          (job) => `<div class="spot"><div class="code">${escapeHtml(job.function)}</div>
+            <div class="num">${ms(job.cpu_ms_per_min)} ms/min</div>
+            <div class="lines"><span class="chip">${job.per_min} per min</span></div></div>`
+        )
+        .join("");
+      parts.push(
+        `<h3>Executor jobs</h3><p class="note">${ms(ex.cpu_ms_per_min)} ms/min CPU, ${ms(ex.wall_ms_per_min)} ms/min of worker time, ${ex.jobs_per_min} jobs per minute.</p>${jobs}`
+      );
+    }
+    if (item.threads) {
+      const chips = Object.entries(item.threads.by_name)
+        .map(([name, value]) => `<span class="chip">${escapeHtml(name)} · ${ms(value)}</span>`)
+        .join("");
+      parts.push(`<h3>Threads</h3><div class="pairs">${chips}</div>`);
     }
     if (item.hot_spots.length) {
       const spots = item.hot_spots

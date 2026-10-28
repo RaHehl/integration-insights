@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import signal
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -11,6 +12,7 @@ from pytest_homeassistant_custom_component.components.diagnostics import (
 )
 from pytest_homeassistant_custom_component.typing import ClientSessionGenerator
 
+from custom_components.integration_insights.attribution import Packages
 from custom_components.integration_insights.const import DOMAIN
 from custom_components.integration_insights.sampler import is_supported
 from homeassistant.config_entries import ConfigEntryState
@@ -90,3 +92,77 @@ async def test_stop_event_removes_sampler(
     assert signal.getsignal(signal.SIGPROF) is signal.SIG_DFL
     assert await hass.config_entries.async_unload(entry.entry_id)
     assert "Unable to remove unknown job listener" not in caplog.text
+
+
+@linux_only
+async def test_executor_jobs_reach_the_report(hass: HomeAssistant) -> None:
+    """Jobs from hass.async_add_executor_job count for the submitting module."""
+    namespace = {"__name__": "custom_components.busy.worker"}
+    exec(  # noqa: S102
+        compile(
+            "def spin(seconds):\n    import time\n    end = time.thread_time() + seconds\n"
+            "    while time.thread_time() < end:\n        pass\n",
+            "/config/custom_components/busy/worker.py",
+            "exec",
+        ),
+        namespace,
+    )
+    await hass.async_add_executor_job(int)  # make sure the default executor exists
+    entry = MockConfigEntry(domain=DOMAIN)
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    executor = hass.loop._default_executor  # noqa: SLF001
+    assert "submit" in vars(executor)
+
+    await hass.async_add_executor_job(namespace["spin"], 0.1)
+    report = entry.runtime_data.report()
+    busy = next(item for item in report["integrations"] if item["domain"] == "busy")
+    assert busy["executor"]["cpu_ms_per_min"] > 0
+    assert busy["loop_cpu_ms_per_min"] == 0
+    assert report["sampler"]["executor_jobs_total"] >= 1
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    assert "submit" not in vars(executor)
+
+
+@linux_only
+async def test_library_map_looks_up_seen_libraries(hass: HomeAssistant) -> None:
+    """Only libraries seen without an integration frame are looked up."""
+    entry = MockConfigEntry(domain=DOMAIN)
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    insights = entry.runtime_data
+    looked_up: list[str] = []
+
+    def read_imports(dist: str) -> tuple[str, ...] | None:
+        looked_up.append(dist)
+        return (dist,)
+
+    insights._packages = Packages(  # noqa: SLF001
+        lambda dist: {"aiofoo": (), "aiobar": ()}.get(dist, ()),
+        read_imports,
+        lambda names: {},
+    )
+    requirements = {"foo": ["aiofoo==1"], "bar": ["aiobar==1"]}
+    with patch(
+        "custom_components.integration_insights.insights.async_get_loaded_integration",
+        side_effect=lambda _hass, domain: SimpleNamespace(
+            requirements=requirements.get(domain, [])
+        ),
+    ):
+        hass.config.top_level_components.update({"foo", "bar"})
+        insights.collector.seen_libraries.add("aiofoo")
+        insights._async_drain()  # noqa: SLF001
+        await hass.async_block_till_done(wait_background_tasks=True)
+        # Samples from the test itself may add real libraries such as aiohttp.
+        assert insights.collector.library_map == {"aiofoo": "foo"}
+        assert "aiofoo" in looked_up
+        looked_up.clear()
+
+        insights.collector.seen_libraries.add("aiobar")
+        insights._async_drain()  # noqa: SLF001
+        await hass.async_block_till_done(wait_background_tasks=True)
+        assert insights.collector.library_map == {"aiofoo": "foo", "aiobar": "bar"}
+        assert "aiobar" in looked_up
+        assert "aiofoo" not in looked_up
+    assert await hass.config_entries.async_unload(entry.entry_id)

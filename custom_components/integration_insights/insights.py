@@ -3,6 +3,7 @@
 from collections.abc import Callable
 from datetime import timedelta
 import logging
+import threading
 import time
 from typing import Any
 
@@ -13,7 +14,8 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.loader import IntegrationNotLoaded, async_get_loaded_integration
 
-from .attribution import PackageIndex, build_library_map, load_package_index
+from .attribution import Packages, distribution_owners, library_owners
+from .background import Background, LoopWait, ThreadRecord
 from .collector import WINDOW_MINUTES, Collector
 from .sampler import Sampler, SamplerError
 
@@ -39,19 +41,40 @@ class Insights:
         self.hass = hass
         self.sampler = Sampler(entry_var=current_entry, wakeup_fd=_wakeup_fd(hass))
         self.collector = Collector()
+        self.background = Background(
+            self.sampler.walk, lambda: self.collector.library_map
+        )
+        self.loop_wait = LoopWait()
         self.started = 0.0
         self._position = 0
         self._mapped_components: frozenset[str] | None = None
         self._mapping = False
+        self._packages = Packages()
+        self._owners: dict[str, str] = {}
+        self._checked_libraries: set[str] = set()
         self._rearm_failed = False
         self._wakeup_hook: Callable[[bytes], None] | None = None
         self._unsub_drain: CALLBACK_TYPE | None = None
         self._unsub_stop: CALLBACK_TYPE | None = None
+        self._polling = False
+        self._wall_ns = 0
+        self._waiting_ns = 0
+
+    def _executors(self) -> list[Any]:
+        executors = [getattr(self.hass.loop, "_default_executor", None)]
+        executors.append(getattr(self.hass, "import_executor", None))
+        return [executor for executor in executors if executor is not None]
 
     def start(self) -> None:
         """Install the sampler; raises SamplerError."""
         self.sampler.install()
         self._hook_wakeup_reads()
+        for executor in self._executors():
+            self.background.hook_executor(executor)
+        if self.loop_wait.install(self.hass.loop):
+            self.sampler.select_wrapper = self.loop_wait.wrapper_code
+        self._wall_ns = time.perf_counter_ns()
+        self._waiting_ns = self.loop_wait.waiting_ns
         self.started = time.monotonic()
         self._position = self.sampler.count
         self._unsub_drain = async_track_time_interval(
@@ -77,6 +100,9 @@ class Insights:
             self._unsub_drain = None
         self.sampler.uninstall()
         self._unhook_wakeup_reads()
+        self.background.unhook_executors()
+        self.loop_wait.uninstall()
+        self.sampler.select_wrapper = None
 
     def _hook_wakeup_reads(self) -> None:
         # asyncio's selector loop hands the bytes it read from the wakeup
@@ -105,6 +131,13 @@ class Insights:
     @callback
     def _async_drain(self, _now: Any = None) -> None:
         self.drain()
+        if not self._polling:
+            self._polling = True
+            skip = self.background.executor_threads(self._executors())
+            skip.add(threading.main_thread().native_id or 0)
+            self.hass.async_create_background_task(
+                self._async_poll_threads(skip), "integration_insights threads"
+            )
         try:
             self.sampler.rearm()
         except SamplerError as err:
@@ -112,7 +145,10 @@ class Insights:
                 _LOGGER.warning("Could not re-arm the sampler: %s", err)
                 self._rearm_failed = True
         components = frozenset(self.hass.config.top_level_components)
-        if components != self._mapped_components and not self._mapping:
+        if not self._mapping and (
+            components != self._mapped_components
+            or not self.collector.seen_libraries <= self._checked_libraries
+        ):
             self._mapping = True
             self.hass.async_create_background_task(
                 self._async_update_library_map(components),
@@ -120,31 +156,75 @@ class Insights:
             )
 
     def drain(self) -> None:
-        """Move new samples into the collector."""
+        """Move new samples, jobs and loop wall time into the collector."""
         records, self._position = self.sampler.drain(self._position)
-        self.collector.add(records, time.monotonic())
+        now = time.monotonic()
+        self.collector.add(records, now)
+        self.collector.add_jobs(self.background.drain_jobs(), now)
+        wall = time.perf_counter_ns()
+        waiting = self.loop_wait.waiting_ns
+        busy = (wall - self._wall_ns) - (waiting - self._waiting_ns)
+        self._wall_ns, self._waiting_ns = wall, waiting
+        if self.loop_wait.wrapper_code is not None and busy > 0:
+            self.collector.add_loop_busy(busy, now)
+
+    async def _async_poll_threads(self, skip: set[int]) -> None:
+        try:
+            threads: list[ThreadRecord] = await self.hass.async_add_executor_job(
+                self.background.poll_threads, skip
+            )
+        except Exception:
+            _LOGGER.debug("Could not read thread CPU", exc_info=True)
+            return
+        finally:
+            self._polling = False
+        self.collector.add_threads(threads, time.monotonic())
 
     async def _async_update_library_map(self, components: frozenset[str]) -> None:
-        # Integrations set up at runtime may have installed packages, so the
-        # index is read again whenever the set of integrations changes.
+        # Only libraries that showed up in samples are looked up. Integrations
+        # set up at runtime may have installed packages, so a new set of
+        # integrations maps everything again (the package cache stays).
+        changed = components != self._mapped_components
+        requirements: dict[str, list[str]] | None = None
+        if changed:
+            requirements = {}
+            for domain in components:
+                try:
+                    integration = async_get_loaded_integration(self.hass, domain)
+                except IntegrationNotLoaded:
+                    continue
+                requirements[domain] = integration.requirements
+            libraries = set(self.collector.seen_libraries)
+        else:
+            libraries = self.collector.seen_libraries - self._checked_libraries
         try:
-            index: PackageIndex = await self.hass.async_add_executor_job(
-                load_package_index
+            owners, mapped = await self.hass.async_add_executor_job(
+                self._map_libraries, requirements, libraries
             )
         except Exception:
             _LOGGER.debug("Could not read the installed packages", exc_info=True)
             return
         finally:
             self._mapping = False
-        self._mapped_components = components
-        requirements: dict[str, list[str]] = {}
-        for domain in components:
-            try:
-                integration = async_get_loaded_integration(self.hass, domain)
-            except IntegrationNotLoaded:
-                continue
-            requirements[domain] = integration.requirements
-        self.collector.library_map = build_library_map(requirements, index)
+        if changed:
+            self._mapped_components = components
+            self._owners = owners
+            self._checked_libraries = libraries
+            self.collector.library_map = mapped
+        else:
+            self._checked_libraries |= libraries
+            self.collector.library_map = {**self.collector.library_map, **mapped}
+
+    def _map_libraries(
+        self, requirements: dict[str, list[str]] | None, libraries: set[str]
+    ) -> tuple[dict[str, str], dict[str, str]]:
+        """Return distribution owners and the owners of libraries (does I/O)."""
+        owners = (
+            distribution_owners(requirements, self._packages)
+            if requirements is not None
+            else self._owners
+        )
+        return owners, library_owners(libraries, owners, self._packages)
 
     def report(self, minutes: int = WINDOW_MINUTES) -> dict[str, Any]:
         """Return the report over the last `minutes`."""
@@ -175,6 +255,7 @@ class Insights:
                 "handler_errors": sampler.errors,
                 "samples_lost": sampler.lost,
                 "backoffs": sampler.backoffs,
+                "executor_jobs_total": self.background.jobs_total,
                 "running_minutes": round((time.monotonic() - self.started) / 60, 1),
             },
             **report,

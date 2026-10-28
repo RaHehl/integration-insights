@@ -7,10 +7,10 @@ from custom_components.integration_insights.attribution import (
     K_INTEGRATION,
     K_LIB,
     K_PLATFORM,
-    PackageIndex,
-    build_library_map,
+    Packages,
     classify_file,
-    load_package_index,
+    distribution_owners,
+    library_owners,
     module_domain,
     requirement_name,
     short_path,
@@ -92,34 +92,65 @@ def test_requirement_name() -> None:
     assert requirement_name("") is None
 
 
-def test_build_library_map() -> None:
-    """Map packages that exactly one loaded integration needs, also indirectly."""
-    index = PackageIndex(
+def _packages(
+    requires: dict[str, tuple[str, ...]],
+    imports: dict[str, tuple[str, ...]],
+    scan: dict[str, tuple[str, ...]] | None = None,
+    reads: list[str] | None = None,
+) -> Packages:
+    def read_requires(dist: str) -> tuple[str, ...] | None:
+        if reads is not None:
+            reads.append(dist)
+        return requires.get(dist, () if dist in imports else None)
+
+    return Packages(
+        read_requires,
+        imports.get,
+        lambda names: {name: (scan or {}).get(name, ()) for name in names},
+    )
+
+
+def test_library_owner() -> None:
+    """Map libraries that exactly one loaded integration needs, also indirectly."""
+    packages = _packages(
+        requires={
+            "homeassistant": ("aiohttp",),
+            "aiohue": ("aiohttp",),
+            "py-foo": ("foo-dep",),
+        },
         imports={
             "aiohue": ("aiohue",),
             "shared": ("shared",),
             "py-foo": ("pyfoo", "pyfoo_c"),
             "foo-dep": ("foodep",),
             "aiohttp": ("aiohttp",),
-            "google-a": ("google",),
-            "google-b": ("google",),
         },
-        requires={
-            "homeassistant": ("aiohttp",),
-            "aiohue": ("aiohttp",),
-            "py-foo": ("foo-dep",),
+        scan={
+            "pyfoo": ("py-foo",),
+            "pyfoo_c": ("py-foo",),
+            "foodep": ("foo-dep",),
+            "google": ("google-a", "google-b"),
         },
-        shared_imports=frozenset({"google"}),
     )
-    library_map = build_library_map(
+    owners = distribution_owners(
         {
             "hue": ["aiohue==4.7.1"],
             "foo": ["shared==1", "py-foo==2"],
             "bar": ["shared==1", "google-a==1"],
         },
-        index,
+        packages,
     )
-    assert library_map == {
+    names = (
+        "aiohue",
+        "pyfoo",
+        "pyfoo_c",
+        "foodep",
+        "shared",
+        "aiohttp",
+        "google",
+        "unknown",
+    )
+    assert library_owners(names, owners, packages) == {
         "aiohue": "hue",
         "pyfoo": "foo",
         "pyfoo_c": "foo",
@@ -127,8 +158,25 @@ def test_build_library_map() -> None:
     }
 
 
-def test_load_package_index() -> None:
-    """The real index knows installed packages and their dependencies."""
-    index = load_package_index()
-    assert "homeassistant" in index.imports["homeassistant"]
-    assert "aiohttp" in index.closure(["homeassistant"])
+def test_packages_read_only_what_is_needed() -> None:
+    """Only the dependency tree is read, each distribution once."""
+    reads: list[str] = []
+    packages = _packages(
+        requires={"homeassistant": ("aiohttp",), "aiohue": ("aiohttp",)},
+        imports={"aiohue": ("aiohue",), "aiohttp": ("aiohttp",), "other": ("other",)},
+        reads=reads,
+    )
+    distribution_owners({"hue": ["aiohue"]}, packages)
+    distribution_owners({"hue": ["aiohue"]}, packages)
+    assert sorted(reads) == ["aiohttp", "aiohue", "homeassistant"]
+
+
+def test_real_packages() -> None:
+    """The real readers find installed packages and their dependencies."""
+    packages = Packages()
+    assert "aiohttp" in packages.closure(["homeassistant"])
+    assert packages.providers(["aiohttp", "yaml", "not_installed_anywhere"]) == {
+        "aiohttp": ("aiohttp",),
+        "yaml": ("pyyaml",),
+        "not_installed_anywhere": (),
+    }

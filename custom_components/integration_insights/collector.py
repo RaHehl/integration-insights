@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .attribution import short_path
+from .background import JobRecord, Owner, ThreadRecord
 from .sampler import Record
 
 WINDOW_MINUTES = 60
@@ -16,6 +17,8 @@ TOP_HOT_SPOTS = 5
 TOP_STACKS = 3
 TOP_TRIGGERS = 5
 TOP_LINES = 5
+TOP_JOBS = 5
+TOP_THREADS = 5
 
 type Location = tuple[str, str, int]  # short path, qualname, line
 type Stack = tuple[Location, ...]
@@ -33,6 +36,12 @@ class _Domain:
     hot_spots: Counter[Location] = field(default_factory=Counter)
     hot_spot_samples: Counter[Location] = field(default_factory=Counter)
     stacks: Counter[Stack] = field(default_factory=Counter)
+    executor_cpu_ns: int = 0
+    executor_wall_ns: int = 0
+    jobs: Counter[str] = field(default_factory=Counter)
+    job_counts: Counter[str] = field(default_factory=Counter)
+    thread_cpu_ns: int = 0
+    threads: Counter[str] = field(default_factory=Counter)
 
     def merge(self, other: _Domain) -> None:
         self.cpu_ns += other.cpu_ns
@@ -45,12 +54,25 @@ class _Domain:
         self.hot_spots.update(other.hot_spots)
         self.hot_spot_samples.update(other.hot_spot_samples)
         self.stacks.update(other.stacks)
+        self.executor_cpu_ns += other.executor_cpu_ns
+        self.executor_wall_ns += other.executor_wall_ns
+        self.jobs.update(other.jobs)
+        self.job_counts.update(other.job_counts)
+        self.thread_cpu_ns += other.thread_cpu_ns
+        self.threads.update(other.threads)
+
+    @property
+    def total_cpu_ns(self) -> int:
+        return self.cpu_ns + self.executor_cpu_ns + self.thread_cpu_ns
 
 
 @dataclass(slots=True)
 class _Bucket:
     minute: int
     cpu_ns: int = 0
+    loop_busy_ns: int = 0
+    executor_cpu_ns: int = 0
+    thread_cpu_ns: int = 0
     samples: int = 0
     stack_count: int = 0
     dropped_stack_ns: int = 0
@@ -66,6 +88,8 @@ class Collector:
     def __init__(self) -> None:
         """Initialize the collector."""
         self.library_map: dict[str, str] = {}
+        # Libraries seen where no integration frame was on the stack.
+        self.seen_libraries: set[str] = set()
         self._buckets: deque[_Bucket] = deque(maxlen=WINDOW_MINUTES)
         # Keyed by id: code objects compare equal across files when their
         # bytecode matches. The value keeps the code alive so ids stay unique.
@@ -73,12 +97,53 @@ class Collector:
         self._lines: dict[int, tuple[Any, list[int], list[int | None]]] = {}
         self._prefixes: dict[str, tuple[str, str]] = {}
 
-    def add(self, records: list[Record], now: float) -> None:
-        """Add records that were sampled before `now` (monotonic seconds)."""
+    def _bucket(self, now: float) -> _Bucket:
         minute = int(now // 60)
         if not self._buckets or self._buckets[-1].minute != minute:
             self._buckets.append(_Bucket(minute))
+        return self._buckets[-1]
+
+    def _owner(self, owner: Owner) -> _Domain:
+        """Return the stats of the integration that owns a job or thread."""
+        domain = owner.domain
+        if domain == "core":
+            self.seen_libraries.update(owner.libraries)
+            for library in owner.libraries:
+                if (mapped := self.library_map.get(library)) is not None:
+                    domain = mapped
+                    break
         bucket = self._buckets[-1]
+        if (stats := bucket.domains.get(domain)) is None:
+            stats = bucket.domains[domain] = _Domain()
+        return stats
+
+    def add_jobs(self, jobs: list[JobRecord], now: float) -> None:
+        """Add executor jobs that finished before `now`."""
+        bucket = self._bucket(now)
+        for job in jobs:
+            stats = self._owner(job.owner)
+            stats.executor_cpu_ns += job.cpu_ns
+            stats.executor_wall_ns += job.wall_ns
+            stats.jobs[job.label] += job.cpu_ns
+            stats.job_counts[job.label] += 1
+            bucket.executor_cpu_ns += job.cpu_ns
+
+    def add_threads(self, threads: list[ThreadRecord], now: float) -> None:
+        """Add thread CPU measured before `now`."""
+        bucket = self._bucket(now)
+        for thread in threads:
+            stats = self._owner(thread.owner)
+            stats.thread_cpu_ns += thread.cpu_ns
+            stats.threads[thread.name] += thread.cpu_ns
+            bucket.thread_cpu_ns += thread.cpu_ns
+
+    def add_loop_busy(self, busy_ns: int, now: float) -> None:
+        """Add wall time the loop spent outside select() before `now`."""
+        self._bucket(now).loop_busy_ns += busy_ns
+
+    def add(self, records: list[Record], now: float) -> None:
+        """Add records that were sampled before `now` (monotonic seconds)."""
+        bucket = self._bucket(now)
         for record in records:
             self._add(bucket, record)
         if len(self._locations) > 50_000:
@@ -90,6 +155,7 @@ class Collector:
         domain = record.domain
         via_library = False
         if domain == "core":
+            self.seen_libraries.update(record.libraries)
             for library in record.libraries:
                 if (owner := self.library_map.get(library)) is not None:
                     domain = owner
@@ -190,12 +256,15 @@ class Collector:
         first_minute = int(now // 60) - min(minutes, WINDOW_MINUTES) + 1
         window_start = max(started, first_minute * 60)
         span = max((now - window_start) / 60, 1 / 60)
-        cpu_ns = samples = dropped_ns = 0
+        cpu_ns = samples = dropped_ns = busy_ns = executor_ns = thread_ns = 0
         domains: dict[str, _Domain] = {}
         for bucket in self._buckets:
             if bucket.minute < first_minute:
                 continue
             cpu_ns += bucket.cpu_ns
+            busy_ns += bucket.loop_busy_ns
+            executor_ns += bucket.executor_cpu_ns
+            thread_ns += bucket.thread_cpu_ns
             samples += bucket.samples
             dropped_ns += bucket.dropped_stack_ns
             for domain, stats in bucket.domains.items():
@@ -211,15 +280,19 @@ class Collector:
 
         integrations = []
         for domain, stats in sorted(
-            domains.items(), key=lambda item: item[1].cpu_ns, reverse=True
+            domains.items(), key=lambda item: item[1].total_cpu_ns, reverse=True
         ):
             if domain == "idle":
                 continue
             item: dict[str, Any] = {
                 "domain": domain,
+                "cpu_ms_per_min": per_minute(stats.total_cpu_ns),
                 "loop_cpu_ms_per_min": per_minute(stats.cpu_ns),
+                "background_cpu_ms_per_min": per_minute(
+                    stats.executor_cpu_ns + stats.thread_cpu_ns
+                ),
                 "samples": stats.samples,
-                "low_confidence": stats.samples < MIN_CONFIDENT_SAMPLES,
+                "low_confidence": 0 < stats.samples < MIN_CONFIDENT_SAMPLES,
             }
             if stats.via_library_ns:
                 item["via_library_ms_per_min"] = per_minute(stats.via_library_ns)
@@ -236,12 +309,34 @@ class Collector:
                 }
                 for stack, ns in stats.stacks.most_common(TOP_STACKS)
             ]
+            if stats.job_counts:
+                item["executor"] = {
+                    "cpu_ms_per_min": per_minute(stats.executor_cpu_ns),
+                    "wall_ms_per_min": per_minute(stats.executor_wall_ns),
+                    "jobs_per_min": round(stats.job_counts.total() / span, 1),
+                    "jobs": [
+                        {
+                            "function": label,
+                            "cpu_ms_per_min": per_minute(ns),
+                            "per_min": round(stats.job_counts[label] / span, 1),
+                        }
+                        for label, ns in stats.jobs.most_common(TOP_JOBS)
+                    ],
+                }
+            if stats.threads:
+                item["threads"] = {
+                    "cpu_ms_per_min": per_minute(stats.thread_cpu_ns),
+                    "by_name": top(stats.threads, TOP_THREADS),
+                }
             integrations.append(item)
 
         idle = domains.get("idle")
         return {
             "window_minutes": round(span, 1),
             "loop_cpu_ms_per_min": per_minute(cpu_ns),
+            "loop_busy_ms_per_min": per_minute(busy_ns),
+            "executor_cpu_ms_per_min": per_minute(executor_ns),
+            "thread_cpu_ms_per_min": per_minute(thread_ns),
             "idle_ms_per_min": per_minute(idle.cpu_ns if idle else 0),
             "samples": samples,
             "stacks_not_kept_ms_per_min": per_minute(dropped_ns),
