@@ -7,6 +7,8 @@
 
 Finds the integration that slows Home Assistant down, keeps the CPU busy, or leaks memory, and tells you what to do about it.
 
+![Overview with three findings, from three example integrations written for this screenshot](docs/overview.png)
+
 ## What it finds
 
 - An integration that keeps the event loop busy. While it runs, automations, the dashboard and every other integration wait.
