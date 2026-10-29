@@ -1,7 +1,9 @@
 """Tests for executor job and thread CPU."""
 
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import functools
+import hashlib
 import threading
 import time
 
@@ -133,6 +135,37 @@ def test_threads_are_charged_by_target_and_stack() -> None:
     assert by_name["other-loop"].owner.domain == "other"
     assert by_name["busy-worker"].cpu_ns > 10_000_000
     assert threading.main_thread().name not in by_name
+
+
+@linux_only
+def test_pool_workers_are_charged_by_what_they_run() -> None:
+    """A pool worker running C code shows only the pool, so its callable decides."""
+    work = functools.partial(hashlib.pbkdf2_hmac, "sha256", b"x", b"salt", 3_000_000)
+    background = _background({"_hashlib": "solar"})
+    background.poll_threads(set())  # baseline
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="Library") as executor:
+        future = executor.submit(work)
+        time.sleep(0.3)
+        records = background.poll_threads({threading.main_thread().native_id})
+        future.result()
+    (record,) = [r for r in records if r.name.startswith("Library")]
+    assert record.owner == Owner("solar", ("_hashlib",))
+    assert record.name.endswith("(_hashlib.pbkdf2_hmac)")
+
+
+@linux_only
+async def test_anyio_workers_are_charged_by_what_they_run() -> None:
+    """Blocking calls run through anyio use its own threads, outside the executors."""
+    anyio = pytest.importorskip("anyio")
+    work = functools.partial(hashlib.pbkdf2_hmac, "sha256", b"x", b"salt", 3_000_000)
+    background = _background({"_hashlib": "solar"})
+    background.poll_threads(set())  # baseline
+    task = asyncio.ensure_future(anyio.to_thread.run_sync(work))
+    await asyncio.sleep(0.3)
+    records = background.poll_threads({threading.main_thread().native_id})
+    await task
+    (record,) = [r for r in records if r.name.startswith("AnyIO worker thread")]
+    assert record.owner.domain == "solar"
 
 
 @linux_only

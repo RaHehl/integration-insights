@@ -20,6 +20,12 @@ from .attribution import callable_owner, module_domain, top_package
 from .sampler import Record
 
 MAX_PENDING_JOBS = 20_000
+# Pool workers run a callable handed to them, often C code with no frame of its
+# own, so their stack only shows the pool. Their loop holds it in a local.
+_POOL_LOCALS = {
+    "anyio._backends._asyncio": "func",
+    "concurrent.futures.thread": "fn",
+}
 _TICK_NS = 1_000_000_000 // os.sysconf("SC_CLK_TCK")
 
 
@@ -150,17 +156,25 @@ class Background:
             if tid in skip or cpu <= previous:
                 continue
             thread = threads.get(tid)
+            name: str | None = None
             owner = self._static_owner(tid, thread)
             if owner is None:
                 if thread is not None and thread.ident is not None:
                     if frames is None:
                         frames = sys._current_frames()  # noqa: SLF001
-                    record = self._walk(frames.get(thread.ident), 0)
+                    frame = frames.get(thread.ident)
+                    record = self._walk(frame, 0)
                     domain = record.domain if record.domain != "idle" else "core"
                     owner = Owner(domain, record.libraries)
+                    if domain == "core" and (fn := _pool_callable(frame)) is not None:
+                        pool_owner, label = self.resolve(fn, None)
+                        if pool_owner.domain != "core":
+                            owner = pool_owner
+                            name = f"{thread.name} ({label})"
                 else:
                     owner = Owner("core", ())
-            name = thread.name if thread is not None else _task_name(tid)
+            if name is None:
+                name = thread.name if thread is not None else _task_name(tid)
             records.append(ThreadRecord(owner, name, cpu - previous))
         self._primed = True
         for tid in set(self._thread_cpu) - seen:
@@ -198,6 +212,17 @@ class Background:
         if owner is not None:
             self._thread_owners[tid] = (thread, owner)
         return owner
+
+
+def _pool_callable(frame: FrameType | None) -> Any:
+    """Return the callable a pool worker runs, from its loop's frame, or None."""
+    while frame is not None:
+        if (local := _POOL_LOCALS.get(frame.f_globals.get("__name__", ""))) and (
+            fn := frame.f_locals.get(local)
+        ) is not None:
+            return fn
+        frame = frame.f_back
+    return None
 
 
 def _timed(
