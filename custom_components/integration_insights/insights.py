@@ -23,6 +23,7 @@ from .collector import WINDOW_MINUTES, Collector
 from .memory import (
     Snapshot,
     account_heap,
+    check_headroom,
     count_resources,
     heap_roots,
     imported_packages,
@@ -309,8 +310,12 @@ class Insights:
         return {"sampler": self._sampler_stats(), **report}
 
     async def async_take_snapshot(self) -> Snapshot:
-        """Take a memory snapshot; the object walk runs in the executor."""
+        """Take a memory snapshot; the object walk runs in the executor.
+
+        Raises SnapshotRefused when memory is too short for the walk.
+        """
         async with self._snapshot_lock:
+            await self.hass.async_add_executor_job(check_headroom)
             # The heap holds every imported library, not only those seen in
             # samples; map them all so code lands with its integration.
             self.collector.seen_libraries.update(imported_packages())

@@ -21,6 +21,7 @@ from dataclasses import dataclass
 import gc
 import inspect
 import sys
+import time
 from types import (
     BuiltinFunctionType,
     CodeType,
@@ -44,30 +45,32 @@ _OWNED_REFS = 3
 
 _C_IMPLEMENTED = (WrapperDescriptorType, MethodDescriptorType, BuiltinFunctionType)
 
+# What the walk does with an object, decided once per type.
+_OTHER, _LEAF, _CLASS, _CODE, _MODULE, _FRAME, _FUNCTION = range(7)
 
-def _make_sizer() -> Callable[[Any], int]:
-    """Return a sizeof that never runs Python code.
 
-    A class with its own __sizeof__ in Python (mocks, proxies) could do
+def _kind(cls: type) -> tuple[int, bool]:
+    """Return what kind of object a type makes, and whether sizeof is safe.
+
+    Only type(obj) is used, never isinstance: a proxy's __class__ is Python
+    code. A class with its own __sizeof__ in Python (mocks, proxies) could do
     anything, even create objects while it is measured; such objects get the
     size of their base object instead.
     """
-    safe: dict[type, bool] = {}
-    getsizeof = sys.getsizeof
-    base_sizeof = object.__sizeof__
-
-    def size(obj: Any) -> int:
-        cls = type(obj)
-        if (ok := safe.get(cls)) is None:
-            ok = safe[cls] = isinstance(
-                inspect.getattr_static(cls, "__sizeof__", None), _C_IMPLEMENTED
-            )
-        try:
-            return getsizeof(obj) if ok else base_sizeof(obj)
-        except Exception:  # noqa: BLE001
-            return 0
-
-    return size
+    safe = isinstance(inspect.getattr_static(cls, "__sizeof__", None), _C_IMPLEMENTED)
+    if cls in _LEAVES:
+        return _LEAF, safe
+    if issubclass(cls, type):
+        return _CLASS, safe
+    if cls is CodeType:
+        return _CODE, safe
+    if cls is ModuleType:
+        return _MODULE, safe
+    if cls is FrameType:
+        return _FRAME, safe
+    if cls is FunctionType:
+        return _FUNCTION, safe
+    return _OTHER, safe
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +93,11 @@ class Tally:
 
 type Accounts = dict[tuple[str, str], Tally]
 
+# The walk runs in an executor thread but holds the GIL almost all the time.
+# Every few thousand objects it sleeps briefly so the event loop runs freely.
+_YIELD_EVERY = 2048
+_YIELD_SECONDS = 0.001
+
 
 def walk(
     roots: list[Root],
@@ -98,65 +106,99 @@ def walk(
 ) -> Accounts:
     """Account everything reachable from roots, then what nobody reached."""
     accounts: Accounts = defaultdict(Tally)
-    module_dicts = {id(m.__dict__) for m in list(sys.modules.values()) if m is not None}
     seen: set[int] = {id(obj) for obj in stoppers}
     seen.update(id(root.obj) for root in roots)
+    # Module dicts are only ever walked as code roots.
+    seen.update(id(m.__dict__) for m in list(sys.modules.values()) if m is not None)
     shared: set[int] = set()
     shared_tally = accounts[(SHARED, DATA)]
-    getsizeof = _make_sizer()
+    kinds: dict[type, tuple[int, bool]] = {}
+    getsizeof = sys.getsizeof
+    base_sizeof = object.__sizeof__
     getrefcount = sys.getrefcount
     get_referents = gc.get_referents
+
+    def size_of(obj: Any, safe: bool) -> int:
+        return getsizeof(obj) if safe else base_sizeof(obj)
 
     stack: list[Any] = []
     # The walk can reach its own frame through the thread it runs in; its
     # working structures must not be walked or counted.
-    seen.update(id(obj) for obj in (stack, seen, shared, accounts, roots, module_dicts))
+    seen.update(id(obj) for obj in (stack, seen, shared, accounts, roots, kinds))
+    push = stack.extend
+    pop = stack.pop
+    mark = seen.add
+    shared_size = shared_count = 0
+    sleep = time.sleep
+    budget = _YIELD_EVERY
     for root in roots:
-        tally = accounts[(root.owner, root.category)]
         code_module = root.module
-        tally.size += getsizeof(root.obj)
-        tally.count += 1
-        stack.extend(get_referents(root.obj))
+        root_cls = type(root.obj)
+        if (info := kinds.get(root_cls)) is None:
+            info = kinds[root_cls] = _kind(root_cls)
+        # Sums stay in locals inside the loop, which runs once per object.
+        size = size_of(root.obj, info[1])
+        count = 1
+        push(get_referents(root.obj))
         while stack:
-            obj = stack.pop()
+            budget -= 1
+            if not budget:
+                sleep(_YIELD_SECONDS)
+                budget = _YIELD_EVERY
+            obj = pop()
             cls = type(obj)
-            if cls in _LEAVES:
+            if (info := kinds.get(cls)) is None:
+                info = kinds[cls] = _kind(cls)
+            kind, safe = info
+            if kind == _LEAF:
                 if getrefcount(obj) > _OWNED_REFS:
                     if id(obj) not in shared:
                         shared.add(id(obj))
-                        shared_tally.size += getsizeof(obj)
-                        shared_tally.count += 1
+                        shared_size += getsizeof(obj)
+                        shared_count += 1
                 else:
-                    tally.size += getsizeof(obj)
-                    tally.count += 1
+                    size += getsizeof(obj)
+                    count += 1
                 continue
             oid = id(obj)
-            if oid in seen or oid in module_dicts or cls is ModuleType:
+            if oid in seen or kind == _MODULE:
                 continue
-            # type(obj), never isinstance: a proxy's __class__ is Python code.
-            is_class = issubclass(cls, type)
             if code_module is None:
                 # Classes and code belong to the module that defines them.
-                if is_class or cls is CodeType:
+                if kind in (_CLASS, _CODE):
                     continue
-            elif (is_class or cls is FunctionType) and obj.__module__ != code_module:
+            elif kind in (_CLASS, _FUNCTION) and obj.__module__ != code_module:
                 # Imported names belong to their own module.
                 continue
-            seen.add(oid)
-            tally.size += getsizeof(obj)
-            tally.count += 1
-            if cls is FrameType:
+            mark(oid)
+            size += getsizeof(obj) if safe else base_sizeof(obj)
+            count += 1
+            if kind == _FRAME:
                 # Locals of a suspended coroutine are data; the frame chain is
                 # not, and a running frame may be this walk itself.
                 if obj.f_back is None:
-                    stack.extend(obj.f_locals.values())
+                    push(obj.f_locals.values())
                 continue
-            stack.extend(get_referents(obj))
+            push(get_referents(obj))
+        tally = accounts[(root.owner, root.category)]
+        tally.size += size
+        tally.count += count
+    shared_tally.size += shared_size
+    shared_tally.count += shared_count
 
     for obj in gc.get_objects():
-        if id(obj) in seen or issubclass(type(obj), (type, ModuleType, CodeType)):
+        budget -= 1
+        if not budget:
+            sleep(_YIELD_SECONDS)
+            budget = _YIELD_EVERY
+        if id(obj) in seen:
             continue
-        tally = accounts[(unreached_owner(type(obj)), UNREACHED)]
-        tally.size += getsizeof(obj)
+        cls = type(obj)
+        if (info := kinds.get(cls)) is None:
+            info = kinds[cls] = _kind(cls)
+        if info[0] in (_CLASS, _MODULE, _CODE):
+            continue
+        tally = accounts[(unreached_owner(cls), UNREACHED)]
+        tally.size += size_of(obj, info[1])
         tally.count += 1
     return dict(accounts)

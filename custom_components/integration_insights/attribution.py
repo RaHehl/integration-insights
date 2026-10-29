@@ -7,6 +7,7 @@ from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
 import re
 import sys
+import time
 from types import ModuleType
 from typing import Any
 
@@ -170,40 +171,52 @@ def _read_imports(dist: str) -> tuple[str, ...] | None:
     return tuple(names)
 
 
+def _record_tops(record: bytes) -> set[bytes]:
+    """Return the top level names a RECORD file lists: packages and modules."""
+    tops: set[bytes] = set()
+    for line in record.split(b"\n"):
+        top, sep, _ = line.split(b",", 1)[0].partition(b"/")
+        if sep:
+            tops.add(top)
+        elif top.endswith(b".py"):
+            tops.add(top[:-3])
+    return tops
+
+
+# Executor threads hold the GIL while parsing; a short sleep every so many
+# distributions lets the event loop run.
+_YIELD_EVERY = 64
+_YIELD_SECONDS = 0.001
+
+
 def _scan_providers(import_names: Iterable[str]) -> dict[str, tuple[str, ...]]:
     """Find the distributions that ship import names by reading their file lists.
 
     The slow path for names that differ from their distribution (yaml from
-    PyYAML). One pass covers all names. Reads raw bytes and parses nothing.
+    PyYAML). One pass covers all names, each file list is read once.
     """
-    needles = {name: name.encode() for name in import_names}
-    found: dict[str, list[str]] = {name: [] for name in needles}
+    needles = {name.encode(): name for name in import_names}
+    found: dict[str, list[str]] = {name: [] for name in needles.values()}
+    count = 0
     for entry in sys.path:
         try:
             infos = [p for p in Path(entry).iterdir() if p.name.endswith(".dist-info")]
         except OSError:
             continue
         for info in infos:
+            count += 1
+            if count % _YIELD_EVERY == 0:
+                time.sleep(_YIELD_SECONDS)
             dist = _normalize(info.name.removesuffix(".dist-info").rsplit("-", 1)[0])
             try:
-                top_level = set((info / "top_level.txt").read_bytes().split())
+                shipped = set((info / "top_level.txt").read_bytes().split())
             except OSError:
-                top_level = None
-            if top_level is not None:
-                for name, needle in needles.items():
-                    if needle in top_level:
-                        found[name].append(dist)
-                continue
-            try:
-                record = b"\n" + (info / "RECORD").read_bytes()
-            except OSError:
-                continue
-            for name, needle in needles.items():
-                if (
-                    b"\n" + needle + b"/" in record
-                    or b"\n" + needle + b".py," in record
-                ):
-                    found[name].append(dist)
+                try:
+                    shipped = _record_tops((info / "RECORD").read_bytes())
+                except OSError:
+                    continue
+            for needle in needles.keys() & shipped:
+                found[needles[needle]].append(dist)
     return {name: tuple(dict.fromkeys(dists)) for name, dists in found.items()}
 
 

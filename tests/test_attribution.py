@@ -1,5 +1,8 @@
 """Tests for code attribution."""
 
+from pathlib import Path
+import sys
+
 import pytest
 
 from custom_components.integration_insights.attribution import (
@@ -8,6 +11,7 @@ from custom_components.integration_insights.attribution import (
     K_LIB,
     K_PLATFORM,
     Packages,
+    _scan_providers,
     classify_file,
     distribution_owners,
     library_owners,
@@ -179,4 +183,34 @@ def test_real_packages() -> None:
         "aiohttp": ("aiohttp",),
         "yaml": ("pyyaml",),
         "not_installed_anywhere": (),
+    }
+
+
+def test_scan_providers_reads_file_lists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Import names are found in top_level.txt or RECORD, once per name."""
+    site = tmp_path / "site"
+    for dist, files in {
+        "PyYAML-6.0.dist-info": {"top_level.txt": "_yaml\nyaml\n"},
+        "attrs-24.1.dist-info": {
+            "RECORD": "attr/__init__.py,sha256=x,1\nattrs/__init__.py,,\n"
+        },
+        "six-1.16.dist-info": {
+            "RECORD": "six.py,sha256=x,1\nsix-1.16.dist-info/RECORD,,\n"
+        },
+        "attrs_fork-1.0.dist-info": {"RECORD": "attr/fork.py,,\n"},
+    }.items():
+        (site / dist).mkdir(parents=True)
+        for name, text in files.items():
+            (site / dist / name).write_text(text)
+    monkeypatch.setattr(sys, "path", [str(site), str(tmp_path / "missing")])
+
+    found = _scan_providers(["yaml", "attr", "six", "nothing"])
+    # Directory order is up to the file system.
+    assert {name: set(dists) for name, dists in found.items()} == {
+        "yaml": {"pyyaml"},
+        "attr": {"attrs", "attrs-fork"},
+        "six": {"six"},
+        "nothing": set(),
     }

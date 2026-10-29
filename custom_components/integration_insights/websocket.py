@@ -13,6 +13,7 @@ from homeassistant.loader import IntegrationNotLoaded, async_get_loaded_integrat
 from .collector import WINDOW_MINUTES
 from .const import DOMAIN
 from .insights import Insights
+from .memory import SnapshotRefused
 
 MINUTES = vol.All(int, vol.Range(min=1, max=WINDOW_MINUTES))
 
@@ -188,7 +189,11 @@ async def websocket_memory_snapshot(
     """Take a memory snapshot and return it compared with the one before."""
     if (insights := _insights(hass, connection, msg["id"])) is None:
         return
-    await insights.async_take_snapshot()
+    try:
+        await insights.async_take_snapshot()
+    except SnapshotRefused as err:
+        connection.send_error(msg["id"], "insufficient_memory", str(err))
+        return
     connection.send_result(msg["id"], _memory_result(hass, insights))
 
 

@@ -4,7 +4,7 @@ import asyncio
 from datetime import UTC, datetime
 import functools
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 from pytest_homeassistant_custom_component.typing import WebSocketGenerator
@@ -19,9 +19,11 @@ from custom_components.integration_insights.heap import (
     walk,
 )
 from custom_components.integration_insights.memory import (
+    MIN_SPARE_MIB,
     Resources,
     Snapshot,
     count_resources,
+    headroom_problem,
     imported_packages,
     make_callable_owner,
     make_heap_owner,
@@ -294,3 +296,35 @@ def test_imported_packages_are_third_party() -> None:
     packages = imported_packages()
     assert "aiohttp" in packages
     assert {"asyncio", "homeassistant", "custom_components"}.isdisjoint(packages)
+
+
+def test_headroom_problem() -> None:
+    """A walk waits while memory is stalled or would run short."""
+    assert headroom_problem(80, 1000, 0.5) is None
+    assert headroom_problem(80, None, None) is None
+    assert "80 MiB" in headroom_problem(80, MIN_SPARE_MIB + 79, None)
+    assert headroom_problem(80, MIN_SPARE_MIB + 80, None) is None
+    assert "stalled" in headroom_problem(80, 1000, 25.0)
+
+
+async def test_snapshot_refused(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
+    """A refused snapshot answers with a reason and keeps nothing."""
+    entry = MockConfigEntry(domain=DOMAIN)
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    client = await hass_ws_client(hass)
+
+    with patch(
+        "custom_components.integration_insights.memory._available_mib",
+        return_value=1.0,
+    ):
+        await client.send_json_auto_id({"type": f"{DOMAIN}/memory_snapshot"})
+        response = await client.receive_json()
+    assert response["error"]["code"] == "insufficient_memory"
+    assert "1 MiB is available" in response["error"]["message"]
+
+    await client.send_json_auto_id({"type": f"{DOMAIN}/memory"})
+    assert (await client.receive_json())["result"]["memory"] == {"snapshots": []}
+    assert await hass.config_entries.async_unload(entry.entry_id)

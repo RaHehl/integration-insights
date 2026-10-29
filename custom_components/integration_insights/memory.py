@@ -30,6 +30,17 @@ from .heap import CODE, DATA, SHARED, UNREACHED, Root, walk
 TOP_TYPES = 5
 CHUNK = 20_000
 _KIB = 1024
+# The walk keeps the id of every object in a set; with the int and the set
+# slot that is about this much per allocated block.
+_WALK_BYTES_PER_BLOCK = 100
+# Memory left over once the walk has what it needs.
+MIN_SPARE_MIB = 128
+# Share of time tasks stalled on memory over the last 10 s.
+MAX_PRESSURE_AVG10 = 10.0
+
+
+class SnapshotRefused(Exception):
+    """A snapshot would push the system into memory pressure."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +80,69 @@ def _read_key_values(path: Path) -> dict[str, str]:
     return values
 
 
+def _cgroup_dir() -> Path:
+    cgroup = Path("/proc/self/cgroup").read_text(encoding="utf-8")
+    return Path("/sys/fs/cgroup") / cgroup.strip().split("::", 1)[1].lstrip("/")
+
+
+def _available_mib() -> float | None:
+    """Return memory the process can still use: the system's, capped by its cgroup."""
+    available: list[float] = []
+    try:
+        meminfo = _read_key_values(Path("/proc/meminfo"))
+        available.append(int(meminfo["MemAvailable"].split()[0]) / _KIB)
+    except OSError, ValueError, KeyError:
+        pass
+    try:
+        path = _cgroup_dir()
+        limit = (path / "memory.max").read_text(encoding="utf-8").strip()
+        if limit != "max":
+            current = int((path / "memory.current").read_text(encoding="utf-8"))
+            available.append((int(limit) - current) / _KIB**2)
+    except OSError, ValueError, IndexError:
+        pass
+    return min(available) if available else None
+
+
+def _pressure_avg10() -> float | None:
+    try:
+        line = Path("/proc/pressure/memory").read_text(encoding="utf-8").splitlines()[0]
+        fields = dict(item.split("=") for item in line.split()[1:])
+        return float(fields["avg10"])
+    except OSError, ValueError, KeyError, IndexError:
+        return None
+
+
+def walk_need_mib() -> float:
+    """Estimate the memory a heap walk needs on top of what is in use."""
+    return sys.getallocatedblocks() * _WALK_BYTES_PER_BLOCK / _KIB**2
+
+
+def headroom_problem(
+    need_mib: float, available_mib: float | None, pressure_avg10: float | None
+) -> str | None:
+    """Return why a walk should not run now, or None when it can."""
+    if pressure_avg10 is not None and pressure_avg10 > MAX_PRESSURE_AVG10:
+        return (
+            f"The system is short of memory right now ({pressure_avg10:.0f}% of the"
+            " last 10 s stalled on memory). Try again later."
+        )
+    if available_mib is not None and available_mib < need_mib + MIN_SPARE_MIB:
+        return (
+            f"Not enough free memory for a snapshot: it needs about {need_mib:.0f}"
+            f" MiB, {available_mib:.0f} MiB is available."
+        )
+    return None
+
+
+def check_headroom() -> None:
+    """Raise SnapshotRefused when a walk would strain memory (does I/O)."""
+    if problem := headroom_problem(
+        walk_need_mib(), _available_mib(), _pressure_avg10()
+    ):
+        raise SnapshotRefused(problem)
+
+
 def read_process() -> dict[str, float]:
     """Read process memory, memory pressure and cgroup figures (does I/O).
 
@@ -97,8 +171,7 @@ def read_process() -> dict[str, float]:
     except OSError, ValueError, KeyError:
         pass
     try:
-        cgroup = Path("/proc/self/cgroup").read_text(encoding="utf-8")
-        path = Path("/sys/fs/cgroup") / cgroup.strip().split("::", 1)[1].lstrip("/")
+        path = _cgroup_dir()
         process["cgroup_mib"] = round(
             int((path / "memory.current").read_text(encoding="utf-8")) / _KIB**2, 1
         )
