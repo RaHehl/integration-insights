@@ -737,6 +737,8 @@ class IntegrationInsightsPanel extends HTMLElement {
     const samplerCost = (sampler.handler_cpu_us_avg * samplesPerMinute) / 1000;
     const problems = sampler.samples_lost + sampler.handler_errors;
     const integrations = report.integrations;
+    // The sampler's own time is never sampled, so it is added to what this integration does.
+    const ownWork = integrations.find((item) => item.domain === "integration_insights")?.cpu_ms_per_min || 0;
     const top = integrations.length ? integrations[0].cpu_ms_per_min : 0;
     const background = report.executor_cpu_ms_per_min + report.thread_cpu_ms_per_min;
 
@@ -754,8 +756,8 @@ class IntegrationInsightsPanel extends HTMLElement {
         <div class="value">${report.window_minutes} min</div>
         <div class="sub">${report.samples.toLocaleString()} samples</div></div>
       <div class="tile"><div class="label">Measuring costs</div>
-        <div class="value">${ms(samplerCost)} ms/min</div>
-        <div class="sub">${sampler.handler_cpu_us_avg} µs per sample</div></div>
+        <div class="value">${ms(samplerCost + ownWork)} ms/min</div>
+        <div class="sub">sampling ${ms(samplerCost)} · own work ${ms(ownWork)}</div></div>
       <div class="tile${problems ? " warn" : ""}"><div class="label">Sampler</div>
         <div class="value">${problems ? `${problems} problems` : "OK"}</div>
         <div class="sub">lost ${sampler.samples_lost} · errors ${sampler.handler_errors} · slowdowns ${sampler.backoffs}</div></div>
