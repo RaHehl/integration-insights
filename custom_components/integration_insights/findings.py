@@ -7,6 +7,7 @@ than a borderline case that is not mentioned.
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+import math
 from typing import Any
 
 PROBLEM = "problem"
@@ -75,16 +76,12 @@ def find(
     def hold(key: str, domain: str | None = None) -> float:
         return HOLD if (key, domain) in shown else 1
 
+    if summary["window_minutes"] < MIN_MINUTES:
+        # Too short to judge, and nothing else would be true to say yet
+        left = math.ceil(MIN_MINUTES - summary["window_minutes"])
+        return [Finding("measuring", INFO, values={"minutes": str(left)})]
     findings: list[Finding] = []
     minutes = _number(summary["window_minutes"])
-    if summary["window_minutes"] < MIN_MINUTES:
-        findings.append(
-            Finding(
-                "measuring",
-                INFO,
-                values={"minutes": _number(summary["window_minutes"])},
-            )
-        )
     sampler = summary["sampler"]
     if (
         sampler["handler_errors"]
@@ -140,7 +137,11 @@ def _cpu_findings(
     background = item["background_cpu_ms_per_min"]
     background_notice = BACKGROUND_NOTICE_MS * factor
     background_problem = BACKGROUND_PROBLEM_MS * factor
-    if loop < LOOP_NOTICE_MS * HOLD and background < background_notice * HOLD:
+    if (
+        loop < LOOP_NOTICE_MS * HOLD
+        and background < background_notice * HOLD
+        and item.get("jobs_per_min", 0) < JOBS_NOTICE_PER_MIN * factor * HOLD
+    ):
         return []
     if (info := detail(domain)) is None:
         return []

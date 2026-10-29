@@ -314,12 +314,14 @@ class Insights:
         and integrations setting up would look like a load that is not there.
         """
         settled = (time.monotonic() - self.started) / 60 - STARTUP_MINUTES
-        if settled < MIN_MINUTES:
+        # A window of n minutes starts on a minute boundary and can span a
+        # little less than n, so wait one minute more than find() needs.
+        if settled < MIN_MINUTES + 1:
             return [
                 Finding(
                     "measuring",
                     INFO,
-                    values={"minutes": f"{math.ceil(MIN_MINUTES - settled)}"},
+                    values={"minutes": f"{math.ceil(MIN_MINUTES + 1 - settled)}"},
                 )
             ]
         window = min(minutes, math.floor(settled))

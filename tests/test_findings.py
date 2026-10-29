@@ -39,11 +39,14 @@ def _summary(
     }
 
 
-def _item(domain: str, loop: float = 0, background: float = 0) -> dict[str, Any]:
+def _item(
+    domain: str, loop: float = 0, background: float = 0, jobs: float = 0
+) -> dict[str, Any]:
     return {
         "domain": domain,
         "loop_cpu_ms_per_min": loop,
         "background_cpu_ms_per_min": background,
+        "jobs_per_min": jobs,
     }
 
 
@@ -136,17 +139,18 @@ def test_home_assistant_itself_is_not_flagged() -> None:
 def test_loop_waits_measuring_and_sampler() -> None:
     """Findings that are about the system or the measurement, not one integration."""
     findings = find(
-        _summary([], loop=1_000, busy=14_000, minutes=2, samples_lost=200),
-        lambda _: None,
-        {},
+        _summary([], loop=1_000, busy=14_000, samples_lost=200), lambda _: None, {}
     )
     assert _keys(findings) == [
         ("loop_waits", PROBLEM, None),
-        ("measuring", INFO, None),
         ("measuring_incomplete", INFO, None),
     ]
     assert verdict(findings) == PROBLEM
     assert find(_summary([], loop=1_000, busy=3_999), lambda _: None, {}) == []
+
+    # Too short a window: only say so, and how long it takes
+    (short,) = find(_summary([], busy=14_000, minutes=3.2), lambda _: None, {})
+    assert (short.key, short.values) == ("measuring", {"minutes": "2"})
 
 
 def test_growing_resources_need_two_snapshots() -> None:
@@ -250,7 +254,7 @@ async def test_findings_wait_for_home_assistant_to_settle(hass: HomeAssistant) -
         return_value=started + 6 * 60,
     ):
         assert _keys(insights.findings()) == [("measuring", INFO, None)]
-        assert insights.findings()[0].values == {"minutes": "4"}
+        assert insights.findings()[0].values == {"minutes": "5"}
     with (
         patch(
             "custom_components.integration_insights.insights.time.monotonic",
@@ -319,3 +323,18 @@ async def test_insights_remember_what_was_shown(hass: HomeAssistant) -> None:
     shown = [call.args[4] for call in find_mock.call_args_list]
     assert shown == [frozenset(), {("busy_thread", "foo")}, frozenset()]
     assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+def test_many_cheap_jobs_are_found() -> None:
+    """Polling through the executor shows in the job count, not in CPU."""
+    detail = _detail(
+        executor={
+            "cpu_ms_per_min": 12,
+            "jobs_per_min": 750,
+            "jobs": [{"function": "foo.read", "per_min": 750, "cpu_ms_per_min": 12}],
+        }
+    )
+    summary = _summary([_item("foo", 5, 12, jobs=750)])
+    assert _keys(find(summary, lambda _: detail, {})) == [
+        ("busy_executor", NOTICE, "foo")
+    ]

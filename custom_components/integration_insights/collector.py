@@ -43,6 +43,8 @@ class _Domain:
     executor_wall_ns: int = 0
     jobs: Counter[str] = field(default_factory=Counter)
     job_counts: Counter[str] = field(default_factory=Counter)
+    # The sum of job_counts, kept as a number for the summary
+    job_total: int = 0
     thread_cpu_ns: int = 0
     threads: Counter[str] = field(default_factory=Counter)
 
@@ -61,6 +63,7 @@ class _Domain:
         self.executor_wall_ns += other.executor_wall_ns
         self.jobs.update(other.jobs)
         self.job_counts.update(other.job_counts)
+        self.job_total += other.job_total
         self.thread_cpu_ns += other.thread_cpu_ns
         self.threads.update(other.threads)
 
@@ -71,6 +74,7 @@ class _Domain:
         self.via_library_ns += sign * other.via_library_ns
         self.executor_cpu_ns += sign * other.executor_cpu_ns
         self.executor_wall_ns += sign * other.executor_wall_ns
+        self.job_total += sign * other.job_total
         self.thread_cpu_ns += sign * other.thread_cpu_ns
 
     def totals_are_zero(self) -> bool:
@@ -80,6 +84,7 @@ class _Domain:
             or self.via_library_ns
             or self.executor_cpu_ns
             or self.executor_wall_ns
+            or self.job_total
             or self.thread_cpu_ns
         )
 
@@ -177,6 +182,7 @@ class Collector:
             stats.executor_wall_ns += job.wall_ns
             stats.jobs[job.label] += job.cpu_ns
             stats.job_counts[job.label] += 1
+            stats.job_total += 1
             bucket.executor_cpu_ns += job.cpu_ns
 
     def add_threads(self, threads: list[ThreadRecord], now: float) -> None:
@@ -354,14 +360,15 @@ class Collector:
         sums: dict[str, list[int]] = {}
         for part in parts:
             for domain, stats in part.domains.items():
-                row = sums.setdefault(domain, [0, 0, 0, 0])
+                row = sums.setdefault(domain, [0, 0, 0, 0, 0])
                 row[0] += stats.cpu_ns
                 row[1] += stats.executor_cpu_ns + stats.thread_cpu_ns
                 row[2] += stats.samples
                 row[3] += stats.via_library_ns
-        idle = sums.pop("idle", [0, 0, 0, 0])
+                row[4] += stats.job_total
+        idle = sums.pop("idle", [0, 0, 0, 0, 0])
         integrations = []
-        for domain, (loop_ns, background_ns, samples, via_ns) in sorted(
+        for domain, (loop_ns, background_ns, samples, via_ns, jobs) in sorted(
             sums.items(), key=lambda item: (-(item[1][0] + item[1][1]), item[0])
         ):
             item: dict[str, Any] = {
@@ -369,6 +376,7 @@ class Collector:
                 "cpu_ms_per_min": per_minute(loop_ns + background_ns),
                 "loop_cpu_ms_per_min": per_minute(loop_ns),
                 "background_cpu_ms_per_min": per_minute(background_ns),
+                "jobs_per_min": round(jobs / span, 1),
                 "samples": samples,
                 "low_confidence": 0 < samples < MIN_CONFIDENT_SAMPLES,
             }
@@ -467,6 +475,7 @@ def _item(domain: str, stats: _Domain, span: float) -> dict[str, Any]:
         "background_cpu_ms_per_min": per_minute(
             stats.executor_cpu_ns + stats.thread_cpu_ns
         ),
+        "jobs_per_min": round(stats.job_total / span, 1),
         "samples": stats.samples,
         "low_confidence": 0 < stats.samples < MIN_CONFIDENT_SAMPLES,
     }
