@@ -73,6 +73,8 @@ class Insights:
         self._packages = Packages()
         self._owners: dict[str, str] = {}
         self._checked_libraries: set[str] = set()
+        # Findings of the last call per window, see findings.HOLD
+        self._shown: dict[int, frozenset[tuple[str, str | None]]] = {}
         self._rearm_failed = False
         self._wakeup_hook: Callable[[bytes], None] | None = None
         self._unsub_drain: CALLBACK_TYPE | None = None
@@ -320,13 +322,16 @@ class Insights:
                     values={"minutes": f"{math.ceil(MIN_MINUTES - settled)}"},
                 )
             ]
-        minutes = min(minutes, math.floor(settled))
-        return find(
-            self.summary(minutes),
-            lambda domain: self.detail(domain, minutes),
+        window = min(minutes, math.floor(settled))
+        findings = find(
+            self.summary(window),
+            lambda domain: self.detail(domain, window),
             self.memory_report(),
             self._built_in,
+            self._shown.get(minutes, frozenset()),
         )
+        self._shown[minutes] = frozenset((f.key, f.domain) for f in findings)
+        return findings
 
     def _built_in(self, domain: str) -> bool:
         try:

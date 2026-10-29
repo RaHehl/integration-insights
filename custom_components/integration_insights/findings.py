@@ -39,6 +39,9 @@ RESOURCES = ("listeners", "dispatcher", "timers", "tasks")
 # Built-in integrations run reviewed background work by design, such as the
 # recorder writing to its database, so only a lot of it is worth a word.
 BUILT_IN_BACKGROUND_FACTOR = 5
+# A finding that is shown stays until its number falls this far below the
+# threshold, so a value close to it does not make the finding come and go.
+HOLD = 0.8
 # Home Assistant itself, nothing a user can update or turn off, and this
 # integration, whose own cost the panel shows as measuring cost.
 NOT_AN_INTEGRATION = frozenset({"core", "python", "shared", "integration_insights"})
@@ -61,9 +64,19 @@ def find(
     detail: Callable[[str], dict[str, Any] | None],
     memory: dict[str, Any],
     built_in: Callable[[str], bool] = lambda _domain: False,
+    shown: frozenset[tuple[str, str | None]] = frozenset(),
 ) -> list[Finding]:
-    """Return the findings, the most severe first."""
+    """Return the findings, the most severe first.
+
+    `shown` holds the (key, domain) of the findings of the last call, which
+    only end below HOLD times their threshold.
+    """
+
+    def hold(key: str, domain: str | None = None) -> float:
+        return HOLD if (key, domain) in shown else 1
+
     findings: list[Finding] = []
+    minutes = _number(summary["window_minutes"])
     if summary["window_minutes"] < MIN_MINUTES:
         findings.append(
             Finding(
@@ -91,14 +104,14 @@ def find(
         if item["domain"] in NOT_AN_INTEGRATION:
             continue
         factor = BUILT_IN_BACKGROUND_FACTOR if built_in(item["domain"]) else 1
-        findings.extend(_cpu_findings(item, total_loop, detail, factor))
+        findings.extend(_cpu_findings(item, total_loop, detail, factor, hold, minutes))
     waiting = summary["loop_busy_ms_per_min"] - total_loop
-    if waiting >= LOOP_WAIT_NOTICE_MS:
+    if waiting >= LOOP_WAIT_NOTICE_MS * hold("loop_waits"):
         findings.append(
             Finding(
                 "loop_waits",
                 PROBLEM if waiting >= LOOP_WAIT_PROBLEM_MS else NOTICE,
-                values={"ms": _number(waiting)},
+                values={"ms": _number(waiting), "minutes": minutes},
             )
         )
     findings.extend(_memory_findings(memory))
@@ -119,35 +132,46 @@ def _cpu_findings(
     total_loop: float,
     detail: Callable[[str], dict[str, Any] | None],
     factor: int,
+    hold: Callable[[str, str | None], float],
+    minutes: str,
 ) -> list[Finding]:
     domain = item["domain"]
     loop = item["loop_cpu_ms_per_min"]
     background = item["background_cpu_ms_per_min"]
     background_notice = BACKGROUND_NOTICE_MS * factor
     background_problem = BACKGROUND_PROBLEM_MS * factor
-    if loop < LOOP_NOTICE_MS and background < background_notice:
+    if loop < LOOP_NOTICE_MS * HOLD and background < background_notice * HOLD:
         return []
     if (info := detail(domain)) is None:
         return []
     findings = []
-    if loop >= LOOP_NOTICE_MS and loop >= LOOP_SHARE * total_loop:
+    loop_hold = hold("busy_loop", domain)
+    if (
+        loop >= LOOP_NOTICE_MS * loop_hold
+        and loop >= LOOP_SHARE * loop_hold * total_loop
+    ):
         findings.append(
             Finding(
                 "busy_loop",
                 PROBLEM if loop >= LOOP_PROBLEM_MS else NOTICE,
                 domain,
-                {"ms": _number(loop), "share": _number(100 * loop / total_loop)},
+                {
+                    "ms": _number(loop),
+                    "share": _number(100 * loop / total_loop),
+                    "minutes": minutes,
+                },
                 _loop_evidence(info),
             )
         )
     threads = info.get("threads", {})
-    if (thread_ms := threads.get("cpu_ms_per_min", 0)) >= background_notice:
+    thread_ms = threads.get("cpu_ms_per_min", 0)
+    if thread_ms >= background_notice * hold("busy_thread", domain):
         findings.append(
             Finding(
                 "busy_thread",
                 PROBLEM if thread_ms >= background_problem else NOTICE,
                 domain,
-                {"ms": _number(thread_ms)},
+                {"ms": _number(thread_ms), "minutes": minutes},
                 [
                     f"thread {name}: {_number(ms)} ms/min"
                     for name, ms in list(threads["by_name"].items())[:EVIDENCE_LINES]
@@ -157,13 +181,21 @@ def _cpu_findings(
     executor = info.get("executor", {})
     executor_ms = executor.get("cpu_ms_per_min", 0)
     jobs = executor.get("jobs_per_min", 0)
-    if executor_ms >= background_notice or jobs >= JOBS_NOTICE_PER_MIN * factor:
+    executor_hold = hold("busy_executor", domain)
+    if (
+        executor_ms >= background_notice * executor_hold
+        or jobs >= JOBS_NOTICE_PER_MIN * factor * executor_hold
+    ):
         findings.append(
             Finding(
                 "busy_executor",
                 PROBLEM if executor_ms >= background_problem else NOTICE,
                 domain,
-                {"ms": _number(executor_ms), "jobs": _number(jobs)},
+                {
+                    "ms": _number(executor_ms),
+                    "jobs": _number(jobs),
+                    "minutes": minutes,
+                },
                 [
                     f"{job['function']}: {_number(job['per_min'])}/min, {_number(job['cpu_ms_per_min'])} ms/min"
                     for job in executor["jobs"][:EVIDENCE_LINES]

@@ -29,19 +29,19 @@
     },
     "busy_loop": {
       "title": "{name} keeps Home Assistant busy",
-      "description": "{name} used the event loop for {ms} ms a minute, {share}% of all event loop time. While it runs, everything else waits: automations, the dashboard and other integrations.\n\nWhat you can do:\n- Check whether an update of {name} is available.\n- Look for a report, or open one, at [the issue tracker]({issues_url}), and add the report from this page.\n- To confirm, [disable {name}]({config_url}) for a while and compare."
+      "description": "Over the last {minutes} minutes, {name} used the event loop for {ms} ms a minute, {share}% of all CPU time on the event loop. While it runs, everything else waits: automations, the dashboard and other integrations.\n\nWhat you can do:\n- Check whether an update of {name} is available.\n- Look for a report, or open one, at [the issue tracker]({issues_url}), and add the report from this page.\n- To confirm, [disable {name}]({config_url}) for a while and compare."
     },
     "busy_thread": {
       "title": "{name} keeps background threads busy",
-      "description": "Threads of {name} used {ms} ms of CPU a minute, around the clock. This does not hold up Home Assistant directly, but it costs CPU and power, and that adds up on small hardware.\n\nWhat you can do:\n- Check whether an update of {name} is available.\n- Look for a report, or open one, at [the issue tracker]({issues_url}), and add the report from this page."
+      "description": "Over the last {minutes} minutes, threads of {name} used {ms} ms of CPU a minute. They run beside the event loop, but they cost CPU and power, and that adds up on small hardware.\n\nWhat you can do:\n- Check whether an update of {name} is available.\n- Look for a report, or open one, at [the issue tracker]({issues_url}), and add the report from this page."
     },
     "busy_executor": {
       "title": "{name} keeps handing off work",
-      "description": "{name} ran {jobs} jobs a minute in the background, using {ms} ms of CPU a minute. This usually means it polls or reads files more often than it needs to.\n\nWhat you can do:\n- Check the options of {name} for an update interval.\n- Check whether an update of {name} is available.\n- Look for a report, or open one, at [the issue tracker]({issues_url}), and add the report from this page."
+      "description": "Over the last {minutes} minutes, {name} ran {jobs} jobs a minute in the background, using {ms} ms of CPU a minute. That many jobs can mean it polls or reads files more often than it needs to.\n\nWhat you can do:\n- Check the options of {name} for an update interval.\n- Check whether an update of {name} is available.\n- Look for a report, or open one, at [the issue tracker]({issues_url}), and add the report from this page."
     },
     "loop_waits": {
       "title": "The event loop often waits",
-      "description": "The event loop was busy {ms} ms a minute longer than it used the CPU. It was waiting, usually on a blocking call such as reading a file or the network, sometimes on a busy thread. Home Assistant does nothing else while it waits.\n\nWhat you can do:\n- Look in the log for \"Detected blocking call\", which names the integration.\n- This page measures CPU time, so it cannot tell which integration made the event loop wait."
+      "description": "Over the last {minutes} minutes, the event loop was busy {ms} ms a minute longer than it used the CPU. It was waiting: on a blocking call such as reading a file or the network, on a busy thread that held Python's interpreter lock, or for a free CPU core. Home Assistant does nothing else while it waits.\n\nWhat you can do:\n- Look in the log for \"Detected blocking call\", which names the integration.\n- This page measures CPU time, so it cannot tell which integration made the event loop wait."
     },
     "growing_resources": {
       "title": "{name} may be leaking",

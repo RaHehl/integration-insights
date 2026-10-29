@@ -73,7 +73,7 @@ def test_busy_loop_needs_both_amount_and_share() -> None:
 
     findings = find(_summary([_item("foo", 1_500)], loop=3_000), lambda _: detail, {})
     assert _keys(findings) == [("busy_loop", NOTICE, "foo")]
-    assert findings[0].values == {"ms": "1,500", "share": "50"}
+    assert findings[0].values == {"ms": "1,500", "share": "50", "minutes": "15"}
     assert findings[0].evidence == [
         "custom_components/foo/coordinator.py FooCoordinator._parse (line 57): 900 ms/min",
         "triggered by event state_changed: 800 ms/min",
@@ -115,7 +115,7 @@ def test_background_threads_and_jobs() -> None:
     assert findings[0].evidence == [
         "thread AnyIO worker thread (watchfiles.RustNotify.watch): 510 ms/min"
     ]
-    assert findings[1].values == {"ms": "40", "jobs": "900"}
+    assert findings[1].values == {"ms": "40", "jobs": "900", "minutes": "15"}
 
     quiet = _detail(
         threads={"cpu_ms_per_min": 299, "by_name": {}},
@@ -194,7 +194,11 @@ async def test_findings_are_rendered_with_where_to_act(
     assert await hass.config_entries.async_setup(entry.entry_id)
     client = await hass_ws_client(hass)
     finding = Finding(
-        "busy_thread", NOTICE, DOMAIN, {"ms": "510"}, ["thread X: 510 ms/min"]
+        "busy_thread",
+        NOTICE,
+        DOMAIN,
+        {"ms": "510", "minutes": "15"},
+        ["thread X: 510 ms/min"],
     )
 
     with patch(
@@ -207,6 +211,7 @@ async def test_findings_are_rendered_with_where_to_act(
     assert result["verdict"] == NOTICE
     (item,) = result["findings"]
     assert item["title"] == "Integration Insights keeps background threads busy"
+    assert "Over the last 15 minutes" in item["description"]
     assert "510 ms of CPU a minute" in item["description"]
     assert (
         "(https://github.com/RaHehl/integration-insights/issues)" in item["description"]
@@ -258,4 +263,59 @@ async def test_findings_wait_for_home_assistant_to_settle(hass: HomeAssistant) -
         assert insights.findings(60) == []
     summary = find_mock.call_args.args[0]
     assert summary["window_minutes"] <= 7  # The first five minutes are left out
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+def test_shown_findings_hold_until_clearly_below() -> None:
+    """A value close to the threshold does not make a finding come and go."""
+    detail = _detail(
+        threads={"cpu_ms_per_min": 280, "by_name": {"poller": 280}},
+        executor={"cpu_ms_per_min": 0, "jobs_per_min": 500, "jobs": []},
+    )
+    summary = _summary([_item("foo", 900, 280)], loop=4_000, busy=6_500)
+    assert find(summary, lambda _: detail, {}) == []
+
+    shown = frozenset(
+        {
+            ("busy_loop", "foo"),
+            ("busy_thread", "foo"),
+            ("busy_executor", "foo"),
+            ("loop_waits", None),
+        }
+    )
+    assert _keys(find(summary, lambda _: detail, {}, shown=shown)) == [
+        ("busy_loop", NOTICE, "foo"),
+        ("busy_thread", NOTICE, "foo"),
+        ("busy_executor", NOTICE, "foo"),
+        ("loop_waits", NOTICE, None),
+    ]
+
+    low = _detail(threads={"cpu_ms_per_min": 230, "by_name": {}})
+    summary = _summary([_item("foo", 790, 230)], loop=4_000, busy=6_300)
+    assert find(summary, lambda _: low, {}, shown=shown) == []
+
+
+async def test_insights_remember_what_was_shown(hass: HomeAssistant) -> None:
+    """Each window passes the findings of its last call on to the next one."""
+    entry = MockConfigEntry(domain=DOMAIN)
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    insights = entry.runtime_data
+    finding = Finding("busy_thread", NOTICE, "foo")
+
+    with (
+        patch(
+            "custom_components.integration_insights.insights.time.monotonic",
+            return_value=insights.started + 30 * 60,
+        ),
+        patch(
+            "custom_components.integration_insights.insights.find",
+            return_value=[finding],
+        ) as find_mock,
+    ):
+        insights.findings(15)
+        insights.findings(15)
+        insights.findings(60)
+    shown = [call.args[4] for call in find_mock.call_args_list]
+    assert shown == [frozenset(), {("busy_thread", "foo")}, frozenset()]
     assert await hass.config_entries.async_unload(entry.entry_id)
