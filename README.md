@@ -1,3 +1,8 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/brand/dark_logo.svg">
+  <img src="docs/brand/logo.svg" alt="Integration Insights" width="420">
+</picture>
+
 # Integration Insights
 
 Finds the integration that slows Home Assistant down, keeps the CPU busy, or leaks memory, and tells you what to do about it.
