@@ -169,6 +169,27 @@ async def test_anyio_workers_are_charged_by_what_they_run() -> None:
 
 
 @linux_only
+async def test_anyio_workers_are_charged_to_the_waiting_task() -> None:
+    """A Rust or C callable names no package, the task waiting for it does."""
+    anyio = pytest.importorskip("anyio")
+    work = functools.partial(hashlib.pbkdf2_hmac, "sha256", b"x", b"salt", 3_000_000)
+    watch = _module(
+        "/config/custom_components/solar/watch.py",
+        "custom_components.solar.watch",
+        "async def watch(anyio, work):\n    return await anyio.to_thread.run_sync(work)\n",
+    )["watch"]
+    background = _background()  # Nothing mapped: only the task can tell
+    background.poll_threads(set())  # baseline
+    task = asyncio.ensure_future(watch(anyio, work))
+    await asyncio.sleep(0.3)
+    records = background.poll_threads({threading.main_thread().native_id})
+    await task
+    (record,) = [r for r in records if r.name.startswith("AnyIO worker thread")]
+    assert record.owner.domain == "solar"
+    assert record.name == "AnyIO worker thread (custom_components.solar.watch.watch)"
+
+
+@linux_only
 def test_executor_workers_are_skipped() -> None:
     """Executor workers are covered by their jobs, not as threads."""
     background = _background()

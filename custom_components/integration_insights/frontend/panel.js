@@ -17,6 +17,33 @@ const escapeHtml = (value) =>
     (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]
   );
 
+// Finding texts come from the translations: paragraphs, "- " lists and links,
+// escaped first. Links go to http(s) or to a page of Home Assistant.
+const renderText = (text) =>
+  String(text)
+    .split(/\n{2,}/)
+    .map((block) => {
+      const lines = block.split("\n");
+      const inline = (line) =>
+        escapeHtml(line).replace(/\[([^\]]+)\]\(((?:https?:\/\/|\/)[^)\s]*)\)/g, (_m, label, href) =>
+          href.startsWith("/")
+            ? `<a href="${href}" data-action="navigate" data-value="${href}">${label}</a>`
+            : `<a href="${href}" target="_blank" rel="noreferrer">${label}</a>`
+        );
+      if (lines.every((line) => line.startsWith("- "))) {
+        return `<ul>${lines.map((line) => `<li>${inline(line.slice(2))}</li>`).join("")}</ul>`;
+      }
+      const [first, ...rest] = lines;
+      const list = rest.filter((line) => line.startsWith("- "));
+      if (list.length && list.length === rest.length) {
+        return `<p>${inline(first)}</p><ul>${list.map((line) => `<li>${inline(line.slice(2))}</li>`).join("")}</ul>`;
+      }
+      return `<p>${lines.map(inline).join("<br>")}</p>`;
+    })
+    .join("");
+
+const plainText = (text) => String(text).replace(/\[([^\]]+)\]\(([^)]+)\)/g, "$1 ($2)");
+
 const ms = (value) =>
   value >= 10 ? Math.round(value).toLocaleString() : value.toFixed(1);
 
@@ -251,6 +278,51 @@ const STYLE = `
     color: var(--secondary-text-color);
   }
   .error { color: var(--error-color, #db4437); }
+  .verdict {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 16px;
+    padding: 16px;
+    border-radius: var(--ii-radius);
+    background: var(--ii-card);
+    box-shadow: var(--ha-card-box-shadow, none);
+    border: 1px solid var(--divider-color, rgba(0, 0, 0, 0.12));
+  }
+  .verdict .mark { font-size: 28px; line-height: 1; }
+  .verdict .head { font-size: 18px; }
+  .verdict .sub { margin-top: 2px; font-size: 13px; color: var(--secondary-text-color); }
+  .verdict.ok .mark { color: var(--success-color, #43a047); }
+  .verdict.notice .mark { color: var(--warning-color, #ffa600); }
+  .verdict.problem .mark { color: var(--error-color, #db4437); }
+  .finding {
+    margin-bottom: 12px;
+    padding: 16px;
+    border-radius: var(--ii-radius);
+    background: var(--ii-card);
+    box-shadow: var(--ha-card-box-shadow, none);
+    border: 1px solid var(--divider-color, rgba(0, 0, 0, 0.12));
+    border-left: 4px solid var(--info-color, #039be5);
+  }
+  .finding.notice { border-left-color: var(--warning-color, #ffa600); }
+  .finding.problem { border-left-color: var(--error-color, #db4437); }
+  .finding h2 { margin: 0 0 8px; font-size: 16px; font-weight: 500; }
+  .finding .text p { margin: 0 0 8px; }
+  .finding .text ul { margin: 0 0 8px; padding-left: 20px; }
+  .finding .text a { color: var(--primary-color); }
+  .finding .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+  .finding .actions button {
+    padding: 6px 14px;
+    border: 1px solid var(--primary-color);
+    border-radius: 16px;
+    background: none;
+    color: var(--primary-color);
+    font: inherit;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  .finding details { margin-top: 10px; font-size: 13px; }
+  .finding details ul { margin: 6px 0 0; padding-left: 20px; font-family: var(--ii-mono); word-break: break-word; }
   .footer { margin-top: 12px; font-size: 13px; color: var(--secondary-text-color); }
   @media (max-width: 600px) {
     main { padding: 12px; }
@@ -273,7 +345,8 @@ class IntegrationInsightsPanel extends HTMLElement {
     this._expanded = new Set();
     this._openStacks = new Set();
     this._details = new Map();
-    this._view = "cpu";
+    this._view = "overview";
+    this._findings = undefined;
     this._memory = undefined;
     this._memExpanded = new Set();
     this._snapshotting = false;
@@ -322,7 +395,7 @@ class IntegrationInsightsPanel extends HTMLElement {
   }
 
   async _subscribe() {
-    if (!this._hass || this._token || document.hidden || this._view !== "cpu") return;
+    if (!this._hass || this._token || document.hidden || this._view === "memory") return;
     const token = (this._token = {});
     try {
       const unsub = await this._hass.connection.subscribeMessage(
@@ -351,6 +424,25 @@ class IntegrationInsightsPanel extends HTMLElement {
     this._error = undefined;
     this._updated = new Date();
     for (const domain of this._expanded) this._loadDetail(domain);
+    if (this._view === "overview") this._loadFindings();
+    this._render();
+  }
+
+  async _loadFindings() {
+    if (this._findingsPending) return;
+    this._findingsPending = true;
+    try {
+      this._findings = await this._hass.connection.sendMessagePromise({
+        type: "integration_insights/findings",
+        minutes: this._minutes,
+        language: this._hass.locale?.language || this._hass.language,
+      });
+      this._error = undefined;
+    } catch (err) {
+      this._error = err && err.message ? err.message : String(err);
+    } finally {
+      this._findingsPending = false;
+    }
     this._render();
   }
 
@@ -397,6 +489,7 @@ class IntegrationInsightsPanel extends HTMLElement {
       this._minutes = Number(value);
       this._unsubscribe();
       this._details.clear();
+      this._findings = undefined;
       this._render();
       this._subscribe();
     } else if (action === "toggle") {
@@ -410,8 +503,10 @@ class IntegrationInsightsPanel extends HTMLElement {
       this._render();
     } else if (action === "view") {
       this._view = value;
-      if (value === "cpu") this._subscribe();
-      else {
+      if (value !== "memory") {
+        this._subscribe();
+        if (value === "overview" && this._data) this._loadFindings();
+      } else {
         this._unsubscribe();
         if (!this._memory) this._loadMemory(false);
       }
@@ -426,6 +521,17 @@ class IntegrationInsightsPanel extends HTMLElement {
       this._download();
     } else if (action === "copy") {
       this._copy(value, target);
+    } else if (action === "copyfinding") {
+      this._copyFinding(Number(value), target);
+    } else if (action === "show") {
+      this._view = "cpu";
+      this._expanded.add(value);
+      this._loadDetail(value);
+      this._render();
+    } else if (action === "navigate") {
+      ev.preventDefault();
+      history.pushState(null, "", value);
+      window.dispatchEvent(new CustomEvent("location-changed", { detail: { replace: false } }));
     }
   }
 
@@ -474,7 +580,29 @@ class IntegrationInsightsPanel extends HTMLElement {
   async _copy(domain, button) {
     const detail = this._details.get(domain);
     if (!detail || !detail.item) return;
-    const text = this._describe(detail);
+    await this._toClipboard(this._describe(detail), button, "Copy as text");
+  }
+
+  // What a developer needs to look into a finding, ready for an issue.
+  async _copyFinding(index, button) {
+    const finding = this._findings?.findings[index];
+    if (!finding) return;
+    const config = this._hass.config || {};
+    const lines = [`Integration Insights: ${finding.title}`, ""];
+    if (finding.domain) {
+      lines.push(
+        `Integration: ${finding.name} (${finding.domain})${finding.version ? `, version ${finding.version}` : ""}`
+      );
+    }
+    lines.push(`Home Assistant ${config.version || "?"}, measured over the last ${this._minutes} minutes`, "");
+    lines.push(plainText(finding.description.split("\n\n")[0]));
+    if (finding.evidence.length) {
+      lines.push("", "Details:", ...finding.evidence.map((line) => `- ${line}`));
+    }
+    await this._toClipboard(lines.join("\n"), button, "Copy report for the developer");
+  }
+
+  async _toClipboard(text, button, label) {
     let done = false;
     try {
       await navigator.clipboard.writeText(text);
@@ -492,7 +620,7 @@ class IntegrationInsightsPanel extends HTMLElement {
     }
     button.textContent = done ? "Copied" : "Copy failed";
     setTimeout(() => {
-      button.textContent = "Copy as text";
+      button.textContent = label;
     }, 1500);
   }
 
@@ -573,6 +701,7 @@ class IntegrationInsightsPanel extends HTMLElement {
         `<button data-action="window" data-value="${minutes}" aria-pressed="${minutes === this._minutes}">${minutes} min</button>`
     ).join("");
     const views = [
+      ["overview", "Overview"],
       ["cpu", "CPU"],
       ["memory", "Memory"],
     ]
@@ -582,7 +711,9 @@ class IntegrationInsightsPanel extends HTMLElement {
       )
       .join("");
     const tools =
-      this._view === "cpu"
+      this._view === "overview"
+        ? `<div class="segmented" role="group" aria-label="Time window">${windows}</div>`
+        : this._view === "cpu"
         ? `<div class="segmented" role="group" aria-label="Time window">${windows}</div>
       <button class="header-button" data-action="download" ${this._data ? "" : "disabled"}>Download report</button>`
         : `<button class="header-button" data-action="snapshot" ${this._snapshotting ? "disabled" : ""}>${this._snapshotting ? "Taking snapshot…" : "Take snapshot"}</button>`;
@@ -594,6 +725,7 @@ class IntegrationInsightsPanel extends HTMLElement {
 
   _renderBody() {
     if (this._view === "memory") return this._renderMemory();
+    if (this._view === "overview") return this._renderOverview();
     if (!this._data) {
       return this._error
         ? `<div class="message error">${escapeHtml(this._error)}</div>`
@@ -674,6 +806,51 @@ class IntegrationInsightsPanel extends HTMLElement {
     if (owner === "python") return "Python standard library";
     if (owner === "shared") return "Shared strings and bytes";
     return this._memory.names[owner] || owner;
+  }
+
+  _renderOverview() {
+    if (!this._findings) {
+      return this._error
+        ? `<div class="message error">${escapeHtml(this._error)}</div>`
+        : `<div class="message">Loading…</div>`;
+    }
+    const { verdict, findings } = this._findings;
+    const worthALook = findings.filter((f) => f.severity !== "info").length;
+    const head =
+      verdict === "ok"
+        ? `Nothing unusual in the last ${this._minutes} minutes`
+        : verdict === "problem"
+        ? `${worthALook} ${worthALook === 1 ? "problem" : "problems"} found`
+        : `${worthALook} ${worthALook === 1 ? "thing" : "things"} worth a look`;
+    const mark = verdict === "ok" ? "✓" : verdict === "problem" ? "✕" : "!";
+    const banner = `<div class="verdict ${verdict}" role="status">
+        <div class="mark" aria-hidden="true">${mark}</div>
+        <div><div class="head">${escapeHtml(head)}</div>
+        <div class="sub">Checked: time on the event loop, background threads and jobs${this._memory?.latest ? ", memory snapshots" : ""}.</div></div>
+      </div>`;
+    const cards = findings
+      .map((finding, index) => {
+        const evidence = finding.evidence.length
+          ? `<details><summary>Details for developers</summary><ul>${finding.evidence
+              .map((line) => `<li>${escapeHtml(line)}</li>`)
+              .join("")}</ul></details>`
+          : "";
+        const actions = finding.domain
+          ? `<div class="actions">
+              <button data-action="copyfinding" data-value="${index}">Copy report for the developer</button>
+              <button data-action="show" data-value="${escapeHtml(finding.domain)}">Show details</button>
+            </div>`
+          : "";
+        return `<section class="finding ${escapeHtml(finding.severity)}">
+            <h2>${escapeHtml(finding.title)}</h2>
+            <div class="text">${renderText(finding.description)}</div>
+            ${actions}${evidence}
+          </section>`;
+      })
+      .join("");
+    const error = this._error ? `<div class="message error">${escapeHtml(this._error)}</div>` : "";
+    return `${error}${banner}${cards}
+      <div class="footer">Findings use the same numbers as the CPU and Memory views. A snapshot under Memory adds checks for leaks.</div>`;
   }
 
   _renderMemory() {

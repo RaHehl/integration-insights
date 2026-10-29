@@ -8,10 +8,12 @@ import probatio as vol
 from homeassistant.components import websocket_api
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.translation import async_get_translations
 from homeassistant.loader import IntegrationNotLoaded, async_get_loaded_integration
 
 from .collector import WINDOW_MINUTES
 from .const import DOMAIN
+from .findings import Finding, verdict
 from .insights import Insights
 from .memory import SnapshotRefused
 
@@ -26,6 +28,7 @@ def async_setup(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, websocket_subscribe)
     websocket_api.async_register_command(hass, websocket_memory)
     websocket_api.async_register_command(hass, websocket_memory_snapshot)
+    websocket_api.async_register_command(hass, websocket_findings)
 
 
 def _insights(
@@ -205,3 +208,81 @@ def _memory_result(hass: HomeAssistant, insights: Insights) -> dict[str, Any]:
         if row["group"] == "integration"
     ]
     return {"memory": memory, "names": _integration_names(hass, rows)}
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/findings",
+        vol.Optional("minutes", default=WINDOW_MINUTES): MINUTES,
+        vol.Optional("language"): str,
+    }
+)
+@websocket_api.async_response
+async def websocket_findings(
+    hass: HomeAssistant,
+    connection: websocket_api.connection.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Return the findings in the user's language, with where to act on them."""
+    if (insights := _insights(hass, connection, msg["id"])) is None:
+        return
+    findings = insights.findings(msg["minutes"])
+    translations = await async_get_translations(
+        hass, msg.get("language") or hass.config.language, "issues", {DOMAIN}
+    )
+    connection.send_result(
+        msg["id"],
+        {
+            "verdict": verdict(findings),
+            "findings": [_render(hass, finding, translations) for finding in findings],
+        },
+    )
+
+
+def _render(
+    hass: HomeAssistant, finding: Finding, translations: dict[str, str]
+) -> dict[str, Any]:
+    values = dict(finding.values)
+    item: dict[str, Any] = {
+        "key": finding.key,
+        "severity": finding.severity,
+        "domain": finding.domain,
+        "evidence": finding.evidence,
+    }
+    if finding.domain is not None:
+        about = _about(hass, finding.domain)
+        item.update(about)
+        values.update(
+            name=about["name"],
+            issues_url=about["issues_url"],
+            config_url=f"/config/integrations/integration/{finding.domain}",
+        )
+    prefix = f"component.{DOMAIN}.issues.{finding.key}."
+    for part in ("title", "description"):
+        text = translations.get(prefix + part, "")
+        for key, value in values.items():
+            text = text.replace(f"{{{key}}}", value)
+        item[part] = text
+    return item
+
+
+def _about(hass: HomeAssistant, domain: str) -> dict[str, Any]:
+    """Name, version and issue tracker of an integration."""
+    try:
+        integration = async_get_loaded_integration(hass, domain)
+    except IntegrationNotLoaded:
+        return {"name": domain, "built_in": False, "version": None, "issues_url": ""}
+    if integration.is_built_in:
+        issues_url = (
+            "https://github.com/home-assistant/core/issues"
+            f"?q=is%3Aissue+is%3Aopen+label%3A%22integration%3A+{domain}%22"
+        )
+    else:
+        issues_url = integration.issue_tracker or integration.documentation or ""
+    return {
+        "name": integration.name,
+        "built_in": integration.is_built_in,
+        "version": None if integration.version is None else str(integration.version),
+        "issues_url": issues_url,
+    }

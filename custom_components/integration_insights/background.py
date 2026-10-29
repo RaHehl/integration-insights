@@ -5,8 +5,9 @@ to the integration that submitted them. Other threads are read from
 /proc/self/task every drain and charged to the integration that owns them.
 """
 
+import asyncio
 from collections import deque
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import Executor, Future
 import os
 from pathlib import Path
@@ -26,6 +27,8 @@ _POOL_LOCALS = {
     "anyio._backends._asyncio": "func",
     "concurrent.futures.thread": "fn",
 }
+# Code that only passes work along; the label names what is behind it.
+_PLUMBING = ("anyio", "asyncio", "concurrent", "threading")
 _TICK_NS = 1_000_000_000 // os.sysconf("SC_CLK_TCK")
 
 
@@ -166,11 +169,9 @@ class Background:
                     record = self._walk(frame, 0)
                     domain = record.domain if record.domain != "idle" else "core"
                     owner = Owner(domain, record.libraries)
-                    if domain == "core" and (fn := _pool_callable(frame)) is not None:
-                        pool_owner, label = self.resolve(fn, None)
-                        if pool_owner.domain != "core":
-                            owner = pool_owner
-                            name = f"{thread.name} ({label})"
+                    if domain == "core" and (pool := _pool_frame(frame)) is not None:
+                        owner, label = self._pool_owner(pool)
+                        name = f"{thread.name} ({label})"
                 else:
                     owner = Owner("core", ())
             if name is None:
@@ -181,6 +182,30 @@ class Background:
             del self._thread_cpu[tid]
             self._thread_owners.pop(tid, None)
         return records
+
+    def _pool_owner(self, pool: FrameType) -> tuple[Owner, str]:
+        """Owner of the work a pool worker runs: the task waiting for it, else the callable."""
+        fn = pool.f_locals.get(_POOL_LOCALS[pool.f_globals["__name__"]])
+        owner, label = self.resolve(fn, None)
+        # anyio passes the future a task in the event loop waits on. That task
+        # started the call, whatever language the callable is written in.
+        if (task := _waiting_task(pool.f_locals.get("future"))) is not None:
+            domain, libraries, task_label = _task_owner(task)
+            label = task_label or label
+            if domain is not None:
+                return Owner(domain, libraries), label
+            if mapped := next(
+                (
+                    self._library_map()[lib]
+                    for lib in libraries
+                    if lib in self._library_map()
+                ),
+                None,
+            ):
+                return Owner(mapped, libraries), label
+            # Unmapped for now: passing the libraries on lets the map pick them up.
+            owner = Owner(owner.domain, owner.libraries + libraries)
+        return owner, label
 
     def _static_owner(self, tid: int, thread: threading.Thread | None) -> Owner | None:
         """Owner from the thread's target or class, cached per thread object."""
@@ -214,15 +239,63 @@ class Background:
         return owner
 
 
-def _pool_callable(frame: FrameType | None) -> Any:
-    """Return the callable a pool worker runs, from its loop's frame, or None."""
+def _pool_frame(frame: FrameType | None) -> FrameType | None:
+    """Return the frame of a pool worker's loop that holds a callable, or None."""
     while frame is not None:
-        if (local := _POOL_LOCALS.get(frame.f_globals.get("__name__", ""))) and (
-            fn := frame.f_locals.get(local)
-        ) is not None:
-            return fn
+        if (
+            local := _POOL_LOCALS.get(frame.f_globals.get("__name__", ""))
+        ) and frame.f_locals.get(local) is not None:
+            return frame
         frame = frame.f_back
     return None
+
+
+def _waiting_task(future: Any) -> asyncio.Task[Any] | None:
+    """Return the task waiting on an asyncio future, from its done callbacks."""
+    if not isinstance(future, asyncio.Future):
+        return None
+    for callback, _context in future._callbacks or ():  # noqa: SLF001
+        if isinstance(task := getattr(callback, "__self__", None), asyncio.Task):
+            return task
+    return None
+
+
+def _await_frames(task: asyncio.Task[Any]) -> Iterator[FrameType]:
+    """Frames of a suspended task, from its coroutine down to what it awaits."""
+    awaitable: Any = task.get_coro()
+    while awaitable is not None:
+        frame = (
+            getattr(awaitable, "cr_frame", None)
+            or getattr(awaitable, "ag_frame", None)
+            or getattr(awaitable, "gi_frame", None)
+        )
+        if frame is not None:
+            yield frame
+        awaitable = (
+            getattr(awaitable, "cr_await", None)
+            or getattr(awaitable, "ag_await", None)
+            or getattr(awaitable, "gi_yieldfrom", None)
+        )
+
+
+def _task_owner(task: asyncio.Task[Any]) -> tuple[str | None, tuple[str, ...], str]:
+    """Integration, libraries and label of the innermost real code a task awaits in."""
+    domain = None
+    libraries: dict[str, None] = {}
+    label = ""
+    for frame in _await_frames(task):
+        module = frame.f_globals.get("__name__", "")
+        if (found := module_domain(module)) is not None:
+            domain = found
+        elif not module.startswith("homeassistant"):
+            libraries[top_package(module)] = None
+        if not module.startswith(_PLUMBING):
+            label = f"{module}.{frame.f_code.co_qualname}"
+    return (
+        domain,
+        tuple(lib for lib in libraries if not lib.startswith(_PLUMBING)),
+        label,
+    )
 
 
 def _timed(

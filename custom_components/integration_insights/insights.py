@@ -5,6 +5,7 @@ from collections import deque
 from collections.abc import Callable
 from datetime import timedelta
 import logging
+import math
 import threading
 import time
 from typing import Any
@@ -20,6 +21,7 @@ from homeassistant.util import dt as dt_util
 from .attribution import Packages, distribution_owners, library_owners
 from .background import Background, LoopWait, ThreadRecord
 from .collector import WINDOW_MINUTES, Collector
+from .findings import INFO, MIN_MINUTES, Finding, find
 from .memory import (
     Snapshot,
     account_heap,
@@ -39,6 +41,8 @@ _LOGGER = logging.getLogger(__name__)
 DRAIN_INTERVAL = timedelta(seconds=10)
 TOP_ENTITIES = 20
 KEPT_SNAPSHOTS = 10
+# Left out of findings after a start.
+STARTUP_MINUTES = 5
 
 
 def _wakeup_fd(hass: HomeAssistant) -> int | None:
@@ -300,6 +304,35 @@ class Insights:
         self.drain()
         item = self.collector.detail(domain, time.monotonic(), self.started, minutes)
         return None if item is None else self._with_devices(item)
+
+    def findings(self, minutes: int = WINDOW_MINUTES) -> list[Finding]:
+        """Return what the measurements of the last `minutes` point to.
+
+        The minutes right after a start are left out: imports, the library map
+        and integrations setting up would look like a load that is not there.
+        """
+        settled = (time.monotonic() - self.started) / 60 - STARTUP_MINUTES
+        if settled < MIN_MINUTES:
+            return [
+                Finding(
+                    "measuring",
+                    INFO,
+                    values={"minutes": f"{math.ceil(MIN_MINUTES - settled)}"},
+                )
+            ]
+        minutes = min(minutes, math.floor(settled))
+        return find(
+            self.summary(minutes),
+            lambda domain: self.detail(domain, minutes),
+            self.memory_report(),
+            self._built_in,
+        )
+
+    def _built_in(self, domain: str) -> bool:
+        try:
+            return async_get_loaded_integration(self.hass, domain).is_built_in
+        except IntegrationNotLoaded:
+            return False
 
     def report(self, minutes: int = WINDOW_MINUTES) -> dict[str, Any]:
         """Return the full report over the last `minutes`."""
