@@ -72,7 +72,10 @@ def _detail_names(hass: HomeAssistant, items: list[dict[str, Any]]) -> dict[str,
         for device_id in item["devices"]:
             if (device := devices.async_get(device_id)) is not None:
                 device_names[device_id] = device.name_by_user or device.name or ""
-        for entity_id in item["entities"]:
+        for entity_id in (
+            *item["entities"],
+            *item.get("state_writes", {}).get("entities", {}),
+        ):
             if (state := hass.states.get(entity_id)) is not None:
                 entity_names[entity_id] = state.name
     return {

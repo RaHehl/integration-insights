@@ -43,6 +43,8 @@ const renderText = (text) =>
     .join("");
 
 const plainText = (text) => String(text).replace(/\[([^\]]+)\]\(([^)]+)\)/g, "$1 ($2)");
+// Findings answer one question and get one window: long enough to hold, short enough to be today's.
+const FINDINGS_MINUTES = 15;
 const localTime = (epoch) => (epoch ? new Date(epoch * 1000).toLocaleTimeString() : "");
 const isoTime = (epoch) => (epoch ? new Date(epoch * 1000).toISOString() : "");
 
@@ -178,7 +180,13 @@ const STYLE = `
     border-bottom: 1px solid var(--divider-color);
   }
   .num { text-align: right; font-variant-numeric: tabular-nums; }
+  button.sort {
+    background: none; border: 0; padding: 0; margin: 0; font: inherit; color: inherit;
+    text-transform: inherit; letter-spacing: inherit; cursor: pointer; text-align: right;
+  }
+  button.sort.active { color: var(--primary-text-color); }
   .card-head.mem, .row.mem { grid-template-columns: 1fr 100px 100px 84px 70px 60px; }
+  .card-head.states, .row.states { grid-template-columns: 1fr 110px 110px 90px; }
   .delta { display: block; font-size: 12px; color: var(--secondary-text-color); }
   .delta.up { color: var(--error-color, #db4437); }
   .delta.down { color: var(--success-color, #43a047); }
@@ -330,6 +338,7 @@ const STYLE = `
     main { padding: 12px; }
     .card-head, .row { grid-template-columns: 1fr 64px 76px 56px; gap: 8px; }
     .card-head.mem, .row.mem { grid-template-columns: 1fr 64px 64px 56px; }
+    .card-head.states, .row.states { grid-template-columns: 1fr 76px 76px 56px; }
     .col-wide { display: none; }
     .col-samples { display: none; }
     .detail { padding-left: 16px; }
@@ -348,6 +357,8 @@ class IntegrationInsightsPanel extends HTMLElement {
     this._openStacks = new Set();
     this._details = new Map();
     this._view = "overview";
+    this._sort = "cpu_ms_per_min";
+    this._sortAscending = false;
     this._findings = undefined;
     this._memory = undefined;
     this._memExpanded = new Set();
@@ -433,20 +444,12 @@ class IntegrationInsightsPanel extends HTMLElement {
   async _loadFindings() {
     if (this._findingsPending) return;
     this._findingsPending = true;
-    const minutes = this._minutes;
     try {
-      const findings = await this._hass.connection.sendMessagePromise({
+      this._findings = await this._hass.connection.sendMessagePromise({
         type: "integration_insights/findings",
-        minutes,
+        minutes: FINDINGS_MINUTES,
         language: this._hass.locale?.language || this._hass.language,
       });
-      if (minutes !== this._minutes) {
-        // The window changed while this was on its way: ask again.
-        this._findingsPending = false;
-        this._loadFindings();
-        return;
-      }
-      this._findings = findings;
       this._error = undefined;
     } catch (err) {
       this._error = err && err.message ? err.message : String(err);
@@ -501,7 +504,6 @@ class IntegrationInsightsPanel extends HTMLElement {
       this._minutes = Number(value);
       this._unsubscribe();
       this._details.clear();
-      this._findings = undefined;
       this._render();
       this._subscribe();
     } else if (action === "toggle") {
@@ -521,6 +523,13 @@ class IntegrationInsightsPanel extends HTMLElement {
       } else {
         this._unsubscribe();
         if (!this._memory) this._loadMemory(false);
+      }
+      this._render();
+    } else if (action === "sort") {
+      if (this._sort === value) this._sortAscending = !this._sortAscending;
+      else {
+        this._sort = value;
+        this._sortAscending = false;
       }
       this._render();
     } else if (action === "snapshot") {
@@ -606,7 +615,7 @@ class IntegrationInsightsPanel extends HTMLElement {
         `Integration: ${finding.name} (${finding.domain})${finding.version ? `, version ${finding.version}` : ""}`
       );
     }
-    lines.push(`Home Assistant ${config.version || "?"}, measured over the last ${this._minutes} minutes`, "");
+    lines.push(`Home Assistant ${config.version || "?"}, measured over the last ${FINDINGS_MINUTES} minutes`, "");
     lines.push(plainText(finding.description.split("\n\n")[0]));
     if (finding.evidence.length) {
       lines.push("", "Details:", ...finding.evidence.map((line) => `- ${line}`));
@@ -737,6 +746,7 @@ class IntegrationInsightsPanel extends HTMLElement {
     const views = [
       ["overview", "Overview"],
       ["cpu", "CPU"],
+      ["states", "States"],
       ["memory", "Memory"],
     ]
       .map(
@@ -745,8 +755,10 @@ class IntegrationInsightsPanel extends HTMLElement {
       )
       .join("");
     const tools =
-      this._view === "overview"
+      this._view === "states"
         ? `<div class="segmented" role="group" aria-label="Time window">${windows}</div>`
+        : this._view === "overview"
+        ? ""
         : this._view === "cpu"
         ? `<div class="segmented" role="group" aria-label="Time window">${windows}</div>
       <button class="header-button" data-action="download" ${this._data ? "" : "disabled"}>Download report</button>`
@@ -760,6 +772,7 @@ class IntegrationInsightsPanel extends HTMLElement {
   _renderBody() {
     if (this._view === "memory") return this._renderMemory();
     if (this._view === "overview") return this._renderOverview();
+    if (this._view === "states") return this._renderStates();
     if (!this._data) {
       return this._error
         ? `<div class="message error">${escapeHtml(this._error)}</div>`
@@ -801,7 +814,12 @@ class IntegrationInsightsPanel extends HTMLElement {
       return `${tiles}<div class="card"><div class="message">No samples yet. The loop has been idle.</div></div>`;
     }
 
-    const rows = integrations
+    const key = this._sort;
+    const direction = this._sortAscending ? 1 : -1;
+    const sorted = [...integrations].sort(
+      (a, b) => direction * ((a[key] || 0) - (b[key] || 0)) || a.domain.localeCompare(b.domain)
+    );
+    const rows = sorted
       .map((item) => {
         const expanded = this._expanded.has(item.domain);
         const name =
@@ -829,10 +847,91 @@ class IntegrationInsightsPanel extends HTMLElement {
 
     const updated = this._updated ? this._updated.toLocaleTimeString() : "";
     return `${tiles}<div class="card">
-        <div class="card-head"><div>Integration</div><div class="num">Loop ms/min</div><div class="num">Background</div><div class="num">of a core</div><div class="num col-samples">Samples</div></div>
+        <div class="card-head"><div>Integration</div>${this._sortHeader("loop_cpu_ms_per_min", "Loop ms/min")}${this._sortHeader("background_cpu_ms_per_min", "Background")}${this._sortHeader("cpu_ms_per_min", "of a core")}${this._sortHeader("samples", "Samples", "col-samples")}</div>
         ${rows}
       </div>
       <div class="footer">CPU time on the event loop, sampled every ${sampler.interval_ms} ms of loop CPU. Callbacks, executor jobs and threads are measured exactly. Updated ${updated}${this._error ? ` · <span class="error">${escapeHtml(this._error)}</span>` : ""}</div>`;
+  }
+
+  _renderStates() {
+    if (!this._data) {
+      return this._error
+        ? `<div class="message error">${escapeHtml(this._error)}</div>`
+        : `<div class="message">Loading…</div>`;
+    }
+    const { report } = this._data;
+    const integrations = report.integrations
+      .filter((item) => item.state_writes_per_min)
+      .sort((a, b) => b.state_writes_per_min - a.state_writes_per_min);
+    const total = integrations.reduce((sum, item) => sum + item.state_writes_per_min, 0);
+    const unchanged = integrations.reduce((sum, item) => sum + item.state_unchanged_per_min, 0);
+    const share = total ? Math.round((unchanged / total) * 100) : 0;
+    const busiest = integrations[0];
+    const tiles = `<div class="summary">
+      <div class="tile"><div class="label">State writes</div>
+        <div class="value">${ms(total)} per min</div>
+        <div class="sub">every write wakes the recorder, the dashboard and the entity's listeners</div></div>
+      <div class="tile"><div class="label">Without a change</div>
+        <div class="value">${ms(unchanged)} per min</div>
+        <div class="sub">${share} % of all writes changed nothing</div></div>
+      <div class="tile"><div class="label">Busiest</div>
+        <div class="value">${busiest ? escapeHtml(this._data.names[busiest.domain] || busiest.domain) : "–"}</div>
+        <div class="sub">${busiest ? `${ms(busiest.state_writes_per_min)} per min` : "no state writes yet"}</div></div>
+      <div class="tile"><div class="label">Window</div>
+        <div class="value">${report.window_minutes} min</div>
+        <div class="sub">counted at the event bus, exactly</div></div>
+    </div>`;
+    if (!integrations.length) {
+      return `${tiles}<div class="card"><div class="message">No state writes in this window yet.</div></div>`;
+    }
+    const top = integrations[0].state_writes_per_min;
+    const rows = integrations
+      .map((item) => {
+        const expanded = this._expanded.has(item.domain);
+        const name = this._data.names[item.domain] || item.domain;
+        const width = Math.max((item.state_writes_per_min / top) * 100, 1);
+        const itemShare = Math.round((item.state_unchanged_per_min / item.state_writes_per_min) * 100);
+        return `<div class="row states" data-action="toggle" data-value="${escapeHtml(item.domain)}" role="button" tabindex="0" aria-expanded="${expanded}">
+            <div class="name">
+              <div class="title"><svg class="chev" viewBox="0 0 24 24"><path fill="currentColor" d="M8.59,16.58L13.17,12L8.59,7.41L10,6L16,12L10,18L8.59,16.58Z"></path></svg>
+                <span>${escapeHtml(name)}</span></div>
+              <div class="domain">${escapeHtml(item.domain)}</div>
+              <div class="bar" style="width:${width.toFixed(1)}%"></div>
+            </div>
+            <div class="num">${ms(item.state_writes_per_min)}</div>
+            <div class="num">${ms(item.state_unchanged_per_min)}</div>
+            <div class="num">${itemShare} %</div>
+          </div>${expanded ? this._renderStateDetail(item) : ""}`;
+      })
+      .join("");
+    const updated = this._updated ? this._updated.toLocaleTimeString() : "";
+    return `${tiles}<div class="card">
+        <div class="card-head states"><div>Integration</div><div class="num">Writes/min</div><div class="num">Unchanged</div><div class="num">Unchanged</div></div>
+        ${rows}
+      </div>
+      <div class="footer">State writes per minute, counted at the event bus. "Unchanged" writes set the same state again; they still wake the recorder, the dashboard and every automation watching the entity. Updated ${updated}</div>`;
+  }
+
+  _renderStateDetail(brief) {
+    const detail = this._details.get(brief.domain);
+    if (!detail) return `<div class="detail"><p class="note">Loading…</p></div>`;
+    const item = detail.item;
+    const sw = item && item.state_writes;
+    if (!sw) return `<div class="detail"><p class="note">No state writes in this window.</p></div>`;
+    const names = detail.entity_names || {};
+    const chips = Object.entries(sw.entities)
+      .map(
+        ([entityId, value]) =>
+          `<span class="chip" title="${escapeHtml(entityId)}">${escapeHtml(names[entityId] || entityId)} · ${value}/min</span>`
+      )
+      .join("");
+    return `<div class="detail"><h3>Busiest entities</h3><div class="pairs">${chips}</div></div>`;
+  }
+
+  _sortHeader(key, label, extra = "") {
+    const active = this._sort === key;
+    const arrow = active ? (this._sortAscending ? " ▲" : " ▼") : "";
+    return `<button class="num sort${active ? " active" : ""} ${extra}" data-action="sort" data-value="${key}" aria-sort="${active ? (this._sortAscending ? "ascending" : "descending") : "none"}">${label}${arrow}</button>`;
   }
 
   _ownerName(owner) {
@@ -854,7 +953,7 @@ class IntegrationInsightsPanel extends HTMLElement {
     const worthALook = findings.filter((f) => f.severity !== "info").length;
     const head =
       verdict === "ok"
-        ? `Nothing unusual in the last ${this._minutes} minutes`
+        ? `Nothing unusual in the last ${FINDINGS_MINUTES} minutes`
         : verdict === "problem"
         ? `${worthALook} ${worthALook === 1 ? "problem" : "problems"} found`
         : `${worthALook} ${worthALook === 1 ? "thing" : "things"} worth a look`;
