@@ -677,6 +677,11 @@ class IntegrationInsightsPanel extends HTMLElement {
         `Charged through libraries only this integration uses: ${item.via_library_ms_per_min} ms/min`
       );
     }
+    if (item.via_context_ms_per_min) {
+      lines.push(
+        `Charged through the config entry context (core and shared library code run for this integration): ${item.via_context_ms_per_min} ms/min`
+      );
+    }
     lines.push("", "Hot spots (ms/min, hottest lines):");
     for (const spot of item.hot_spots) {
       const spotLines = Object.entries(spot.lines)
@@ -946,6 +951,11 @@ class IntegrationInsightsPanel extends HTMLElement {
     if (item.via_library_ms_per_min) {
       parts.push(
         `<p class="note">${ms(item.via_library_ms_per_min)} ms/min of this ran in libraries that only this integration uses.</p>`
+      );
+    }
+    if (item.via_context_ms_per_min) {
+      parts.push(
+        `<p class="note">${ms(item.via_context_ms_per_min)} ms/min of this is core and shared library code that ran for one of this integration's config entries, such as parsing its HTTP responses.</p>`
       );
     }
     if (item.callbacks) {

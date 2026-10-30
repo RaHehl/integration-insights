@@ -45,6 +45,9 @@ class _Domain:
     cpu_ns: int = 0
     samples: int = 0
     via_library_ns: int = 0
+    # Core and library code with no integration frame, charged to the config
+    # entry whose context it ran in
+    via_context_ns: int = 0
     triggers: Counter[str] = field(default_factory=Counter)
     entries: Counter[str] = field(default_factory=Counter)
     entities: Counter[str] = field(default_factory=Counter)
@@ -77,6 +80,7 @@ class _Domain:
         self.cpu_ns += other.cpu_ns
         self.samples += other.samples
         self.via_library_ns += other.via_library_ns
+        self.via_context_ns += other.via_context_ns
         self.triggers.update(other.triggers)
         self.entries.update(other.entries)
         self.entities.update(other.entities)
@@ -106,6 +110,7 @@ class _Domain:
         self.cpu_ns += sign * other.cpu_ns
         self.samples += sign * other.samples
         self.via_library_ns += sign * other.via_library_ns
+        self.via_context_ns += sign * other.via_context_ns
         self.executor_cpu_ns += sign * other.executor_cpu_ns
         self.executor_wall_ns += sign * other.executor_wall_ns
         self.job_total += sign * other.job_total
@@ -118,6 +123,7 @@ class _Domain:
             self.cpu_ns
             or self.samples
             or self.via_library_ns
+            or self.via_context_ns
             or self.executor_cpu_ns
             or self.executor_wall_ns
             or self.job_total
@@ -279,7 +285,7 @@ class Collector:
     def _add(self, bucket: _Bucket, record: Record) -> None:
         ns = record.cpu_ns
         domain = record.domain
-        via_library = False
+        via_library = via_context = False
         if domain == "core":
             self.seen_libraries.update(record.libraries)
             for library in record.libraries:
@@ -287,6 +293,12 @@ class Collector:
                     domain = owner
                     via_library = True
                     break
+            else:
+                # No integration code on the stack and no library of one:
+                # the config entry whose context this runs in is the owner.
+                if record.entry_domain:
+                    domain = record.entry_domain
+                    via_context = True
         bucket.cpu_ns += ns
         bucket.samples += 1
         if (stats := bucket.domains.get(domain)) is None:
@@ -295,6 +307,8 @@ class Collector:
         stats.samples += 1
         if via_library:
             stats.via_library_ns += ns
+        if via_context:
+            stats.via_context_ns += ns
         if record.trigger is not None and record.trigger != domain:
             stats.triggers[record.trigger] += ns
         # current_entry leaks into tasks that shared helpers start during an
@@ -430,17 +444,26 @@ class Collector:
         sums: dict[str, list[int]] = {}
         for part in parts:
             for domain, stats in part.domains.items():
-                row = sums.setdefault(domain, [0, 0, 0, 0, 0, 0])
+                row = sums.setdefault(domain, [0, 0, 0, 0, 0, 0, 0])
                 row[0] += stats.cpu_ns
                 row[1] += stats.executor_cpu_ns + stats.thread_cpu_ns
                 row[2] += stats.samples
                 row[3] += stats.via_library_ns
                 row[4] += stats.job_total
                 row[5] += stats.loop_wall_ns
-        idle = sums.pop("idle", [0, 0, 0, 0, 0, 0])
+                row[6] += stats.via_context_ns
+        idle = sums.pop("idle", [0, 0, 0, 0, 0, 0, 0])
         longest = self._longest(now, minutes)
         integrations = []
-        for domain, (loop_ns, background_ns, samples, via_ns, jobs, wall_ns) in sorted(
+        for domain, (
+            loop_ns,
+            background_ns,
+            samples,
+            via_ns,
+            jobs,
+            wall_ns,
+            context_ns,
+        ) in sorted(
             sums.items(), key=lambda item: (-(item[1][0] + item[1][1]), item[0])
         ):
             item: dict[str, Any] = {
@@ -455,6 +478,8 @@ class Collector:
             }
             if via_ns:
                 item["via_library_ms_per_min"] = per_minute(via_ns)
+            if context_ns:
+                item["via_context_ms_per_min"] = per_minute(context_ns)
             if (block := longest.get(domain)) is not None:
                 item["longest_ms"] = round(block[0] / 1e6, 1)
                 item["longest_at"] = block[1]
@@ -578,6 +603,8 @@ def _item(domain: str, stats: _Domain, span: float) -> dict[str, Any]:
     }
     if stats.via_library_ns:
         item["via_library_ms_per_min"] = per_minute(stats.via_library_ns)
+    if stats.via_context_ns:
+        item["via_context_ms_per_min"] = per_minute(stats.via_context_ns)
     item["triggered_by"] = top(stats.triggers, TOP_TRIGGERS)
     item["config_entries"] = top(stats.entries)
     # All of them: the caller groups them by device before trimming.

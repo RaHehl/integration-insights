@@ -473,6 +473,7 @@ class Sampler:
         obj = frame.f_locals.get("self")
         if obj is None:
             return None
+        transport = obj
         # A transport belongs to the protocol it serves, an SSL protocol to
         # the application's protocol behind it.
         for name in ("_protocol", "_app_protocol"):
@@ -487,21 +488,43 @@ class Sampler:
         libraries: tuple[str, ...] = ()
         if domain is None:
             package = top_package(module)
-            if package in sys.stdlib_module_names or package == "homeassistant":
-                domain = "core"
-            else:
-                domain = "core"
+            domain = "core"
+            if package not in sys.stdlib_module_names and package != "homeassistant":
                 libraries = (package,)
+        entry_id = entry_domain = None
+        if (entry := self._transport_entry(transport)) is not None:
+            entry_id = getattr(entry, "entry_id", None)
+            entry_domain = getattr(entry, "domain", None)
         return Record(
             (frame.f_code, frame.f_lasti),
             0,
             domain,
             None,
             libraries,
-            None,
-            None,
+            entry_id,
+            entry_domain,
             cpu_ns,
         )
+
+    def _transport_entry(self, transport: object) -> Any:
+        """Return the config entry an unclosed transport was opened for.
+
+        Its socket is still registered, and the reader handle in the selector
+        keeps the context of whoever registered it.
+        """
+        if self.entry_var is None:
+            return None
+        loop = _instance_attribute(transport, "_loop")
+        fd = _instance_attribute(transport, "_sock_fd")
+        selector = _instance_attribute(loop, "_selector") if loop is not None else None
+        if selector is None or fd is None:
+            return None
+        try:
+            reader = selector.get_key(fd).data[0]
+            context = getattr(reader, "_context", None)
+            return context.get(self.entry_var) if context is not None else None
+        except Exception:  # noqa: BLE001
+            return None
 
     def _owner_domain(self, owner: object) -> str | None:
         module = type(owner).__module__

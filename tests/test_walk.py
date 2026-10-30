@@ -1,7 +1,9 @@
 """Tests for how the sampler classifies a stack (no timer needed)."""
 
+import contextvars
 from contextvars import ContextVar
 from types import SimpleNamespace
+from typing import Any
 
 from custom_components.integration_insights.sampler import Sampler
 
@@ -216,3 +218,25 @@ def test_finalizer_samples_go_to_the_owner_of_the_object() -> None:
     own = type("Thing", (), {"__module__": "custom_components.bar.x"})()
     own.sampler = sampler
     assert finalizer(own).domain == "bar"
+
+
+def test_finalizer_reads_the_entry_from_the_transports_reader_handle() -> None:
+    """An unclosed transport is still in the selector, with the opener's context."""
+    entry_var: ContextVar[Any] = ContextVar("entry", default=None)
+    sampler = Sampler(entry_var=entry_var)
+    finalizer = compile_at("/usr/lib/python3.14/asyncio/selector_events.py", FINALIZER)[
+        "__del__"
+    ]
+    entry = SimpleNamespace(entry_id="e1", domain="foo")
+    context = contextvars.copy_context()
+    context.run(entry_var.set, entry)
+    reader = SimpleNamespace(_context=context)
+    selector = SimpleNamespace(get_key=lambda fd: SimpleNamespace(data=(reader, None)))
+    transport = type("Transport", (), {})()
+    transport.sampler = sampler
+    transport._protocol = type("Handler", (), {"__module__": "aiohttp.client_proto"})()  # noqa: SLF001
+    transport._loop = SimpleNamespace(_selector=selector)  # noqa: SLF001
+    transport._sock_fd = 7  # noqa: SLF001
+    record = finalizer(transport)
+    assert (record.domain, record.libraries) == ("core", ("aiohttp",))
+    assert (record.entry_id, record.entry_domain) == ("e1", "foo")

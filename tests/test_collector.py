@@ -293,3 +293,22 @@ def test_callbacks_add_wall_time_and_the_longest_block() -> None:
     # Only the window's minutes count for the longest block
     later = collector.summary(now=60 * 62.0, started=0.0, minutes=1)
     assert all("longest_ms" not in item for item in later["integrations"])
+
+
+def test_core_work_in_an_entry_context_goes_to_the_entry() -> None:
+    """Shared code with no integration frame counts for the config entry it ran for."""
+    spin = spin_at("/usr/src/homeassistant/homeassistant/helpers/aiohttp_client.py")
+    collector = Collector()
+    collector.add(
+        [
+            _record(_frames((spin, 6)), "core", 30 * MS, entry=("e1", "foo")),
+            _record(_frames((spin, 6)), "core", 20 * MS),
+        ],
+        now=60.0,
+    )
+    report = collector.report(now=120.0, started=60.0)
+    rows = {item["domain"]: item for item in report["integrations"]}
+    assert rows["foo"]["loop_cpu_ms_per_min"] == 30.0
+    assert rows["foo"]["via_context_ms_per_min"] == 30.0
+    assert rows["core"]["loop_cpu_ms_per_min"] == 20.0
+    assert "via_context_ms_per_min" not in rows["core"]
