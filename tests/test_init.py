@@ -300,6 +300,15 @@ async def test_callbacks_are_timed_and_charged_to_their_entry(
     }
     assert row["state_writes"]["per_min"] > row["state_writes"]["unchanged_per_min"] > 0
     assert row["state_writes"]["entities"][entity_id] == row["state_writes"]["per_min"]
+    # Writes after a drain are counted too: the filters keep the same dict
+    hass.states.async_set(entity_id, "3")
+    await hass.async_block_till_done()
+    later = next(
+        item
+        for item in insights.report()["integrations"]
+        if item["domain"] == "blocker"
+    )
+    assert later["state_writes"]["per_min"] > row["state_writes"]["per_min"]
     # The sampler does not blame the timing wrapper for what it wraps
     assert "integration_insights" not in row["triggered_by"]
     # A callback without an entry context counts for its module

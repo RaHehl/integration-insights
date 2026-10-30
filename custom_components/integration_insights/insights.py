@@ -283,8 +283,8 @@ class Insights:
         now = time.monotonic()
         self.collector.add(records, now)
         self.collector.add_jobs(self.background.drain_jobs(), now)
-        if self._state_writes:
-            writes, self._state_writes = self._state_writes, {}
+        if writes := self._state_writes:
+            # Cleared in place: the event filters hold this dict
             self.collector.add_state_writes(
                 [
                     StateWrites(domain, row[0], row[1], row[2])
@@ -292,6 +292,7 @@ class Insights:
                 ],
                 now,
             )
+            writes.clear()
         self.collector.add_callbacks(
             [
                 CallbackRecord(
