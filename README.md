@@ -1,21 +1,21 @@
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/brand/dark_logo.svg">
-  <img src="docs/brand/logo.svg" alt="Integration Insights" width="420">
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/RaHehl/integration-insights/main/docs/brand/dark_logo.svg">
+  <img src="https://raw.githubusercontent.com/RaHehl/integration-insights/main/docs/brand/logo.svg" alt="Integration Insights" width="420">
 </picture>
 
 # Integration Insights
 
 Finds the integration that slows Home Assistant down, keeps the CPU busy, or leaks memory, and tells you what to do about it.
 
-![Overview with three findings, from three example integrations written for this screenshot](docs/overview.png)
+![Overview with findings, from example integrations written for these screenshots](https://raw.githubusercontent.com/RaHehl/integration-insights/main/docs/overview.png)
 
 ## What it finds
 
 - An integration that keeps the event loop busy. While it runs, automations, the dashboard and every other integration wait.
 - Background threads that work around the clock, such as a file watcher that keeps polling.
 - Integrations that hand a lot of work to the executor, usually polling more often than needed.
-- A single callback that stopped the event loop for seconds, named by integration and function, the first time it happens.
-- An integration that writes state far more often than its devices change, which wakes the recorder, the dashboard and every automation watching the entity each time.
+- The event loop standing still for seconds, named by the integration and function that ran at that moment, the first time it happens.
+- An integration that changes the state or attributes of its entities many times a second. Each change is recorded and reaches the dashboard and every automation that watches the entity.
 - An event loop that often waits, usually on a blocking call.
 - Listeners, timers and tasks that pile up between two memory snapshots, a sign of a leak.
 
@@ -25,13 +25,21 @@ Measuring begins once Home Assistant has started, so the set-up of integrations 
 
 ## Install
 
-1. In HACS, add `https://github.com/RaHehl/integration-insights` as a custom repository of type Integration, and download Integration Insights.
+1. Search for Integration Insights in HACS and download it. Until it is listed there, add `https://github.com/RaHehl/integration-insights` as a custom repository of type Integration first.
 2. Restart Home Assistant.
 3. Settings > Devices & services > Add integration > Integration Insights.
 
 A sidebar entry "Integration Insights" appears for admins.
 
 Needs Home Assistant OS or the container image on 64-bit Linux.
+
+## Views
+
+The overview lists the findings. The other views show the numbers behind them.
+
+| CPU | Memory | State writes |
+|---|---|---|
+| ![CPU view with one integration opened](https://raw.githubusercontent.com/RaHehl/integration-insights/main/docs/cpu.png) | ![Memory view after a snapshot](https://raw.githubusercontent.com/RaHehl/integration-insights/main/docs/memory.png) | ![State writes per integration](https://raw.githubusercontent.com/RaHehl/integration-insights/main/docs/states.png) |
 
 ## For developers
 
@@ -48,20 +56,23 @@ The Memory view walks the Python heap on request and splits it by integration, l
 
 ### How it measures
 
-- Every callback on the event loop is timed exactly, by wall clock, and charged to the integration whose config entry context it runs in, else to the module of its function or class. This sees time spent waiting, which the sampler cannot. The same code is proposed for Home Assistant's profiler integration.
+- Every callback on the event loop is timed exactly, by wall clock, and charged to the module of its function or class, else to the integration whose config entry context it runs in. This sees time spent waiting, which the sampler cannot. The same code is proposed for Home Assistant's profiler integration.
+- When a callback runs for a second, a watchdog thread looks once at the stack of the event loop thread. The finding names the code running at that moment, not the callback that started it.
 - A timer on the event loop thread's CPU clock samples the stack while the loop is busy, about every 10 ms of loop CPU. When the loop is idle, it does not fire. This is what names the lines inside a callback.
 - A sample goes to the integration whose code runs. Code in an entity platform base class goes to the integration that owns the entity. A library that only one loaded integration requires goes to that integration. Core and shared library code with no integration on the stack, such as aiohttp parsing a response, goes to the config entry whose context it runs in, which Home Assistant sets while an entry is set up and every task and connection started from there inherits.
 - A finalizer running inside the garbage collector is charged to the owner of the object being destroyed, not to whoever allocated enough to trigger the collection.
-- State writes are counted per integration in the bus event filters, with and without a change, at the cost of one dictionary update per write.
+- State writes are counted per integration in the bus event filters, at the cost of one dictionary update per write. A write is a change, a change of attributes only, or a repeat that changes nothing. Repeats are cheap: Home Assistant only moves the last reported time.
 - Executor jobs are timed exactly with the worker thread's CPU clock. A job goes to the integration whose callable it runs, else to the one that submitted it. Other threads are read from `/proc` every 10 seconds. A pool thread is charged to what it runs, and for anyio to the task waiting for it.
 
 ### Cost
 
-The panel shows its own cost under "Measuring costs". On a Raspberry Pi 3 the whole integration uses about 300 ms of CPU per minute, half a percent of one core, less on faster hardware. Timing the callbacks adds a few microseconds to each one, which lands in the callback's own time and is not shown separately. A memory snapshot takes about half a minute on a Raspberry Pi 3 and needs memory for the walk. It is refused with a reason when memory is short.
+The panel shows its own cost under "Measuring costs": sampling, timing the callbacks, and its own work. The cost grows with the number of callbacks on the event loop. A memory snapshot takes about half a minute on a Raspberry Pi 3 and needs memory for the walk. It is refused with a reason when memory is short.
 
 ## Privacy
 
-Reports contain code locations (file, function, line), integration domains and the IDs of config entries, devices and entities. Entity IDs can say something about your home, such as `light.bedroom`, so look before you post one. Reports contain no arguments, values, entity states or local paths. Names of entries, devices and entities only appear in the panel and in "Copy as text", not in the diagnostics download.
+Reports contain code locations (file, function, line), integration domains, thread names and the IDs of config entries, devices and entities, including the entities that write state most. Entity IDs can say something about your home, such as `light.bedroom`. Thread names are chosen by integrations and libraries and can contain a host name or address. Look before you post a report. Reports contain no arguments, values, entity states or local paths. Names of entries, devices and entities only appear in the panel and in "Copy as text", not in the diagnostics download.
+
+Nothing leaves Home Assistant. The integration sends no data anywhere.
 
 ## Limits
 
@@ -69,7 +80,7 @@ Reports contain code locations (file, function, line), integration domains and t
 - Linux checks CPU timers on the scheduler tick, so very short callbacks can be undercounted.
 - Time in C or Rust code is charged to the Python line that called it.
 - During a long block of the event loop the sampler slows down, so the last part of such a block can land on the code that runs next.
-- A blocking call uses no CPU, so the sampler cannot point at the line. The callback timing names the integration and the function that held the loop, and Home Assistant's log may name the call ("Detected blocking call").
+- A blocking call uses no CPU, so the sampler cannot point at the line. The watchdog names the function that ran when the loop had stood still for a second, and Home Assistant's log may name the call ("Detected blocking call").
 - A memory snapshot charges an object that several integrations hold to the first one the walk reaches. Shared strings and bytes go to a shared pool.
 
 ## License
