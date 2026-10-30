@@ -322,20 +322,25 @@ def test_state_writes_count_per_integration_with_their_entities() -> None:
     collector = Collector()
     collector.add_state_writes(
         [
-            StateWrites("foo", 20, 100, Counter({"sensor.a": 90, "sensor.b": 30})),
-            StateWrites("bar", 2, 0, Counter({"light.c": 2})),
+            StateWrites("foo", 20, 100, 30, Counter({"sensor.a": 120, "sensor.b": 30})),
+            StateWrites("bar", 2, 0, 0, Counter({"light.c": 2})),
         ],
         now=60.0,
     )
     summary = collector.summary(now=120.0, started=0.0, minutes=1)
     foo = next(item for item in summary["integrations"] if item["domain"] == "foo")
-    assert (foo["state_writes_per_min"], foo["state_unchanged_per_min"]) == (120, 100)
+    assert (
+        foo["state_writes_per_min"],
+        foo["state_unchanged_per_min"],
+        foo["state_attributes_only_per_min"],
+    ) == (150, 130, 30)
     detail = collector.detail("foo", now=120.0, started=0.0, minutes=1)
     assert detail is not None
     assert detail["state_writes"] == {
-        "per_min": 120,
-        "unchanged_per_min": 100,
-        "entities": {"sensor.a": 90, "sensor.b": 30},
+        "per_min": 150,
+        "unchanged_per_min": 130,
+        "attributes_only_per_min": 30,
+        "entities": {"sensor.a": 120, "sensor.b": 30},
     }
     bar = next(item for item in summary["integrations"] if item["domain"] == "bar")
     assert bar["state_unchanged_per_min"] == 0

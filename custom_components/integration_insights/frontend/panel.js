@@ -663,7 +663,9 @@ class IntegrationInsightsPanel extends HTMLElement {
     ];
     if (item.state_writes) {
       const sw = item.state_writes;
-      lines.push(`State writes: ${sw.per_min} per min, ${sw.unchanged_per_min} without a change`);
+      lines.push(
+        `State writes: ${sw.per_min} per min, ${sw.unchanged_per_min} with the same value, ${sw.attributes_only_per_min || 0} of them changed only attributes`
+      );
       for (const [entityId, value] of Object.entries(sw.entities)) {
         lines.push(`- ${entityId}: ${value} per min`);
       }
@@ -870,15 +872,16 @@ class IntegrationInsightsPanel extends HTMLElement {
       .sort((a, b) => b.state_writes_per_min - a.state_writes_per_min);
     const total = integrations.reduce((sum, item) => sum + item.state_writes_per_min, 0);
     const unchanged = integrations.reduce((sum, item) => sum + item.state_unchanged_per_min, 0);
+    const attributesOnly = integrations.reduce((sum, item) => sum + (item.state_attributes_only_per_min || 0), 0);
     const share = total ? Math.round((unchanged / total) * 100) : 0;
     const busiest = integrations[0];
     const tiles = `<div class="summary">
       <div class="tile"><div class="label">State writes</div>
         <div class="value">${ms(total)} per min</div>
         <div class="sub">every write wakes the recorder, the dashboard and the entity's listeners</div></div>
-      <div class="tile"><div class="label">Without a change</div>
+      <div class="tile"><div class="label">Same value</div>
         <div class="value">${ms(unchanged)} per min</div>
-        <div class="sub">${share} % of all writes changed nothing</div></div>
+        <div class="sub">${share} % of all writes · ${ms(attributesOnly)} of them changed only attributes</div></div>
       <div class="tile"><div class="label">Busiest</div>
         <div class="value">${busiest ? escapeHtml(this._data.names[busiest.domain] || busiest.domain) : "–"}</div>
         <div class="sub">${busiest ? `${ms(busiest.state_writes_per_min)} per min` : "no state writes yet"}</div></div>
@@ -911,10 +914,10 @@ class IntegrationInsightsPanel extends HTMLElement {
       .join("");
     const updated = this._updated ? this._updated.toLocaleTimeString() : "";
     return `${tiles}<div class="card">
-        <div class="card-head states"><div>Integration</div><div class="num">Writes/min</div><div class="num">Unchanged</div><div class="num">Share</div></div>
+        <div class="card-head states"><div>Integration</div><div class="num">Writes/min</div><div class="num">Same value</div><div class="num">Share</div></div>
         ${rows}
       </div>
-      <div class="footer">State writes per minute, counted at the event bus. "Unchanged" writes set the same state again; they still wake the recorder, the dashboard and every automation watching the entity. Updated ${updated}</div>`;
+      <div class="footer">State writes per minute, counted at the event bus. "Same value" writes keep the state, with or without new attributes; they still wake the recorder, the dashboard and every automation watching the entity. Updated ${updated}</div>`;
   }
 
   _renderStateDetail(brief) {
@@ -930,7 +933,7 @@ class IntegrationInsightsPanel extends HTMLElement {
           `<span class="chip" title="${escapeHtml(entityId)}">${escapeHtml(names[entityId] || entityId)} · ${value}/min</span>`
       )
       .join("");
-    return `<div class="detail"><h3>Busiest entities</h3><div class="pairs">${chips}</div></div>`;
+    return `<div class="detail"><p class="note">${sw.per_min} writes per minute: ${sw.unchanged_per_min} kept the value, ${sw.attributes_only_per_min || 0} of them changed only attributes.</p><h3>Busiest entities</h3><div class="pairs">${chips}</div></div>`;
   }
 
   _sortHeader(key, label, extra = "") {
@@ -1075,7 +1078,7 @@ class IntegrationInsightsPanel extends HTMLElement {
         .map(([entityId, value]) => `<span class="chip">${escapeHtml(entityId)} · ${value}/min</span>`)
         .join("");
       parts.push(
-        `<h3>State writes</h3><p class="note">${sw.per_min} state updates per minute, ${sw.unchanged_per_min} of them without a change.</p><div class="pairs">${chips}</div>`
+        `<h3>State writes</h3><p class="note">${sw.per_min} state updates per minute, ${sw.unchanged_per_min} of them with the same value, ${sw.attributes_only_per_min || 0} changing only attributes.</p><div class="pairs">${chips}</div>`
       );
     }
     if (item.callbacks) {

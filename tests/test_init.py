@@ -289,15 +289,23 @@ async def test_callbacks_are_timed_and_charged_to_their_entry(
     entity_id = registry.async_get_or_create("sensor", "blocker", "u1").entity_id
     for value in ("1", "1", "1", "2"):
         hass.states.async_set(entity_id, value)
+    # The same value with another attribute: a write that keeps the state
+    hass.states.async_set(entity_id, "2", {"voltage": 230})
     hass.states.async_set("sensor.unregistered", "x")
     await hass.async_block_till_done()
     report = insights.report()
     row = next(item for item in report["integrations"] if item["domain"] == "blocker")
-    assert row["state_writes"] == {
-        "per_min": row["state_writes"]["per_min"],
-        "unchanged_per_min": row["state_writes"]["unchanged_per_min"],
-        "entities": {entity_id: row["state_writes"]["entities"][entity_id]},
+    assert set(row["state_writes"]) == {
+        "per_min",
+        "unchanged_per_min",
+        "attributes_only_per_min",
+        "entities",
     }
+    assert row["state_writes"]["attributes_only_per_min"] > 0
+    # 5 writes: 2 changed the value, 2 repeated it, 1 changed only attributes
+    sw = row["state_writes"]
+    assert sw["unchanged_per_min"] == 3 * sw["attributes_only_per_min"]
+    assert sw["per_min"] == 5 * sw["attributes_only_per_min"]
     assert row["state_writes"]["per_min"] > row["state_writes"]["unchanged_per_min"] > 0
     assert row["state_writes"]["entities"][entity_id] == row["state_writes"]["per_min"]
     # Writes after a drain are counted too: the filters keep the same dict

@@ -199,14 +199,18 @@ class Insights:
             if (entry := entities.get(entity_id)) is None:
                 return False
             if (row := writes.get(entry.platform)) is None:
-                row = writes[entry.platform] = [0, 0, Counter()]
+                row = writes[entry.platform] = [0, 0, 0, Counter()]
             row[slot] += 1
-            row[2][entity_id] += 1
+            row[3][entity_id] += 1
             return False
 
         @callback
         def changed(data: Any) -> bool:
-            return count(data["entity_id"], 0)
+            # The same value with other attributes is still a write that
+            # changed nothing a user sees as the entity's state
+            old, new = data["old_state"], data["new_state"]
+            same = old is not None and new is not None and old.state == new.state
+            return count(data["entity_id"], 2 if same else 0)
 
         @callback
         def reported(data: Any) -> bool:
@@ -287,7 +291,7 @@ class Insights:
             # Cleared in place: the event filters hold this dict
             self.collector.add_state_writes(
                 [
-                    StateWrites(domain, row[0], row[1], row[2])
+                    StateWrites(domain, row[0], row[1], row[2], row[3])
                     for domain, row in writes.items()
                 ],
                 now,

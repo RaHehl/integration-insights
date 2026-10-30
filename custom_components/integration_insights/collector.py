@@ -36,6 +36,7 @@ class StateWrites(NamedTuple):
     domain: str
     changes: int
     reports: int  # writes that changed nothing
+    attributes_only: int  # writes with the same value and other attributes
     entities: Counter[str]
 
 
@@ -84,6 +85,7 @@ class _Domain:
     # State writes of the integration's entities: with and without a change
     state_changes: int = 0
     state_reports: int = 0
+    state_attributes_only: int = 0
     state_entities: Counter[str] = field(default_factory=Counter)
 
     def note_longest(self, ns: int, at: float, label: str) -> None:
@@ -116,6 +118,7 @@ class _Domain:
         self.note_longest(other.longest_ns, other.longest_at, other.longest_label)
         self.state_changes += other.state_changes
         self.state_reports += other.state_reports
+        self.state_attributes_only += other.state_attributes_only
         self.state_entities.update(other.state_entities)
 
     def merge_totals(self, other: _Domain, sign: int = 1) -> None:
@@ -136,6 +139,7 @@ class _Domain:
         self.callback_total += sign * other.callback_total
         self.state_changes += sign * other.state_changes
         self.state_reports += sign * other.state_reports
+        self.state_attributes_only += sign * other.state_attributes_only
 
     def totals_are_zero(self) -> bool:
         return not (
@@ -151,6 +155,7 @@ class _Domain:
             or self.callback_total
             or self.state_changes
             or self.state_reports
+            or self.state_attributes_only
         )
 
     @property
@@ -290,6 +295,7 @@ class Collector:
                 stats = bucket.domains[record.domain] = _Domain()
             stats.state_changes += record.changes
             stats.state_reports += record.reports
+            stats.state_attributes_only += record.attributes_only
             stats.state_entities.update(record.entities)
 
     def add_loop_busy(self, busy_ns: int, now: float) -> None:
@@ -475,7 +481,7 @@ class Collector:
         sums: dict[str, list[int]] = {}
         for part in parts:
             for domain, stats in part.domains.items():
-                row = sums.setdefault(domain, [0, 0, 0, 0, 0, 0, 0, 0, 0])
+                row = sums.setdefault(domain, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
                 row[0] += stats.cpu_ns
                 row[1] += stats.executor_cpu_ns + stats.thread_cpu_ns
                 row[2] += stats.samples
@@ -485,7 +491,8 @@ class Collector:
                 row[6] += stats.via_context_ns
                 row[7] += stats.state_changes
                 row[8] += stats.state_reports
-        idle = sums.pop("idle", [0, 0, 0, 0, 0, 0, 0, 0, 0])
+                row[9] += stats.state_attributes_only
+        idle = sums.pop("idle", [0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
         longest = self._longest(now, minutes)
         integrations = []
         for domain, (
@@ -498,6 +505,7 @@ class Collector:
             context_ns,
             changes,
             reports,
+            attributes_only,
         ) in sorted(
             sums.items(), key=lambda item: (-(item[1][0] + item[1][1]), item[0])
         ):
@@ -515,9 +523,14 @@ class Collector:
                 item["via_library_ms_per_min"] = per_minute(via_ns)
             if context_ns:
                 item["via_context_ms_per_min"] = per_minute(context_ns)
-            if changes or reports:
-                item["state_writes_per_min"] = round((changes + reports) / span, 1)
-                item["state_unchanged_per_min"] = round(reports / span, 1)
+            if changes or reports or attributes_only:
+                item["state_writes_per_min"] = round(
+                    (changes + reports + attributes_only) / span, 1
+                )
+                item["state_unchanged_per_min"] = round(
+                    (reports + attributes_only) / span, 1
+                )
+                item["state_attributes_only_per_min"] = round(attributes_only / span, 1)
             if (block := longest.get(domain)) is not None:
                 item["longest_ms"] = round(block[0] / 1e6, 1)
                 item["longest_at"] = block[1]
@@ -675,10 +688,14 @@ def _item(domain: str, stats: _Domain, span: float) -> dict[str, Any]:
             "cpu_ms_per_min": per_minute(stats.thread_cpu_ns),
             "by_name": top(stats.threads, TOP_THREADS),
         }
-    if stats.state_changes or stats.state_reports:
+    if stats.state_changes or stats.state_reports or stats.state_attributes_only:
+        writes = stats.state_changes + stats.state_reports + stats.state_attributes_only
         item["state_writes"] = {
-            "per_min": round((stats.state_changes + stats.state_reports) / span, 1),
-            "unchanged_per_min": round(stats.state_reports / span, 1),
+            "per_min": round(writes / span, 1),
+            "unchanged_per_min": round(
+                (stats.state_reports + stats.state_attributes_only) / span, 1
+            ),
+            "attributes_only_per_min": round(stats.state_attributes_only / span, 1),
             "entities": {
                 entity_id: round(count / span, 1)
                 for entity_id, count in _ranked(
