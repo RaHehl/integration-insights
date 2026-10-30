@@ -21,6 +21,7 @@ from homeassistant.util import dt as dt_util
 from .attribution import Packages, distribution_owners, library_owners
 from .background import Background, LoopWait, ThreadRecord
 from .collector import WINDOW_MINUTES, Collector
+from .const import DOMAIN
 from .findings import INFO, MIN_MINUTES, Finding, Shown, find
 from .memory import (
     Snapshot,
@@ -45,6 +46,11 @@ KEPT_SNAPSHOTS = 10
 STARTUP_MINUTES = 5
 # Findings shown this long ago no longer hold, see findings.HOLD.
 SHOWN_SECONDS = 120
+# During start-up every drain sees new components; mapping their libraries
+# again each time would cost more than the measurement.
+REMAP_SECONDS = 60
+# Panels stay subscribed across a reload, so the list outlives an instance.
+SUBSCRIBERS_KEY = f"{DOMAIN}_subscribers"
 
 
 class Insights:
@@ -62,6 +68,7 @@ class Insights:
         self.started = 0.0
         self._position = 0
         self._mapped_components: frozenset[str] | None = None
+        self._mapped_at = 0.0
         self._mapping_lock = asyncio.Lock()
         self._packages = Packages()
         self._owners: dict[str, str] = {}
@@ -76,7 +83,9 @@ class Insights:
         self._unsub_drain: CALLBACK_TYPE | None = None
         self._unsub_stop: CALLBACK_TYPE | None = None
         self._polling = False
-        self._subscribers: list[tuple[int, Callable[[dict[str, Any]], None]]] = []
+        self._subscribers: list[tuple[int, Callable[[dict[str, Any]], None]]] = (
+            hass.data.setdefault(SUBSCRIBERS_KEY, [])
+        )
         self.snapshots: deque[Snapshot] = deque(maxlen=KEPT_SNAPSHOTS)
         self._snapshot_lock = asyncio.Lock()
         self._wall_ns = 0
@@ -169,8 +178,13 @@ class Insights:
                 _LOGGER.warning("Could not re-arm the sampler: %s", err)
                 self._rearm_failed = True
         components = frozenset(self.hass.config.top_level_components)
+        mapped = self._mapped_components
+        if mapped is not None and (
+            components == mapped or time.monotonic() - self._mapped_at < REMAP_SECONDS
+        ):
+            components = mapped
         if not self._mapping_lock.locked() and (
-            components != self._mapped_components
+            components != mapped
             or not self.collector.seen_libraries <= self._checked_libraries
         ):
             self.hass.async_create_background_task(
@@ -242,6 +256,7 @@ class Insights:
             return
         if changed:
             self._mapped_components = components
+            self._mapped_at = time.monotonic()
             self._owners = owners
             self._checked_libraries = libraries
             self.collector.library_map = mapped

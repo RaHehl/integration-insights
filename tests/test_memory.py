@@ -1,11 +1,14 @@
 """Tests for memory snapshots."""
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import functools
+import logging
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 from pytest_homeassistant_custom_component.typing import WebSocketGenerator
 
@@ -22,6 +25,7 @@ from custom_components.integration_insights.memory import (
     MIN_SPARE_MIB,
     Resources,
     Snapshot,
+    _cgroup_available_mib,
     count_resources,
     headroom_problem,
     imported_packages,
@@ -32,8 +36,14 @@ from custom_components.integration_insights.memory import (
     to_report,
 )
 from homeassistant.core import HassJob, HomeAssistant
+from homeassistant.helpers.debounce import Debouncer
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.helpers.event import async_call_later
+from homeassistant.helpers.event import (
+    async_call_later,
+    async_track_state_change_event,
+    async_track_time_interval,
+)
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 LEAKY = "custom_components.leaky.coordinator"
 SOURCE = """\
@@ -45,6 +55,9 @@ def on_event(event):
 
 async def run_forever(event):
     await event.wait()
+
+async def update():
+    return 1
 """
 
 
@@ -171,16 +184,66 @@ def test_callable_owner_unwraps_home_assistant_wrappers() -> None:
     assert owner(print) == "core"
 
 
+def test_callable_owner_runs_no_code_of_the_callback() -> None:
+    """Looking at a callback must not run its properties or __getattr__."""
+    on_event = _module()["on_event"]
+    owner = make_callable_owner({})
+
+    class Touchy:
+        __slots__ = ("job",)
+
+        def __init__(self) -> None:
+            self.job = HassJob(on_event)
+
+        def __getattr__(self, name: str) -> Any:
+            raise RuntimeError(name)
+
+        def __call__(self) -> None:
+            pass
+
+    class Trap:
+        @property
+        def listener_job(self) -> Any:
+            raise RuntimeError("property ran")
+
+        def __call__(self) -> None:
+            pass
+
+    assert owner(Touchy()) == "leaky"  # a slot is read without __getattr__
+    assert owner(Trap()) == "core"
+
+
 async def test_count_resources(hass: HomeAssistant) -> None:
     """Listeners, dispatcher connections, timers and tasks count per integration."""
     module = _module()
     before = count_resources(hass, make_callable_owner({}), make_module_owner({})).get(
         "leaky", Resources()
     )
+    coordinator = DataUpdateCoordinator(
+        hass,
+        logging.getLogger(__name__),
+        config_entry=None,
+        name="leaky",
+        update_method=module["update"],
+        update_interval=timedelta(hours=1),
+    )
+    coordinator._schedule_refresh()  # noqa: SLF001
+    debouncer = Debouncer(
+        hass,
+        logging.getLogger(__name__),
+        cooldown=3600,
+        immediate=False,
+        function=module["update"],
+    )
+    await debouncer.async_call()
     unsubs = [
         hass.bus.async_listen("leaky_event", module["on_event"]),
+        async_track_state_change_event(hass, ["light.leaky"], module["on_event"]),
         async_dispatcher_connect(hass, "leaky_signal", module["on_event"]),
         async_call_later(hass, 3600, module["on_event"]),
+        async_track_time_interval(hass, module["on_event"], timedelta(hours=1)),
+        coordinator._async_unsub_refresh,  # noqa: SLF001
+        debouncer.async_cancel,
     ]
     event = asyncio.Event()
     # A plain task: hass.async_block_till_done would wait for a tracked one.
@@ -189,9 +252,10 @@ async def test_count_resources(hass: HomeAssistant) -> None:
 
     resources = count_resources(hass, make_callable_owner({}), make_module_owner({}))
     leaky = resources["leaky"]
-    assert leaky.listeners == before.listeners + 1
+    assert leaky.listeners == before.listeners + 2
     assert leaky.dispatcher == before.dispatcher + 1
-    assert leaky.timers == before.timers + 1
+    # call_later, the interval, the coordinator and the debouncer
+    assert leaky.timers == before.timers + 4
     assert leaky.tasks == before.tasks + 1
 
     for unsub in unsubs:
@@ -246,6 +310,29 @@ def test_report_with_balance_and_changes() -> None:
     }
     assert report["process_change"] == {"rss_mib": 50.0}
     assert "change" not in to_report(first, None)["owners"][0]
+
+    # An owner that is gone since the previous snapshot shows what it gave back
+    gone = to_report(first, second)["owners"]
+    aiohttp = next(row for row in gone if row["owner"] == "lib:aiohttp")
+    assert (aiohttp["kib"], aiohttp["change"]["kib"]) == (0.0, -1024.0)
+
+
+def test_cgroup_limits_apply_up_to_the_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A parent cgroup with a lower limit counts too."""
+    monkeypatch.setattr(
+        "custom_components.integration_insights.memory._CGROUP_ROOT", tmp_path
+    )
+    leaf = tmp_path / "system" / "docker" / "ha"
+    leaf.mkdir(parents=True)
+    (leaf / "memory.max").write_text("max\n")
+    (leaf / "memory.current").write_text(str(100 * 1024**2))
+    parent = leaf.parent
+    (parent / "memory.max").write_text(str(512 * 1024**2))
+    (parent / "memory.current").write_text(str(400 * 1024**2))
+    # The top level has no memory.max at all
+    assert _cgroup_available_mib(leaf) == [112.0]
 
 
 async def test_snapshot_commands(

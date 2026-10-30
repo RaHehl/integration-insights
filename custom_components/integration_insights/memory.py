@@ -11,10 +11,11 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 import functools
+import inspect
 from pathlib import Path
 import sys
 import time
-from types import ModuleType
+from types import MemberDescriptorType, ModuleType
 from typing import Any
 
 from .attribution import (
@@ -37,6 +38,30 @@ _WALK_BYTES_PER_BLOCK = 100
 MIN_SPARE_MIB = 128
 # Share of time tasks stalled on memory over the last 10 s.
 MAX_PRESSURE_AVG10 = 10.0
+_CGROUP_ROOT = Path("/sys/fs/cgroup")
+# Attributes under which Home Assistant helpers keep the callback they run
+# for an integration: one time listeners, time trackers, coordinators and
+# debouncers.
+_JOB_ATTRIBUTES = (
+    "listener_job",
+    "job",
+    "_run_job",
+    "action",
+    "update_method",
+    "function",
+    "_function",
+    "_job",
+)
+# Callbacks registered per entity or registry id live in these hass.data
+# entries, behind one listener of the core.
+_KEYED_TRACKERS = (
+    "track_state_change_data",
+    "track_state_report_data",
+    "track_state_added_domain_data",
+    "track_state_removed_domain_data",
+    "track_entity_registry_updated_data",
+    "track_device_registry_updated_data",
+)
 
 
 class SnapshotRefused(Exception):
@@ -82,11 +107,26 @@ def _read_key_values(path: Path) -> dict[str, str]:
 
 def _cgroup_dir() -> Path:
     cgroup = Path("/proc/self/cgroup").read_text(encoding="utf-8")
-    return Path("/sys/fs/cgroup") / cgroup.strip().split("::", 1)[1].lstrip("/")
+    return _CGROUP_ROOT / cgroup.strip().split("::", 1)[1].lstrip("/")
+
+
+def _cgroup_available_mib(path: Path) -> list[float]:
+    """Return what is left under every memory limit from a cgroup up to the root."""
+    available: list[float] = []
+    while path != path.parent and path.is_relative_to(_CGROUP_ROOT):
+        try:
+            limit = (path / "memory.max").read_text(encoding="utf-8").strip()
+            if limit != "max":
+                current = int((path / "memory.current").read_text(encoding="utf-8"))
+                available.append((int(limit) - current) / _KIB**2)
+        except OSError, ValueError:
+            pass
+        path = path.parent
+    return available
 
 
 def _available_mib() -> float | None:
-    """Return memory the process can still use: the system's, capped by its cgroup."""
+    """Return memory the process can still use: the system's, capped by its cgroups."""
     available: list[float] = []
     try:
         meminfo = _read_key_values(Path("/proc/meminfo"))
@@ -94,11 +134,7 @@ def _available_mib() -> float | None:
     except OSError, ValueError, KeyError:
         pass
     try:
-        path = _cgroup_dir()
-        limit = (path / "memory.max").read_text(encoding="utf-8").strip()
-        if limit != "max":
-            current = int((path / "memory.current").read_text(encoding="utf-8"))
-            available.append((int(limit) - current) / _KIB**2)
+        available.extend(_cgroup_available_mib(_cgroup_dir()))
     except OSError, ValueError, IndexError:
         pass
     return min(available) if available else None
@@ -201,17 +237,31 @@ def _is_callback(obj: Any) -> bool:
     return callable(obj) or _is_job(obj)
 
 
+def _static_attribute(obj: Any, name: str) -> Any:
+    """Read an attribute without running Python code: no properties, no __getattr__."""
+    try:
+        value = inspect.getattr_static(obj, name)
+    except AttributeError:
+        return None
+    if isinstance(value, MemberDescriptorType):
+        try:
+            return value.__get__(obj, type(obj))
+        except AttributeError:
+            return None
+    return value
+
+
 def _inner_job(target: Any) -> Any:
     """Return the job a Home Assistant helper object runs, if it holds one.
 
-    One time listeners, timer trackers and their bound methods keep the
-    callback as a job attribute.
+    One time listeners, time trackers, coordinators, debouncers and their
+    bound methods keep the callback as an attribute.
     """
-    for holder in (target, getattr(target, "__self__", None)):
+    for holder in (target, _static_attribute(target, "__self__")):
         if holder is None or isinstance(holder, ModuleType):
             continue
-        for name in ("listener_job", "job"):
-            inner = getattr(holder, name, None)
+        for name in _JOB_ATTRIBUTES:
+            inner = _static_attribute(holder, name)
             if inner is not None and _is_callback(inner):
                 return inner
     return None
@@ -279,22 +329,39 @@ def count_resources(
     Must run in the event loop: it reads structures the loop changes.
     """
     counts: dict[str, _ResourceCount] = defaultdict(_ResourceCount)
-    for jobs in getattr(hass.bus, "_listeners", {}).values():
-        for job, _event_filter in jobs:
-            counts[callable_owner_of(job)].listeners += 1
-    for targets in hass.data.get("dispatcher", {}).values():
-        for target in targets:
-            counts[callable_owner_of(target)].dispatcher += 1
+
+    def owner_of(target: Any, args: Iterable[Any] = ()) -> str:
+        try:
+            return callable_owner_of(target, args)
+        except Exception:  # noqa: BLE001
+            # A callable that misbehaves when looked at is still a resource.
+            return "core"
+
+    for jobs in list(getattr(hass.bus, "_listeners", {}).values()):
+        for job, _event_filter in list(jobs):
+            counts[owner_of(job)].listeners += 1
+    for key in _KEYED_TRACKERS:
+        callbacks = getattr(hass.data.get(key), "callbacks", None) or {}
+        for jobs in list(callbacks.values()):
+            for job in list(jobs):
+                counts[owner_of(job)].listeners += 1
+    for targets in list(hass.data.get("dispatcher", {}).values()):
+        for target in list(targets):
+            counts[owner_of(target)].dispatcher += 1
     for handle in list(getattr(hass.loop, "_scheduled", ())):
         if not handle.cancelled():
             counts[
-                callable_owner_of(
+                owner_of(
                     getattr(handle, "_callback", None), getattr(handle, "_args", ())
                 )
             ].timers += 1
     for task in asyncio.all_tasks(hass.loop):
         if not task.done():
-            counts[_task_owner(task, module_owner)].tasks += 1
+            try:
+                owner = _task_owner(task, module_owner)
+            except Exception:  # noqa: BLE001
+                owner = "core"
+            counts[owner].tasks += 1
     return {
         domain: Resources(c.listeners, c.dispatcher, c.timers, c.tasks)
         for domain, c in counts.items()
@@ -430,6 +497,9 @@ def to_report(snapshot: Snapshot, previous: Snapshot | None) -> dict[str, Any]:
 
     empty_resources = Resources()
     owners = set(snapshot.heap) | set(snapshot.resources)
+    if previous is not None:
+        # An owner that is gone shows up with what it gave back.
+        owners |= set(previous.heap) | set(previous.resources)
     rows = []
     for owner in owners:
         parts = snapshot.heap.get(owner, {})

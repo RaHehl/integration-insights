@@ -48,11 +48,11 @@ The Memory view walks the Python heap on request and splits it by integration, l
 
 - A timer on the event loop thread's CPU clock samples the stack while the loop is busy, about every 10 ms of loop CPU. When the loop is idle, it does not fire.
 - A sample goes to the integration whose code runs. Code in an entity platform base class goes to the integration that owns the entity. A library that only one loaded integration requires goes to that integration.
-- Executor jobs are timed exactly with the worker thread's CPU clock and charged to the code that submitted them. Other threads are read from `/proc` every 10 seconds. A pool thread is charged to what it runs, and for anyio to the task waiting for it.
+- Executor jobs are timed exactly with the worker thread's CPU clock. A job goes to the integration whose callable it runs, else to the one that submitted it. Other threads are read from `/proc` every 10 seconds. A pool thread is charged to what it runs, and for anyio to the task waiting for it.
 
 ### Cost
 
-The panel shows its own cost under "Measuring costs". On a Raspberry Pi 3 the whole integration uses about 300 ms of CPU per minute, half a percent of one core, less on faster hardware. A memory snapshot takes about half a minute on a Raspberry Pi 3 and needs memory for the walk. It is refused with a reason when memory is short.
+The panel shows its own cost under "Measuring costs". On a Raspberry Pi 3 the whole integration uses about 300 ms of CPU per minute once Home Assistant has started, half a percent of one core, less on faster hardware. During start-up it is higher while it maps libraries to integrations. A memory snapshot takes about half a minute on a Raspberry Pi 3 and needs memory for the walk. It is refused with a reason when memory is short.
 
 ## Privacy
 
@@ -61,9 +61,11 @@ Reports contain code locations (file, function, line), integration domains and t
 ## Limits
 
 - The numbers are statistical. Integrations with few samples are marked.
-- Linux checks CPU timers on the scheduler tick, so callbacks shorter than about 1 ms are undercounted by 15 to 20 percent.
+- Linux checks CPU timers on the scheduler tick, so very short callbacks can be undercounted.
 - Time in C or Rust code is charged to the Python line that called it.
+- During a long block of the event loop the sampler slows down, so the last part of such a block can land on the code that runs next.
 - A blocking call uses no CPU, so the CPU view cannot say which integration made the event loop wait. Home Assistant's log names it ("Detected blocking call").
+- A memory snapshot charges an object that several integrations hold to the first one the walk reaches. Shared strings and bytes go to a shared pool.
 
 ## License
 

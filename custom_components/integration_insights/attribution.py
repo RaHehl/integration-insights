@@ -164,22 +164,39 @@ def _read_imports(dist: str) -> tuple[str, ...] | None:
         return tuple(line.strip() for line in text.splitlines() if line.strip())
     names: dict[str, None] = {}
     for path in found.files or ():
-        top = path.parts[0]
-        if top.endswith((".dist-info", ".data")) or top in ("..", "__pycache__"):
-            continue
-        names[top.removesuffix(".py")] = None
+        if (top := _top_name(str(path))) is not None:
+            names[top] = None
     return tuple(names)
+
+
+def _top_name(entry: str) -> str | None:
+    """Return the import name a file list entry is part of, if any.
+
+    A directory is a package, a .py file a module, a .so or .pyd file an
+    extension module whose name ends at the first dot.
+    """
+    top, sep, _ = entry.partition("/")
+    if sep:
+        if top.endswith((".dist-info", ".egg-info", ".data")) or top in (
+            "..",
+            "__pycache__",
+        ):
+            return None
+        return top
+    if top.endswith(".py"):
+        return top[:-3]
+    if top.endswith((".so", ".pyd")):
+        return top.split(".", 1)[0]
+    return None
 
 
 def _record_tops(record: bytes) -> set[bytes]:
     """Return the top level names a RECORD file lists: packages and modules."""
     tops: set[bytes] = set()
     for line in record.split(b"\n"):
-        top, sep, _ = line.split(b",", 1)[0].partition(b"/")
-        if sep:
-            tops.add(top)
-        elif top.endswith(b".py"):
-            tops.add(top[:-3])
+        entry = line.split(b",", 1)[0].decode("utf-8", "replace")
+        if (top := _top_name(entry)) is not None:
+            tops.add(top.encode())
     return tops
 
 
@@ -200,14 +217,22 @@ def _scan_providers(import_names: Iterable[str]) -> dict[str, tuple[str, ...]]:
     count = 0
     for entry in sys.path:
         try:
-            infos = [p for p in Path(entry).iterdir() if p.name.endswith(".dist-info")]
+            infos = [
+                p
+                for p in Path(entry).iterdir()
+                if p.name.endswith((".dist-info", ".egg-info"))
+            ]
         except OSError:
             continue
         for info in infos:
             count += 1
             if count % _YIELD_EVERY == 0:
                 time.sleep(_YIELD_SECONDS)
-            dist = _normalize(info.name.removesuffix(".dist-info").rsplit("-", 1)[0])
+            if info.name.endswith(".dist-info"):
+                dist = info.name.removesuffix(".dist-info").rsplit("-", 1)[0]
+            else:
+                dist = info.name.removesuffix(".egg-info").split("-", 1)[0]
+            dist = _normalize(dist)
             try:
                 shipped = set((info / "top_level.txt").read_bytes().split())
             except OSError:

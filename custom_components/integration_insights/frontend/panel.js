@@ -431,12 +431,20 @@ class IntegrationInsightsPanel extends HTMLElement {
   async _loadFindings() {
     if (this._findingsPending) return;
     this._findingsPending = true;
+    const minutes = this._minutes;
     try {
-      this._findings = await this._hass.connection.sendMessagePromise({
+      const findings = await this._hass.connection.sendMessagePromise({
         type: "integration_insights/findings",
-        minutes: this._minutes,
+        minutes,
         language: this._hass.locale?.language || this._hass.language,
       });
+      if (minutes !== this._minutes) {
+        // The window changed while this was on its way: ask again.
+        this._findingsPending = false;
+        this._loadFindings();
+        return;
+      }
+      this._findings = findings;
       this._error = undefined;
     } catch (err) {
       this._error = err && err.message ? err.message : String(err);
@@ -464,12 +472,14 @@ class IntegrationInsightsPanel extends HTMLElement {
   }
 
   async _loadDetail(domain) {
+    const minutes = this._minutes;
     try {
       const detail = await this._hass.connection.sendMessagePromise({
         type: "integration_insights/detail",
         domain,
-        minutes: this._minutes,
+        minutes,
       });
+      if (minutes !== this._minutes) return;
       if (this._expanded.has(domain)) this._details.set(domain, detail);
     } catch (err) {
       this._error = err && err.message ? err.message : String(err);
@@ -828,7 +838,7 @@ class IntegrationInsightsPanel extends HTMLElement {
     const banner = `<div class="verdict ${verdict}" role="status">
         <div class="mark" aria-hidden="true">${mark}</div>
         <div><div class="head">${escapeHtml(head)}</div>
-        <div class="sub">Checked: time on the event loop, background threads and jobs${this._memory?.latest ? ", memory snapshots" : ""}.</div></div>
+        <div class="sub">Checked: time on the event loop, background threads and jobs${this._memory?.memory?.latest ? ", memory snapshots" : ""}.</div></div>
       </div>`;
     const cards = findings
       .map((finding, index) => {

@@ -200,17 +200,26 @@ def test_scan_providers_reads_file_lists(
             "RECORD": "six.py,sha256=x,1\nsix-1.16.dist-info/RECORD,,\n"
         },
         "attrs_fork-1.0.dist-info": {"RECORD": "attr/fork.py,,\n"},
+        # An extension module without a package directory
+        "orjson-3.10.dist-info": {
+            "RECORD": "orjson.cpython-314-x86_64-linux-gnu.so,sha256=x,1\n"
+            "orjson-3.10.dist-info/RECORD,,\n"
+        },
+        # A legacy install
+        "legacy-0.1-py3.14.egg-info": {"top_level.txt": "legacy\n"},
     }.items():
         (site / dist).mkdir(parents=True)
         for name, text in files.items():
             (site / dist / name).write_text(text)
     monkeypatch.setattr(sys, "path", [str(site), str(tmp_path / "missing")])
 
-    found = _scan_providers(["yaml", "attr", "six", "nothing"])
+    found = _scan_providers(["yaml", "attr", "six", "nothing", "orjson", "legacy"])
     # Directory order is up to the file system.
     assert {name: set(dists) for name, dists in found.items()} == {
         "yaml": {"pyyaml"},
         "attr": {"attrs", "attrs-fork"},
         "six": {"six"},
         "nothing": set(),
+        "orjson": {"orjson"},
+        "legacy": {"legacy"},
     }

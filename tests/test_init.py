@@ -10,7 +10,10 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from pytest_homeassistant_custom_component.components.diagnostics import (
     get_diagnostics_for_config_entry,
 )
-from pytest_homeassistant_custom_component.typing import ClientSessionGenerator
+from pytest_homeassistant_custom_component.typing import (
+    ClientSessionGenerator,
+    WebSocketGenerator,
+)
 
 from custom_components.integration_insights.attribution import Packages
 from custom_components.integration_insights.const import DOMAIN
@@ -77,6 +80,25 @@ async def test_reload_keeps_one_timer(hass: HomeAssistant) -> None:
     assert _timers() == timers + 1
     assert await hass.config_entries.async_unload(entry.entry_id)
     assert _timers() == timers
+
+
+@linux_only
+async def test_subscription_survives_a_reload(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
+    """A panel subscribed before a reload keeps getting summaries after it."""
+    entry = MockConfigEntry(domain=DOMAIN)
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    client = await hass_ws_client(hass)
+    await client.send_json_auto_id({"type": f"{DOMAIN}/subscribe", "minutes": 5})
+    msg_id = (await client.receive_json())["id"]
+    assert (await client.receive_json())["id"] == msg_id
+
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    entry.runtime_data._async_drain()  # noqa: SLF001
+    assert (await client.receive_json())["id"] == msg_id
+    assert await hass.config_entries.async_unload(entry.entry_id)
 
 
 @linux_only
@@ -165,4 +187,18 @@ async def test_library_map_looks_up_seen_libraries(hass: HomeAssistant) -> None:
         assert insights.collector.library_map == {"aiofoo": "foo", "aiobar": "bar"}
         assert "aiobar" in looked_up
         assert "aiofoo" not in looked_up
+        looked_up.clear()
+
+        # A new component right after a map does not map everything again
+        hass.config.top_level_components.add("baz")
+        insights._async_drain()  # noqa: SLF001
+        await hass.async_block_till_done(wait_background_tasks=True)
+        assert looked_up == []
+        with patch(
+            "custom_components.integration_insights.insights.time.monotonic",
+            return_value=insights._mapped_at + 61,  # noqa: SLF001
+        ):
+            insights._async_drain()  # noqa: SLF001
+        await hass.async_block_till_done(wait_background_tasks=True)
+        assert {"foo", "bar", "baz"} <= insights._mapped_components  # noqa: SLF001
     assert await hass.config_entries.async_unload(entry.entry_id)
