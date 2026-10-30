@@ -343,6 +343,11 @@ const STYLE = `
     .col-samples { display: none; }
     .detail { padding-left: 16px; }
     .header-button { display: none; }
+    /* Four views and three windows do not fit one row: wrap, title goes */
+    header { flex-wrap: wrap; padding: 8px 12px; gap: 8px; }
+    header h1 { display: none; }
+    .segmented { display: flex; flex: 1 1 100%; }
+    .segmented button { flex: 1; padding: 8px 4px; }
   }
 `;
 
