@@ -647,6 +647,13 @@ class IntegrationInsightsPanel extends HTMLElement {
         `${item.samples} samples over ${report.window_minutes} min` +
         (item.low_confidence ? " (few samples)" : ""),
     ];
+    if (item.state_writes) {
+      const sw = item.state_writes;
+      lines.push(`State writes: ${sw.per_min} per min, ${sw.unchanged_per_min} without a change`);
+      for (const [entityId, value] of Object.entries(sw.entities)) {
+        lines.push(`- ${entityId}: ${value} per min`);
+      }
+    }
     if (item.callbacks) {
       const cb = item.callbacks;
       lines.push(
@@ -956,6 +963,15 @@ class IntegrationInsightsPanel extends HTMLElement {
     if (item.via_context_ms_per_min) {
       parts.push(
         `<p class="note">${ms(item.via_context_ms_per_min)} ms/min of this is core and shared library code that ran for one of this integration's config entries, such as parsing its HTTP responses.</p>`
+      );
+    }
+    if (item.state_writes) {
+      const sw = item.state_writes;
+      const chips = Object.entries(sw.entities)
+        .map(([entityId, value]) => `<span class="chip">${escapeHtml(entityId)} · ${value}/min</span>`)
+        .join("");
+      parts.push(
+        `<h3>State writes</h3><p class="note">${sw.per_min} state updates per minute, ${sw.unchanged_per_min} of them without a change.</p><div class="pairs">${chips}</div>`
       );
     }
     if (item.callbacks) {

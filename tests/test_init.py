@@ -26,6 +26,7 @@ from custom_components.integration_insights.sampler import is_supported
 from homeassistant.config_entries import ConfigEntryState, current_entry
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED, EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import CoreState, HomeAssistant
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.setup import async_setup_component
 from homeassistant.util import dt as dt_util
@@ -283,6 +284,22 @@ async def test_callbacks_are_timed_and_charged_to_their_entry(
     assert brief["longest_ms"] == callbacks["longest_ms"]
     functions = {r["function"] for r in callbacks["by_function"]}
     assert "custom_components.blocker.api.poll" in functions
+    # State writes of the integration's entities, with and without a change
+    registry = er.async_get(hass)
+    entity_id = registry.async_get_or_create("sensor", "blocker", "u1").entity_id
+    for value in ("1", "1", "1", "2"):
+        hass.states.async_set(entity_id, value)
+    hass.states.async_set("sensor.unregistered", "x")
+    await hass.async_block_till_done()
+    report = insights.report()
+    row = next(item for item in report["integrations"] if item["domain"] == "blocker")
+    assert row["state_writes"] == {
+        "per_min": row["state_writes"]["per_min"],
+        "unchanged_per_min": row["state_writes"]["unchanged_per_min"],
+        "entities": {entity_id: row["state_writes"]["entities"][entity_id]},
+    }
+    assert row["state_writes"]["per_min"] > row["state_writes"]["unchanged_per_min"] > 0
+    assert row["state_writes"]["entities"][entity_id] == row["state_writes"]["per_min"]
     # The sampler does not blame the timing wrapper for what it wraps
     assert "integration_insights" not in row["triggered_by"]
     # A callback without an entry context counts for its module

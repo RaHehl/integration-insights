@@ -1,5 +1,6 @@
 """Tests for the collector and its report."""
 
+from collections import Counter
 import random
 from typing import Any
 
@@ -312,3 +313,29 @@ def test_core_work_in_an_entry_context_goes_to_the_entry() -> None:
     assert rows["foo"]["via_context_ms_per_min"] == 30.0
     assert rows["core"]["loop_cpu_ms_per_min"] == 20.0
     assert "via_context_ms_per_min" not in rows["core"]
+
+
+def test_state_writes_count_per_integration_with_their_entities() -> None:
+    """Writes with and without a change count for the entity's integration."""
+    from custom_components.integration_insights.collector import StateWrites  # noqa: PLC0415
+
+    collector = Collector()
+    collector.add_state_writes(
+        [
+            StateWrites("foo", 20, 100, Counter({"sensor.a": 90, "sensor.b": 30})),
+            StateWrites("bar", 2, 0, Counter({"light.c": 2})),
+        ],
+        now=60.0,
+    )
+    summary = collector.summary(now=120.0, started=0.0, minutes=1)
+    foo = next(item for item in summary["integrations"] if item["domain"] == "foo")
+    assert (foo["state_writes_per_min"], foo["state_unchanged_per_min"]) == (120, 100)
+    detail = collector.detail("foo", now=120.0, started=0.0, minutes=1)
+    assert detail is not None
+    assert detail["state_writes"] == {
+        "per_min": 120,
+        "unchanged_per_min": 100,
+        "entities": {"sensor.a": 90, "sensor.b": 30},
+    }
+    bar = next(item for item in summary["integrations"] if item["domain"] == "bar")
+    assert bar["state_unchanged_per_min"] == 0

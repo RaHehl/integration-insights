@@ -1,7 +1,7 @@
 """Run the sampler and feed the collector."""
 
 import asyncio
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Callable
 from datetime import timedelta
 import logging
@@ -11,7 +11,12 @@ import time
 from typing import Any
 
 from homeassistant.config_entries import current_entry
-from homeassistant.const import EVENT_HOMEASSISTANT_STARTED, EVENT_HOMEASSISTANT_STOP
+from homeassistant.const import (
+    EVENT_HOMEASSISTANT_STARTED,
+    EVENT_HOMEASSISTANT_STOP,
+    EVENT_STATE_CHANGED,
+    EVENT_STATE_REPORTED,
+)
 from homeassistant.core import CALLBACK_TYPE, CoreState, Event, HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.event import async_track_time_interval
@@ -27,7 +32,7 @@ from .attribution import (
     top_package,
 )
 from .background import Background, LoopWait, ThreadRecord
-from .collector import WINDOW_MINUTES, CallbackRecord, Collector
+from .collector import WINDOW_MINUTES, CallbackRecord, Collector, StateWrites
 from .const import DOMAIN
 from .findings import INFO, MIN_MINUTES, Finding, Shown, find
 from .loop_timing import LoopTiming
@@ -90,6 +95,9 @@ class Insights:
         self._unsub_drain: CALLBACK_TYPE | None = None
         self._unsub_stop: CALLBACK_TYPE | None = None
         self._unsub_started: CALLBACK_TYPE | None = None
+        self._unsub_states: list[CALLBACK_TYPE] = []
+        # domain -> [changes, reports, entities], filled by the event filters
+        self._state_writes: dict[str, list[Any]] = {}
         self._polling = False
         self._subscribers: list[tuple[int, Callable[[dict[str, Any]], None]]] = (
             hass.data.setdefault(SUBSCRIBERS_KEY, [])
@@ -137,6 +145,7 @@ class Insights:
             self.sampler.select_wrapper = self.loop_wait.wrapper_code
         self.loop_timing.start()
         self.sampler.skip_codes = frozenset({self.loop_timing.wrapper_code})
+        self._listen_state_writes()
         self._wall_ns = time.perf_counter_ns()
         self._waiting_ns = self.loop_wait.waiting_ns
         self.started = time.monotonic()
@@ -172,6 +181,49 @@ class Insights:
         self.loop_timing.stop()
         self.sampler.select_wrapper = None
         self.sampler.skip_codes = frozenset()
+        for unsub in self._unsub_states:
+            unsub()
+        self._unsub_states.clear()
+
+    def _listen_state_writes(self) -> None:
+        """Count state writes per integration in the bus event filters.
+
+        The filters run for every event, counting there and returning False
+        means no listener job is ever scheduled, so the cost stays at a dict
+        update per write.
+        """
+        entities = er.async_get(self.hass).entities
+        writes = self._state_writes
+
+        def count(entity_id: str, slot: int) -> bool:
+            if (entry := entities.get(entity_id)) is None:
+                return False
+            if (row := writes.get(entry.platform)) is None:
+                row = writes[entry.platform] = [0, 0, Counter()]
+            row[slot] += 1
+            row[2][entity_id] += 1
+            return False
+
+        @callback
+        def changed(data: Any) -> bool:
+            return count(data["entity_id"], 0)
+
+        @callback
+        def reported(data: Any) -> bool:
+            return count(data["entity_id"], 1)
+
+        @callback
+        def never(_event: Any) -> None:
+            """Only the filters do the work."""
+
+        self._unsub_states = [
+            self.hass.bus.async_listen(
+                EVENT_STATE_CHANGED, never, event_filter=changed
+            ),
+            self.hass.bus.async_listen(
+                EVENT_STATE_REPORTED, never, event_filter=reported
+            ),
+        ]
 
     def _hook_wakeup_reads(self) -> None:
         # asyncio's selector loop hands the bytes it read from the wakeup
@@ -231,6 +283,15 @@ class Insights:
         now = time.monotonic()
         self.collector.add(records, now)
         self.collector.add_jobs(self.background.drain_jobs(), now)
+        if self._state_writes:
+            writes, self._state_writes = self._state_writes, {}
+            self.collector.add_state_writes(
+                [
+                    StateWrites(domain, row[0], row[1], row[2])
+                    for domain, row in writes.items()
+                ],
+                now,
+            )
         self.collector.add_callbacks(
             [
                 CallbackRecord(

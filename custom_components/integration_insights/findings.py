@@ -33,6 +33,10 @@ LOOP_WAIT_PROBLEM_MS = 12_000
 # One callback that held the loop this long: everything else stood still.
 LOOP_BLOCK_NOTICE_MS = 2_000
 LOOP_BLOCK_PROBLEM_MS = 10_000
+# State writes per minute. Every write wakes the recorder, the frontend and
+# every listener of the entity; ten a second is a device reporting, not changing.
+STATE_WRITES_NOTICE_PER_MIN = 600
+STATE_WRITES_PROBLEM_PER_MIN = 3_000
 # Shorter windows move too much to judge.
 MIN_MINUTES = 5
 # Lost samples are expected now and then, a steady share skews the numbers.
@@ -158,16 +162,40 @@ def _cpu_findings(
     background_notice = BACKGROUND_NOTICE_MS * factor
     background_problem = BACKGROUND_PROBLEM_MS * factor
     longest = item.get("longest_ms", 0)
+    writes = item.get("state_writes_per_min", 0)
     if (
         loop < LOOP_NOTICE_MS * HOLD
         and background < background_notice * HOLD
         and item.get("jobs_per_min", 0) < JOBS_NOTICE_PER_MIN * factor * HOLD
         and longest < LOOP_BLOCK_NOTICE_MS * HOLD
+        and writes < STATE_WRITES_NOTICE_PER_MIN * factor * HOLD
     ):
         return []
     if (info := detail(domain)) is None:
         return []
     findings = []
+    if writes >= STATE_WRITES_NOTICE_PER_MIN * factor * hold("busy_states", domain):
+        states = info.get("state_writes", {})
+        findings.append(
+            Finding(
+                "busy_states",
+                hold.severity(
+                    "busy_states", domain, writes, STATE_WRITES_PROBLEM_PER_MIN * factor
+                ),
+                domain,
+                {
+                    "per_min": _number(writes),
+                    "unchanged": _number(item.get("state_unchanged_per_min", 0)),
+                    "minutes": minutes,
+                },
+                [
+                    f"{entity_id}: {_rate(per_min)}/min"
+                    for entity_id, per_min in list(states.get("entities", {}).items())[
+                        :EVIDENCE_LINES
+                    ]
+                ],
+            )
+        )
     if longest >= LOOP_BLOCK_NOTICE_MS * hold("loop_blocked", domain):
         callbacks = info.get("callbacks", {})
         findings.append(

@@ -12,6 +12,7 @@ from .background import JobRecord, Owner, ThreadRecord
 from .sampler import Record
 
 TOP_CALLBACKS = 5
+TOP_STATE_ENTITIES = 5
 
 WINDOW_MINUTES = 60
 MAX_STACKS_PER_MINUTE = 500
@@ -27,6 +28,15 @@ KEPT_WINDOWS = (5, 15, 60)
 
 type Location = tuple[str, str, int]  # short path, qualname, line
 type Stack = tuple[Location, ...]
+
+
+class StateWrites(NamedTuple):
+    """State writes of one integration's entities since the last drain."""
+
+    domain: str
+    changes: int
+    reports: int  # writes that changed nothing
+    entities: Counter[str]
 
 
 class CallbackRecord(NamedTuple):
@@ -71,6 +81,10 @@ class _Domain:
     longest_ns: int = 0
     longest_at: float = 0.0
     longest_label: str = ""
+    # State writes of the integration's entities: with and without a change
+    state_changes: int = 0
+    state_reports: int = 0
+    state_entities: Counter[str] = field(default_factory=Counter)
 
     def note_longest(self, ns: int, at: float, label: str) -> None:
         if ns > self.longest_ns:
@@ -100,6 +114,9 @@ class _Domain:
         self.callbacks.update(other.callbacks)
         self.callback_counts.update(other.callback_counts)
         self.note_longest(other.longest_ns, other.longest_at, other.longest_label)
+        self.state_changes += other.state_changes
+        self.state_reports += other.state_reports
+        self.state_entities.update(other.state_entities)
 
     def merge_totals(self, other: _Domain, sign: int = 1) -> None:
         """Add (or with sign -1 remove) only the numbers, not the counters.
@@ -117,6 +134,8 @@ class _Domain:
         self.thread_cpu_ns += sign * other.thread_cpu_ns
         self.loop_wall_ns += sign * other.loop_wall_ns
         self.callback_total += sign * other.callback_total
+        self.state_changes += sign * other.state_changes
+        self.state_reports += sign * other.state_reports
 
     def totals_are_zero(self) -> bool:
         return not (
@@ -130,6 +149,8 @@ class _Domain:
             or self.thread_cpu_ns
             or self.loop_wall_ns
             or self.callback_total
+            or self.state_changes
+            or self.state_reports
         )
 
     @property
@@ -260,6 +281,16 @@ class Collector:
             stats.callback_counts[record.label] += record.calls
             stats.note_longest(record.max_ns, record.max_at, record.label)
             bucket.loop_wall_ns += record.total_ns
+
+    def add_state_writes(self, writes: list[StateWrites], now: float) -> None:
+        """Add state writes counted before `now`."""
+        bucket = self._bucket(now)
+        for record in writes:
+            if (stats := bucket.domains.get(record.domain)) is None:
+                stats = bucket.domains[record.domain] = _Domain()
+            stats.state_changes += record.changes
+            stats.state_reports += record.reports
+            stats.state_entities.update(record.entities)
 
     def add_loop_busy(self, busy_ns: int, now: float) -> None:
         """Add wall time the loop spent outside select() before `now`."""
@@ -444,7 +475,7 @@ class Collector:
         sums: dict[str, list[int]] = {}
         for part in parts:
             for domain, stats in part.domains.items():
-                row = sums.setdefault(domain, [0, 0, 0, 0, 0, 0, 0])
+                row = sums.setdefault(domain, [0, 0, 0, 0, 0, 0, 0, 0, 0])
                 row[0] += stats.cpu_ns
                 row[1] += stats.executor_cpu_ns + stats.thread_cpu_ns
                 row[2] += stats.samples
@@ -452,7 +483,9 @@ class Collector:
                 row[4] += stats.job_total
                 row[5] += stats.loop_wall_ns
                 row[6] += stats.via_context_ns
-        idle = sums.pop("idle", [0, 0, 0, 0, 0, 0, 0])
+                row[7] += stats.state_changes
+                row[8] += stats.state_reports
+        idle = sums.pop("idle", [0, 0, 0, 0, 0, 0, 0, 0, 0])
         longest = self._longest(now, minutes)
         integrations = []
         for domain, (
@@ -463,6 +496,8 @@ class Collector:
             jobs,
             wall_ns,
             context_ns,
+            changes,
+            reports,
         ) in sorted(
             sums.items(), key=lambda item: (-(item[1][0] + item[1][1]), item[0])
         ):
@@ -480,6 +515,9 @@ class Collector:
                 item["via_library_ms_per_min"] = per_minute(via_ns)
             if context_ns:
                 item["via_context_ms_per_min"] = per_minute(context_ns)
+            if changes or reports:
+                item["state_writes_per_min"] = round((changes + reports) / span, 1)
+                item["state_unchanged_per_min"] = round(reports / span, 1)
             if (block := longest.get(domain)) is not None:
                 item["longest_ms"] = round(block[0] / 1e6, 1)
                 item["longest_at"] = block[1]
@@ -636,6 +674,17 @@ def _item(domain: str, stats: _Domain, span: float) -> dict[str, Any]:
         item["threads"] = {
             "cpu_ms_per_min": per_minute(stats.thread_cpu_ns),
             "by_name": top(stats.threads, TOP_THREADS),
+        }
+    if stats.state_changes or stats.state_reports:
+        item["state_writes"] = {
+            "per_min": round((stats.state_changes + stats.state_reports) / span, 1),
+            "unchanged_per_min": round(stats.state_reports / span, 1),
+            "entities": {
+                entity_id: round(count / span, 1)
+                for entity_id, count in _ranked(
+                    stats.state_entities, TOP_STATE_ENTITIES
+                )
+            },
         }
     if stats.callback_total:
         item["callbacks"] = {

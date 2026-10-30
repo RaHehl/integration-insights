@@ -470,3 +470,45 @@ def test_one_long_block_is_found_at_once() -> None:
     assert _keys(
         find(_summary([{**item, "longest_ms": 12_000}]), lambda _: detail, {})
     ) == [("loop_blocked", PROBLEM, "foo")]
+
+
+def test_too_many_state_writes_are_found() -> None:
+    """Ten state writes a second is a device reporting, not changing."""
+    item = {
+        **_item("foo"),
+        "state_writes_per_min": 1_231,
+        "state_unchanged_per_min": 1_100,
+    }
+    detail = _detail(
+        state_writes={
+            "per_min": 1_231,
+            "unchanged_per_min": 1_100,
+            "entities": {"sensor.foo_power": 900.4, "sensor.foo_temp": 300},
+        }
+    )
+    findings = find(_summary([item]), lambda _: detail, {})
+    assert _keys(findings) == [("busy_states", NOTICE, "foo")]
+    assert findings[0].values == {
+        "per_min": "1,231",
+        "unchanged": "1,100",
+        "minutes": "15",
+    }
+    assert findings[0].evidence == [
+        "sensor.foo_power: 900/min",
+        "sensor.foo_temp: 300/min",
+    ]
+    assert (
+        find(_summary([{**item, "state_writes_per_min": 599}]), lambda _: detail, {})
+        == []
+    )
+    # Built-in integrations such as mqtt write state for what the user wired up
+    built_in = find(
+        _summary([{**item, "domain": "mqtt"}]),
+        lambda _: detail,
+        {},
+        built_in=lambda d: True,
+    )
+    assert built_in == []
+    assert _keys(
+        find(_summary([{**item, "state_writes_per_min": 4_000}]), lambda _: detail, {})
+    ) == [("busy_states", PROBLEM, "foo")]

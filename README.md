@@ -15,6 +15,7 @@ Finds the integration that slows Home Assistant down, keeps the CPU busy, or lea
 - Background threads that work around the clock, such as a file watcher that keeps polling.
 - Integrations that hand a lot of work to the executor, usually polling more often than needed.
 - A single callback that stopped the event loop for seconds, named by integration and function, the first time it happens.
+- An integration that writes state far more often than its devices change, which wakes the recorder, the dashboard and every automation watching the entity each time.
 - An event loop that often waits, usually on a blocking call.
 - Listeners, timers and tasks that pile up between two memory snapshots, a sign of a leak.
 
@@ -51,6 +52,7 @@ The Memory view walks the Python heap on request and splits it by integration, l
 - A timer on the event loop thread's CPU clock samples the stack while the loop is busy, about every 10 ms of loop CPU. When the loop is idle, it does not fire. This is what names the lines inside a callback.
 - A sample goes to the integration whose code runs. Code in an entity platform base class goes to the integration that owns the entity. A library that only one loaded integration requires goes to that integration. Core and shared library code with no integration on the stack, such as aiohttp parsing a response, goes to the config entry whose context it runs in, which Home Assistant sets while an entry is set up and every task and connection started from there inherits.
 - A finalizer running inside the garbage collector is charged to the owner of the object being destroyed, not to whoever allocated enough to trigger the collection.
+- State writes are counted per integration in the bus event filters, with and without a change, at the cost of one dictionary update per write.
 - Executor jobs are timed exactly with the worker thread's CPU clock. A job goes to the integration whose callable it runs, else to the one that submitted it. Other threads are read from `/proc` every 10 seconds. A pool thread is charged to what it runs, and for anyio to the task waiting for it.
 
 ### Cost
