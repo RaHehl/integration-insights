@@ -331,16 +331,41 @@ def test_state_writes_count_per_integration_with_their_entities() -> None:
     foo = next(item for item in summary["integrations"] if item["domain"] == "foo")
     assert (
         foo["state_writes_per_min"],
-        foo["state_unchanged_per_min"],
+        foo["state_changes_per_min"],
         foo["state_attributes_only_per_min"],
-    ) == (150, 130, 30)
+        foo["state_repeated_per_min"],
+    ) == (150, 20, 30, 100)
     detail = collector.detail("foo", now=120.0, started=0.0, minutes=1)
     assert detail is not None
     assert detail["state_writes"] == {
         "per_min": 150,
-        "unchanged_per_min": 130,
+        "changes_per_min": 20,
         "attributes_only_per_min": 30,
+        "repeated_per_min": 100,
         "entities": {"sensor.a": 120, "sensor.b": 30},
     }
     bar = next(item for item in summary["integrations"] if item["domain"] == "bar")
-    assert bar["state_unchanged_per_min"] == 0
+    assert bar["state_repeated_per_min"] == 0
+
+
+def test_state_entities_keep_only_the_busiest_per_minute() -> None:
+    """Thousands of entities in one integration do not grow memory without bound."""
+    from custom_components.integration_insights.collector import (  # noqa: PLC0415
+        MAX_STATE_ENTITIES_PER_MINUTE,
+        StateWrites,
+    )
+
+    collector = Collector()
+    many = Counter(
+        {f"sensor.e{i}": 1 for i in range(5 * MAX_STATE_ENTITIES_PER_MINUTE)}
+    )
+    many["sensor.busy"] = 50
+    for _ in range(3):
+        collector.add_state_writes([StateWrites("foo", 1, 0, 0, many)], now=60.0)
+    bucket = collector._buckets[-1]  # noqa: SLF001
+    assert (
+        len(bucket.domains["foo"].state_entities) <= 2 * MAX_STATE_ENTITIES_PER_MINUTE
+    )
+    detail = collector.detail("foo", now=61.0, started=0.0, minutes=1)
+    assert detail is not None
+    assert next(iter(detail["state_writes"]["entities"])) == "sensor.busy"

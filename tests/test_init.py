@@ -125,6 +125,43 @@ async def test_stop_event_removes_sampler(
 
 
 @linux_only
+async def test_failed_start_leaves_nothing_behind(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A start that fails half way removes what it had installed."""
+    executor = hass.loop._default_executor  # noqa: SLF001
+    submit = executor.submit if executor is not None else None
+    hass.set_state(CoreState.starting)
+    entry = MockConfigEntry(domain=DOMAIN)
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    hass.set_state(CoreState.running)
+    with patch(
+        "custom_components.integration_insights.insights.Insights._listen_state_writes",
+        side_effect=RuntimeError("boom"),
+    ):
+        hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+        await hass.async_block_till_done()
+    assert "Could not start measuring: boom" in caplog.text
+    assert signal.getsignal(signal.SIGPROF) is signal.SIG_DFL
+    assert Handle._run.__qualname__ == "Handle._run"  # noqa: SLF001
+    if executor is not None:
+        assert executor.submit == submit
+    ran: list[int] = []
+    hass.loop.call_soon(ran.append, 1)
+    await hass.async_block_till_done()
+    assert ran == [1]
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+def test_translations_have_no_escaped_newlines() -> None:
+    """A doubled backslash shows as text in the repair instead of a new line."""
+    root = Path(__file__).parent.parent / "custom_components" / DOMAIN
+    for path in (root / "strings.json", *(root / "translations").glob("*.json")):
+        assert "\\\\n" not in path.read_text(), path
+
+
+@linux_only
 async def test_executor_jobs_reach_the_report(hass: HomeAssistant) -> None:
     """Jobs from hass.async_add_executor_job count for the submitting module."""
     namespace = {"__name__": "custom_components.busy.worker"}
@@ -297,17 +334,19 @@ async def test_callbacks_are_timed_and_charged_to_their_entry(
     row = next(item for item in report["integrations"] if item["domain"] == "blocker")
     assert set(row["state_writes"]) == {
         "per_min",
-        "unchanged_per_min",
+        "changes_per_min",
         "attributes_only_per_min",
+        "repeated_per_min",
         "entities",
     }
-    assert row["state_writes"]["attributes_only_per_min"] > 0
     # 5 writes: 2 changed the value, 2 repeated it, 1 changed only attributes
     sw = row["state_writes"]
-    assert sw["unchanged_per_min"] == 3 * sw["attributes_only_per_min"]
+    assert sw["attributes_only_per_min"] > 0
+    assert sw["changes_per_min"] == 2 * sw["attributes_only_per_min"]
+    assert sw["repeated_per_min"] == 2 * sw["attributes_only_per_min"]
     assert sw["per_min"] == 5 * sw["attributes_only_per_min"]
-    assert row["state_writes"]["per_min"] > row["state_writes"]["unchanged_per_min"] > 0
-    assert row["state_writes"]["entities"][entity_id] == row["state_writes"]["per_min"]
+    # Busiest entities by what reaches listeners: repeated writes do not
+    assert sw["entities"][entity_id] == 3 * sw["attributes_only_per_min"]
     # Writes after a drain are counted too: the filters keep the same dict
     hass.states.async_set(entity_id, "3")
     await hass.async_block_till_done()
@@ -339,7 +378,7 @@ async def test_callbacks_are_timed_and_charged_to_their_entry(
         insights.callback_domain(
             "asyncio.unix_events._UnixSelectorEventLoop._read_from_self", None
         )
-        == DOMAIN
+        == "core"
     )
     insights.collector.library_map["aiofoo"] = "foo"
     assert insights.callback_domain("aiofoo.client.Client.data_received", None) == "foo"

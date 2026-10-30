@@ -29,10 +29,17 @@ from .attribution import (
     library_owners,
     module_domain,
     platform_domains,
+    short_path,
     top_package,
 )
 from .background import Background, LoopWait, ThreadRecord
-from .collector import WINDOW_MINUTES, CallbackRecord, Collector, StateWrites
+from .collector import (
+    WINDOW_MINUTES,
+    BlockRecord,
+    CallbackRecord,
+    Collector,
+    StateWrites,
+)
 from .const import DOMAIN
 from .findings import INFO, MIN_MINUTES, Finding, Shown, find
 from .loop_timing import LoopTiming
@@ -75,7 +82,8 @@ class Insights:
             self.sampler.walk, lambda: self.collector.library_map
         )
         self.loop_wait = LoopWait()
-        self.loop_timing = LoopTiming(hass.loop)
+        self.loop_timing = LoopTiming(hass.loop, self._blocker)
+        self._snapshot_running = False
         self._entry_domains: dict[str, str] = {}
         self._platforms = platform_domains()
         self.started = 0.0
@@ -92,6 +100,7 @@ class Insights:
         self._errors_seen = 0
         self._rearm_failed = False
         self._wakeup_hook: Callable[[bytes], None] | None = None
+        self._wakeup_active = [False]
         self._unsub_drain: CALLBACK_TYPE | None = None
         self._unsub_stop: CALLBACK_TYPE | None = None
         self._unsub_started: CALLBACK_TYPE | None = None
@@ -133,10 +142,18 @@ class Insights:
         self._unsub_started = None
         try:
             self._start()
-        except SamplerError as err:
-            _LOGGER.error("Could not start the sampler: %s", err)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.error("Could not start measuring: %s", err)
 
     def _start(self) -> None:
+        try:
+            self._install()
+        except BaseException:
+            # Whatever was installed before the failure must not stay behind
+            self.stop()
+            raise
+
+    def _install(self) -> None:
         self.sampler.install()
         self._hook_wakeup_reads()
         for executor in self._executors():
@@ -194,20 +211,31 @@ class Insights:
         """
         entities = er.async_get(self.hass).entities
         writes = self._state_writes
+        # entity_id -> integration; the registry lookup is slow for a hot path
+        platforms: dict[str, str | None] = {}
 
         def count(entity_id: str, slot: int) -> bool:
-            if (entry := entities.get(entity_id)) is None:
+            if entity_id in platforms:
+                platform = platforms[entity_id]
+            else:
+                entry = entities.get(entity_id)
+                platform = platforms[entity_id] = (
+                    entry.platform if entry is not None else None
+                )
+            if platform is None:
                 return False
-            if (row := writes.get(entry.platform)) is None:
-                row = writes[entry.platform] = [0, 0, 0, Counter()]
+            if (row := writes.get(platform)) is None:
+                row = writes[platform] = [0, 0, 0, Counter()]
             row[slot] += 1
-            row[3][entity_id] += 1
+            if slot != 1:
+                # Busiest entities by what reaches listeners and the recorder
+                row[3][entity_id] += 1
             return False
 
         @callback
         def changed(data: Any) -> bool:
-            # The same value with other attributes is still a write that
-            # changed nothing a user sees as the entity's state
+            # The same state with other attributes still reaches every
+            # listener and the recorder like a change
             old, new = data["old_state"], data["new_state"]
             same = old is not None and new is not None and old.state == new.state
             return count(data["entity_id"], 2 if same else 0)
@@ -220,7 +248,14 @@ class Insights:
         def never(_event: Any) -> None:
             """Only the filters do the work."""
 
+        @callback
+        def registry_updated(_event: Any) -> None:
+            platforms.clear()
+
         self._unsub_states = [
+            self.hass.bus.async_listen(
+                er.EVENT_ENTITY_REGISTRY_UPDATED, registry_updated
+            ),
             self.hass.bus.async_listen(
                 EVENT_STATE_CHANGED, never, event_filter=changed
             ),
@@ -238,15 +273,18 @@ class Insights:
         if original is None:
             return
         sampler = self.sampler
+        active = self._wakeup_active = [True]
 
         def process_self_data(data: bytes) -> None:
-            sampler.loop_drained()
+            if active[0]:
+                sampler.loop_drained()
             original(data)
 
         self._wakeup_hook = process_self_data
         loop._process_self_data = process_self_data  # type: ignore[attr-defined]  # noqa: SLF001
 
     def _unhook_wakeup_reads(self) -> None:
+        self._wakeup_active[0] = False
         loop = self.hass.loop
         if (hook := self._wakeup_hook) is not None:
             if vars(loop).get("_process_self_data") is hook:
@@ -297,6 +335,16 @@ class Insights:
                 now,
             )
             writes.clear()
+        self.collector.add_blocks(
+            [
+                BlockRecord(
+                    block.blocker[0], block.blocker[1], block.duration_ns, block.at
+                )
+                for block in self.loop_timing.drain_blocks()
+                if block.blocker is not None
+            ],
+            now,
+        )
         self.collector.add_callbacks(
             [
                 CallbackRecord(
@@ -326,28 +374,60 @@ class Insights:
     def callback_domain(self, label: str, entry_id: str | None) -> str:
         """Return the integration a timed callback ran for.
 
-        The config entry in the callback's context decides; without one the
-        module of the function or class does. A platform's own code without
-        an entry is core: it runs for whoever registered the entity.
+        The module of the function or class decides, as for samples. Core,
+        platform base classes and shared libraries go to the config entry in
+        the callback's context, which Home Assistant sets for an entry's
+        setup and everything started from it.
         """
-        if entry_id is not None:
-            if (domain := self._entry_domains.get(entry_id)) is None:
-                entry = self.hass.config_entries.async_get_entry(entry_id)
-                domain = self._entry_domains[entry_id] = (
-                    entry.domain if entry is not None else ""
-                )
-            if domain:
-                return domain
-        if label.endswith("._read_from_self"):
-            # The loop reading its wakeup socket: mostly the sampler's signals
-            return DOMAIN
+        # The integration whose code it is decides, as for samples
         domain = module_domain(label)
-        if domain is None:
-            # A library that only one loaded integration requires
-            return self.collector.library_map.get(top_package(label), "core")
-        if domain in self._platforms:
-            return "core"
-        return domain
+        if domain is not None and domain not in self._platforms:
+            return domain
+        if domain is None and (
+            mapped := self.collector.library_map.get(top_package(label))
+        ):
+            return mapped
+        # Core, a platform base class or a shared library: the config entry
+        # it runs for, if there is one
+        return self._entry_domain(entry_id) or "core"
+
+    def _entry_domain(self, entry_id: str | None) -> str | None:
+        if entry_id is None:
+            return None
+        if (domain := self._entry_domains.get(entry_id)) is None:
+            entry = self.hass.config_entries.async_get_entry(entry_id)
+            domain = self._entry_domains[entry_id] = (
+                entry.domain if entry is not None else ""
+            )
+        return domain or None
+
+    def _blocker(self, frame: Any) -> tuple[str, str] | None:
+        """Name the integration whose code a frame of the loop thread runs.
+
+        Runs in the watchdog thread while a callback blocks the loop. During
+        a memory snapshot the loop waits for the walk's executor thread, so
+        whatever runs then is not to blame.
+        """
+        if self._snapshot_running or frame is None:
+            return None
+        record = self.sampler.walk(frame, 0)
+        domain: str | None = record.domain
+        if domain in ("core", "idle"):
+            domain = next(
+                (
+                    self.collector.library_map[library]
+                    for library in record.libraries
+                    if library in self.collector.library_map
+                ),
+                None,
+            )
+        if domain is None or domain == DOMAIN:
+            return None
+        index = max(record.self_index, 0)
+        code = record.frames[2 * index] if record.frames else None
+        if code is None:
+            return domain, ""
+        return domain, f"{short_path(code.co_filename)} {code.co_qualname}"
 
     async def _async_poll_threads(self, skip: set[int]) -> None:
         try:
@@ -424,6 +504,15 @@ class Insights:
             "samples_lost": sampler.lost,
             "backoffs": sampler.backoffs,
             "executor_jobs_total": self.background.jobs_total,
+            "timing_cpu_ms_per_min": round(
+                self.loop_timing.overhead_ns
+                / 1e6
+                / max((time.monotonic() - self.started) / 60, 1 / 60),
+                1,
+            )
+            if self.sampler.installed
+            else 0,
+            "timing_errors": self.loop_timing.errors,
             "running_minutes": round((time.monotonic() - self.started) / 60, 1)
             if self.sampler.installed
             else 0,
@@ -541,9 +630,13 @@ class Insights:
                 self.hass, make_callable_owner(library_map), module_owner
             )
             roots, stoppers = heap_roots(self.hass, heap_owner, module_owner)
-            heap, walk_ms = await self.hass.async_add_executor_job(
-                account_heap, roots, stoppers, heap_owner
-            )
+            self._snapshot_running = True
+            try:
+                heap, walk_ms = await self.hass.async_add_executor_job(
+                    account_heap, roots, stoppers, heap_owner
+                )
+            finally:
+                self._snapshot_running = False
             del roots, stoppers
             process = await self.hass.async_add_executor_job(read_process)
             snapshot = Snapshot(dt_util.utcnow(), walk_ms, process, heap, resources)

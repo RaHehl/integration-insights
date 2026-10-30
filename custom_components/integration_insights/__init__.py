@@ -32,6 +32,7 @@ async def async_setup_entry(
             translation_domain=DOMAIN, translation_key="not_supported"
         )
     insights = Insights(hass)
+    entry.async_on_unload(insights.stop)
     try:
         insights.start()
     except SamplerError as err:
@@ -41,7 +42,6 @@ async def async_setup_entry(
             translation_placeholders={"error": str(err)},
         ) from err
     entry.runtime_data = insights
-    entry.async_on_unload(insights.stop)
     version = async_get_loaded_integration(hass, DOMAIN).version
     await panel.async_register_panel(hass, str(version))
     entry.async_on_unload(lambda: panel.async_remove_panel(hass))

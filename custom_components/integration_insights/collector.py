@@ -13,6 +13,7 @@ from .sampler import Record
 
 TOP_CALLBACKS = 5
 TOP_STATE_ENTITIES = 5
+MAX_STATE_ENTITIES_PER_MINUTE = 100
 
 WINDOW_MINUTES = 60
 MAX_STACKS_PER_MINUTE = 500
@@ -38,6 +39,15 @@ class StateWrites(NamedTuple):
     reports: int  # writes that changed nothing
     attributes_only: int  # writes with the same value and other attributes
     entities: Counter[str]
+
+
+class BlockRecord(NamedTuple):
+    """A callback that held the loop, named by the code that ran during it."""
+
+    domain: str
+    function: str
+    duration_ns: int
+    at: float
 
 
 class CallbackRecord(NamedTuple):
@@ -82,11 +92,19 @@ class _Domain:
     longest_ns: int = 0
     longest_at: float = 0.0
     longest_label: str = ""
+    # The longest block of the loop while this integration's code ran
+    block_ns: int = 0
+    block_at: float = 0.0
+    block_function: str = ""
     # State writes of the integration's entities: with and without a change
     state_changes: int = 0
     state_reports: int = 0
     state_attributes_only: int = 0
     state_entities: Counter[str] = field(default_factory=Counter)
+
+    def note_block(self, ns: int, at: float, function: str) -> None:
+        if ns > self.block_ns:
+            self.block_ns, self.block_at, self.block_function = ns, at, function
 
     def note_longest(self, ns: int, at: float, label: str) -> None:
         if ns > self.longest_ns:
@@ -116,6 +134,7 @@ class _Domain:
         self.callbacks.update(other.callbacks)
         self.callback_counts.update(other.callback_counts)
         self.note_longest(other.longest_ns, other.longest_at, other.longest_label)
+        self.note_block(other.block_ns, other.block_at, other.block_function)
         self.state_changes += other.state_changes
         self.state_reports += other.state_reports
         self.state_attributes_only += other.state_attributes_only
@@ -156,6 +175,7 @@ class _Domain:
             or self.state_changes
             or self.state_reports
             or self.state_attributes_only
+            or self.block_ns
         )
 
     @property
@@ -287,6 +307,14 @@ class Collector:
             stats.note_longest(record.max_ns, record.max_at, record.label)
             bucket.loop_wall_ns += record.total_ns
 
+    def add_blocks(self, blocks: list[BlockRecord], now: float) -> None:
+        """Add blocks of the loop that ended before `now`."""
+        bucket = self._bucket(now)
+        for block in blocks:
+            if (stats := bucket.domains.get(block.domain)) is None:
+                stats = bucket.domains[block.domain] = _Domain()
+            stats.note_block(block.duration_ns, block.at, block.function)
+
     def add_state_writes(self, writes: list[StateWrites], now: float) -> None:
         """Add state writes counted before `now`."""
         bucket = self._bucket(now)
@@ -296,7 +324,13 @@ class Collector:
             stats.state_changes += record.changes
             stats.state_reports += record.reports
             stats.state_attributes_only += record.attributes_only
-            stats.state_entities.update(record.entities)
+            entities = stats.state_entities
+            entities.update(record.entities)
+            if len(entities) > 2 * MAX_STATE_ENTITIES_PER_MINUTE:
+                # The panel shows the busiest few, a long tail only costs memory
+                stats.state_entities = Counter(
+                    dict(entities.most_common(MAX_STATE_ENTITIES_PER_MINUTE))
+                )
 
     def add_loop_busy(self, busy_ns: int, now: float) -> None:
         """Add wall time the loop spent outside select() before `now`."""
@@ -527,14 +561,18 @@ class Collector:
                 item["state_writes_per_min"] = round(
                     (changes + reports + attributes_only) / span, 1
                 )
-                item["state_unchanged_per_min"] = round(
-                    (reports + attributes_only) / span, 1
-                )
+                item["state_changes_per_min"] = round(changes / span, 1)
                 item["state_attributes_only_per_min"] = round(attributes_only / span, 1)
+                item["state_repeated_per_min"] = round(reports / span, 1)
             if (block := longest.get(domain)) is not None:
-                item["longest_ms"] = round(block[0] / 1e6, 1)
-                item["longest_at"] = block[1]
-                item["longest_function"] = block[2]
+                if block[0]:
+                    item["longest_ms"] = round(block[0] / 1e6, 1)
+                    item["longest_at"] = block[1]
+                    item["longest_function"] = block[2]
+                if block[3]:
+                    item["blocked_ms"] = round(block[3] / 1e6, 1)
+                    item["blocked_at"] = block[4]
+                    item["blocked_function"] = block[5]
             integrations.append(item)
         return {
             "window_minutes": round(span, 1),
@@ -555,21 +593,22 @@ class Collector:
             "integrations": integrations,
         }
 
-    def _longest(self, now: float, minutes: int) -> dict[str, tuple[int, float, str]]:
-        """Return the longest callback per integration in the window."""
+    def _longest(
+        self, now: float, minutes: int
+    ) -> dict[str, tuple[int, float, str, int, float, str]]:
+        """Return per integration its longest callback and longest block in the window."""
         first_minute = self._first_minute(now, minutes)
-        longest: dict[str, tuple[int, float, str]] = {}
+        longest: dict[str, list[Any]] = {}
         for bucket in self._buckets:
             if bucket.minute < first_minute:
                 continue
             for domain, stats in bucket.domains.items():
-                if stats.longest_ns > longest.get(domain, (0, 0.0, ""))[0]:
-                    longest[domain] = (
-                        stats.longest_ns,
-                        stats.longest_at,
-                        stats.longest_label,
-                    )
-        return longest
+                row = longest.setdefault(domain, [0, 0.0, "", 0, 0.0, ""])
+                if stats.longest_ns > row[0]:
+                    row[0:3] = [stats.longest_ns, stats.longest_at, stats.longest_label]
+                if stats.block_ns > row[3]:
+                    row[3:6] = [stats.block_ns, stats.block_at, stats.block_function]
+        return {domain: tuple(row) for domain, row in longest.items()}
 
     def detail(
         self, domain: str, now: float, started: float, minutes: int = WINDOW_MINUTES
@@ -692,16 +731,21 @@ def _item(domain: str, stats: _Domain, span: float) -> dict[str, Any]:
         writes = stats.state_changes + stats.state_reports + stats.state_attributes_only
         item["state_writes"] = {
             "per_min": round(writes / span, 1),
-            "unchanged_per_min": round(
-                (stats.state_reports + stats.state_attributes_only) / span, 1
-            ),
+            "changes_per_min": round(stats.state_changes / span, 1),
             "attributes_only_per_min": round(stats.state_attributes_only / span, 1),
+            "repeated_per_min": round(stats.state_reports / span, 1),
             "entities": {
                 entity_id: round(count / span, 1)
                 for entity_id, count in _ranked(
                     stats.state_entities, TOP_STATE_ENTITIES
                 )
             },
+        }
+    if stats.block_ns:
+        item["stall"] = {
+            "ms": round(stats.block_ns / 1e6, 1),
+            "at": stats.block_at,
+            "function": stats.block_function,
         }
     if stats.callback_total:
         item["callbacks"] = {

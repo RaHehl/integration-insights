@@ -7,6 +7,7 @@ than a borderline case that is not mentioned.
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 import math
 from typing import Any
 
@@ -30,11 +31,13 @@ JOBS_NOTICE_PER_MIN = 600
 # Wall time on the loop beyond its CPU time: blocking calls or waits for the GIL.
 LOOP_WAIT_NOTICE_MS = 3_000
 LOOP_WAIT_PROBLEM_MS = 12_000
-# One callback that held the loop this long: everything else stood still.
+# The loop stood still this long at a stretch while the integration's code ran.
 LOOP_BLOCK_NOTICE_MS = 2_000
 LOOP_BLOCK_PROBLEM_MS = 10_000
-# State writes per minute. Every write wakes the recorder, the frontend and
-# every listener of the entity; ten a second is a device reporting, not changing.
+# State changes per minute, attribute-only ones included. Each one reaches the
+# recorder, the frontend and every listener of the entity. Ten a second is a
+# device reporting, not changing. Writes that change nothing are cheap and do
+# not count.
 STATE_WRITES_NOTICE_PER_MIN = 600
 STATE_WRITES_PROBLEM_PER_MIN = 3_000
 # Shorter windows move too much to judge.
@@ -161,13 +164,15 @@ def _cpu_findings(
     background = item["background_cpu_ms_per_min"]
     background_notice = BACKGROUND_NOTICE_MS * factor
     background_problem = BACKGROUND_PROBLEM_MS * factor
-    longest = item.get("longest_ms", 0)
-    writes = item.get("state_writes_per_min", 0)
+    blocked = item.get("blocked_ms", 0)
+    writes = item.get("state_changes_per_min", 0) + item.get(
+        "state_attributes_only_per_min", 0
+    )
     if (
         loop < LOOP_NOTICE_MS * HOLD
         and background < background_notice * HOLD
         and item.get("jobs_per_min", 0) < JOBS_NOTICE_PER_MIN * factor * HOLD
-        and longest < LOOP_BLOCK_NOTICE_MS * HOLD
+        and blocked < LOOP_BLOCK_NOTICE_MS * HOLD
         and writes < STATE_WRITES_NOTICE_PER_MIN * factor * HOLD
     ):
         return []
@@ -185,7 +190,9 @@ def _cpu_findings(
                 domain,
                 {
                     "per_min": _number(writes),
-                    "unchanged": _number(item.get("state_unchanged_per_min", 0)),
+                    "attributes_only": _number(
+                        item.get("state_attributes_only_per_min", 0)
+                    ),
                     "minutes": minutes,
                 },
                 [
@@ -196,21 +203,20 @@ def _cpu_findings(
                 ],
             )
         )
-    if longest >= LOOP_BLOCK_NOTICE_MS * hold("loop_blocked", domain):
-        callbacks = info.get("callbacks", {})
+    if blocked >= LOOP_BLOCK_NOTICE_MS * hold("loop_blocked", domain):
         findings.append(
             Finding(
                 "loop_blocked",
-                hold.severity("loop_blocked", domain, longest, LOOP_BLOCK_PROBLEM_MS),
+                hold.severity("loop_blocked", domain, blocked, LOOP_BLOCK_PROBLEM_MS),
                 domain,
                 {
-                    "ms": _number(longest),
-                    "function": item.get("longest_function", ""),
+                    "ms": _number(blocked),
+                    "function": item.get("blocked_function", ""),
                     "minutes": minutes,
                 },
                 [
-                    f"{row['function']}: {_rate(row['per_min'])}/min, {_number(row['wall_ms_per_min'])} ms/min"
-                    for row in callbacks.get("by_function", [])[:EVIDENCE_LINES]
+                    f"{item.get('blocked_function', '')}: {_number(blocked)} ms,"
+                    f" ended {_utc(item.get('blocked_at', 0))}"
                 ],
             )
         )
@@ -325,6 +331,10 @@ def _memory_findings(memory: dict[str, Any]) -> list[Finding]:
 
 def _number(value: float) -> str:
     return f"{value:,.0f}"
+
+
+def _utc(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp, UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 def _rate(value: float) -> str:

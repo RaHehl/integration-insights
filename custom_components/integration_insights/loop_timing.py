@@ -7,6 +7,11 @@ its `self`, a HassJob to its target, anything else to its function or
 method and class, each split by the config entry whose context it runs in.
 Unlike the sampler this sees time a callback spends waiting, not only CPU.
 
+A callback times everything that runs inside it, including listeners of
+other integrations it triggers. So a long block is not blamed on the
+callback: a watchdog thread looks at the loop thread's stack while the
+block lasts and names the code that is actually running.
+
 The same code is proposed for Home Assistant's profiler integration
 (home-assistant/core#189557). Once a release has it, this can use the
 profiler's actions instead of its own wrapper.
@@ -14,11 +19,13 @@ profiler's actions instead of its own wrapper.
 
 import asyncio
 from asyncio import events
+from collections import deque
 from collections.abc import Callable
 from functools import partial
-import inspect
+import sys
+import threading
 import time
-from types import MemberDescriptorType, ModuleType
+from types import FrameType, MemberDescriptorType, ModuleType
 from typing import Any, NamedTuple
 
 from homeassistant.config_entries import current_entry
@@ -26,6 +33,10 @@ from homeassistant.core import HassJob
 
 # Only code compiled at runtime can add rows without bound
 MAX_ROWS = 10_000
+# A callback this long is a block: the watchdog looks at the stack
+BLOCK_NS = 1_000_000_000
+WATCHDOG_INTERVAL = 0.25
+MAX_BLOCKS = 100
 
 type _Key = tuple[Any, type | None, str | None]
 _OTHER: _Key = ("other", None, None)
@@ -37,18 +48,37 @@ _HELPER_JOBS = ("_run_job", "job", "_job", "listener_job")
 _TRANSPORT_MODULES = ("asyncio.",)
 
 
+_SLOTS: dict[tuple[type, str], Any] = {}
+
+
 def _static(obj: Any, name: str) -> Any:
-    """Read an attribute without running Python code of the object."""
+    """Read an instance attribute without running Python code of the object.
+
+    The instance dict first, then a slot; the slot descriptor is looked up
+    once per class, since this runs for many callbacks.
+    """
     try:
-        value = inspect.getattr_static(obj, name)
+        value = object.__getattribute__(obj, "__dict__").get(name)
+    except AttributeError:
+        value = None
+    if value is not None:
+        return value
+    cls = type(obj)
+    if (descriptor := _SLOTS.get((cls, name), False)) is False:
+        descriptor = _SLOTS[(cls, name)] = next(
+            (
+                found
+                for klass in cls.__mro__
+                if isinstance(found := vars(klass).get(name), MemberDescriptorType)
+            ),
+            None,
+        )
+    if descriptor is None:
+        return None
+    try:
+        return descriptor.__get__(obj, cls)
     except AttributeError:
         return None
-    if isinstance(value, MemberDescriptorType):
-        try:
-            return value.__get__(obj, type(obj))
-        except AttributeError:
-            return None
-    return value
 
 
 def _unwrap_helper(owner: Any) -> Any:
@@ -81,6 +111,15 @@ class CallbackRecord(NamedTuple):
     max_at: float  # time.time() when the longest run ended
 
 
+class BlockRecord(NamedTuple):
+    """One callback that held the loop for BLOCK_NS or longer."""
+
+    at: float  # time.time() when it ended
+    duration_ns: int
+    callback: str  # label of the callback that was started
+    blocker: tuple[str, str] | None  # (domain, function) from the stack, if seen
+
+
 class _Row:
     """What one owner did on the loop."""
 
@@ -108,16 +147,38 @@ def _label(func: Any, code: Any, cls: type | None, module: str | None) -> str:
 class LoopTiming:
     """Record how long each callback holds the event loop."""
 
-    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
-        """Initialize; start() installs the wrapper."""
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        blocker: Callable[[FrameType | None], tuple[str, str] | None] | None = None,
+    ) -> None:
+        """Initialize; start() installs the wrapper.
+
+        blocker names the code a frame of the loop thread is running, for the
+        watchdog. Without it, blocks are kept without a name.
+        """
         self._loop = loop
+        self._blocker = blocker
         self._rows: dict[_Key, _Row] = {}
+        self._blocks: deque[BlockRecord] = deque(maxlen=MAX_BLOCKS)
+        # Start of the callback running now, and who the watchdog saw in it
+        self._running = [0]
+        self._seen: dict[int, tuple[str, str] | None] = {}
+        self._active = [False]
+        self._overhead = [0]
         self._original: Callable[[Any], None] | None = None
         self._wrapper: Callable[[Any], None] | None = None
+        self._watchdog: threading.Thread | None = None
+        self._stop_watchdog = threading.Event()
         # For the sampler: frames of the wrapper are not an integration's
         self.wrapper_code: Any = None
         self.errors = 0
         self.started_at = 0.0
+
+    @property
+    def overhead_ns(self) -> int:
+        """Return the time the wrapper itself has used, in ns."""
+        return self._overhead[0]
 
     def start(self) -> None:
         """Install the wrapper on Handle._run."""
@@ -126,15 +187,23 @@ class LoopTiming:
         original = events.Handle._run  # noqa: SLF001
         loop = self._loop
         rows = self._rows
+        blocks = self._blocks
+        running = self._running
+        seen = self._seen
+        active = self._active
+        overhead = self._overhead
         perf = time.perf_counter_ns
         wall = time.time
         task_type = asyncio.Task
 
         # One function with everything inline: it runs once per callback
         def _run(handle: Any) -> None:
-            if handle._loop is not loop:  # noqa: SLF001
+            # Once stopped, a wrapper that something else wrapped in turn
+            # stays in the chain; it only passes calls on
+            if not active[0] or handle._loop is not loop:  # noqa: SLF001
                 original(handle)
                 return
+            entered = perf()
             row = None
             key: _Key = _OTHER
             # Nothing in here may escape into the loop, hence one wide try
@@ -210,26 +279,74 @@ class LoopTiming:
                         row = rows[key] = _Row(label)
             except Exception:  # noqa: BLE001
                 self.errors += 1
-            start = perf()
+            outer = running[0]
+            start = running[0] = perf()
             try:
                 original(handle)
             finally:
+                end = perf()
+                running[0] = outer
+                elapsed = end - start
                 if row is not None:
-                    elapsed = perf() - start
                     row.count += 1
                     row.total_ns += elapsed
                     if elapsed > row.max_ns:
                         row.max_ns = elapsed
                         row.max_at = wall()
+                if elapsed >= BLOCK_NS:
+                    blocks.append(
+                        BlockRecord(
+                            wall(),
+                            elapsed,
+                            row.label if row is not None else "?",
+                            seen.pop(start, None),
+                        )
+                    )
+                overhead[0] += (start - entered) + (perf() - end)
 
         self._original = original
         self._wrapper = _run
         self.wrapper_code = _run.__code__
         self.started_at = time.time()
+        self._active[0] = True
         events.Handle._run = _run  # type: ignore[method-assign, assignment]  # noqa: SLF001
+        if self._blocker is not None:
+            self._stop_watchdog.clear()
+            self._watchdog = threading.Thread(
+                target=self._watch,
+                args=(threading.get_ident(),),
+                name="integration_insights watchdog",
+                daemon=True,
+            )
+            self._watchdog.start()
+
+    def _watch(self, loop_thread: int) -> None:
+        """Name the code of a callback that has run for BLOCK_NS, once per callback."""
+        assert self._blocker is not None
+        last = 0
+        while not self._stop_watchdog.wait(WATCHDOG_INTERVAL):
+            start = self._running[0]
+            if not start or start == last:
+                continue
+            if time.perf_counter_ns() - start < BLOCK_NS:
+                continue
+            last = start
+            try:
+                frame = sys._current_frames().get(loop_thread)  # noqa: SLF001
+                self._seen[start] = self._blocker(frame)
+            except Exception:  # noqa: BLE001
+                self.errors += 1
+            # Entries of callbacks that ended between the check and here
+            if len(self._seen) > MAX_BLOCKS:
+                self._seen.clear()
 
     def stop(self) -> None:
-        """Remove the wrapper, if it is still in place."""
+        """Remove the wrapper, if it is still in place, and stop the watchdog."""
+        self._active[0] = False
+        self._stop_watchdog.set()
+        if self._watchdog is not None:
+            self._watchdog.join(timeout=1)
+            self._watchdog = None
         if self._wrapper is None:
             return
         if events.Handle._run is self._wrapper:  # noqa: SLF001
@@ -253,3 +370,9 @@ class LoopTiming:
         ]
         rows.clear()
         return records
+
+    def drain_blocks(self) -> list[BlockRecord]:
+        """Return the blocks since the last drain."""
+        blocks = list(self._blocks)
+        self._blocks.clear()
+        return blocks

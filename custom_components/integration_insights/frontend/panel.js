@@ -664,11 +664,16 @@ class IntegrationInsightsPanel extends HTMLElement {
     if (item.state_writes) {
       const sw = item.state_writes;
       lines.push(
-        `State writes: ${sw.per_min} per min, ${sw.unchanged_per_min} with the same value, ${sw.attributes_only_per_min || 0} of them changed only attributes`
+        `State writes: ${sw.per_min} per min, ${sw.changes_per_min} changes, ${sw.attributes_only_per_min} attributes only, ${sw.repeated_per_min} repeated`
       );
       for (const [entityId, value] of Object.entries(sw.entities)) {
         lines.push(`- ${entityId}: ${value} per min`);
       }
+    }
+    if (item.stall) {
+      lines.push(
+        `Event loop stood still: ${item.stall.ms} ms at ${isoTime(item.stall.at)}, running ${item.stall.function}`
+      );
     }
     if (item.callbacks) {
       const cb = item.callbacks;
@@ -789,7 +794,9 @@ class IntegrationInsightsPanel extends HTMLElement {
     const sampler = report.sampler;
     const samplesPerMinute = report.samples / Math.max(report.window_minutes, 1 / 60);
     const samplerCost = (sampler.handler_cpu_us_avg * samplesPerMinute) / 1000;
-    const problems = sampler.samples_lost + sampler.handler_errors;
+    // Timing every callback is measured exactly; part of it also shows as core in the samples.
+    const timingCost = sampler.timing_cpu_ms_per_min || 0;
+    const problems = sampler.samples_lost + sampler.handler_errors + (sampler.timing_errors || 0);
     const integrations = report.integrations;
     // The sampler's own time is never sampled, so it is added to what this integration does.
     const ownWork = integrations.find((item) => item.domain === "integration_insights")?.cpu_ms_per_min || 0;
@@ -810,11 +817,11 @@ class IntegrationInsightsPanel extends HTMLElement {
         <div class="value">${report.window_minutes} min</div>
         <div class="sub">${report.samples.toLocaleString()} samples</div></div>
       <div class="tile"><div class="label">Measuring costs</div>
-        <div class="value">${ms(samplerCost + ownWork)} ms/min</div>
-        <div class="sub">sampling ${ms(samplerCost)} · own work ${ms(ownWork)}</div></div>
+        <div class="value">${ms(samplerCost + timingCost + ownWork)} ms/min</div>
+        <div class="sub">sampling ${ms(samplerCost)} · timing ${ms(timingCost)} · own work ${ms(ownWork)}</div></div>
       <div class="tile${problems ? " warn" : ""}"><div class="label">Sampler</div>
         <div class="value">${problems ? `${problems} problems` : "OK"}</div>
-        <div class="sub">lost ${sampler.samples_lost} · errors ${sampler.handler_errors} · slowdowns ${sampler.backoffs}</div></div>
+        <div class="sub">lost ${sampler.samples_lost} · errors ${sampler.handler_errors + (sampler.timing_errors || 0)} · slowdowns ${sampler.backoffs}</div></div>
     </div>`;
 
     if (!integrations.length) {
@@ -870,21 +877,24 @@ class IntegrationInsightsPanel extends HTMLElement {
     const integrations = report.integrations
       .filter((item) => item.state_writes_per_min)
       .sort((a, b) => b.state_writes_per_min - a.state_writes_per_min);
-    const total = integrations.reduce((sum, item) => sum + item.state_writes_per_min, 0);
-    const unchanged = integrations.reduce((sum, item) => sum + item.state_unchanged_per_min, 0);
-    const attributesOnly = integrations.reduce((sum, item) => sum + (item.state_attributes_only_per_min || 0), 0);
-    const share = total ? Math.round((unchanged / total) * 100) : 0;
+    const sum = (key) => integrations.reduce((total, item) => total + (item[key] || 0), 0);
+    const changes = sum("state_changes_per_min");
+    const attributesOnly = sum("state_attributes_only_per_min");
+    const repeated = sum("state_repeated_per_min");
     const busiest = integrations[0];
     const tiles = `<div class="summary">
-      <div class="tile"><div class="label">State writes</div>
-        <div class="value">${ms(total)} per min</div>
-        <div class="sub">every write wakes the recorder, the dashboard and the entity's listeners</div></div>
-      <div class="tile"><div class="label">Same value</div>
-        <div class="value">${ms(unchanged)} per min</div>
-        <div class="sub">${share} % of all writes · ${ms(attributesOnly)} of them changed only attributes</div></div>
+      <div class="tile"><div class="label">Changes</div>
+        <div class="value">${ms(changes)} per min</div>
+        <div class="sub">the state changed. Recorded, sent to the dashboard and every listener</div></div>
+      <div class="tile"><div class="label">Attributes only</div>
+        <div class="value">${ms(attributesOnly)} per min</div>
+        <div class="sub">same state, other attributes. Costs as much as a change</div></div>
+      <div class="tile"><div class="label">Repeated</div>
+        <div class="value">${ms(repeated)} per min</div>
+        <div class="sub">nothing changed. Cheap, only the last reported time moves</div></div>
       <div class="tile"><div class="label">Busiest</div>
-        <div class="value">${busiest ? escapeHtml(this._data.names[busiest.domain] || busiest.domain) : "–"}</div>
-        <div class="sub">${busiest ? `${ms(busiest.state_writes_per_min)} per min` : "no state writes yet"}</div></div>
+        <div class="value">${busiest ? escapeHtml(this._data.names[busiest.domain] || busiest.domain) : "none"}</div>
+        <div class="sub">${busiest ? `${ms(busiest.state_writes_per_min)} writes per min` : "no state writes yet"}</div></div>
       <div class="tile"><div class="label">Window</div>
         <div class="value">${report.window_minutes} min</div>
         <div class="sub">counted at the event bus, exactly</div></div>
@@ -898,7 +908,6 @@ class IntegrationInsightsPanel extends HTMLElement {
         const expanded = this._expanded.has(item.domain);
         const name = this._data.names[item.domain] || item.domain;
         const width = Math.max((item.state_writes_per_min / top) * 100, 1);
-        const itemShare = Math.round((item.state_unchanged_per_min / item.state_writes_per_min) * 100);
         return `<div class="row states" data-action="toggle" data-value="${escapeHtml(item.domain)}" role="button" tabindex="0" aria-expanded="${expanded}">
             <div class="name">
               <div class="title"><svg class="chev" viewBox="0 0 24 24"><path fill="currentColor" d="M8.59,16.58L13.17,12L8.59,7.41L10,6L16,12L10,18L8.59,16.58Z"></path></svg>
@@ -906,18 +915,18 @@ class IntegrationInsightsPanel extends HTMLElement {
               <div class="domain">${escapeHtml(item.domain)}</div>
               <div class="bar" style="width:${width.toFixed(1)}%"></div>
             </div>
-            <div class="num">${ms(item.state_writes_per_min)}</div>
-            <div class="num">${ms(item.state_unchanged_per_min)}</div>
-            <div class="num">${itemShare} %</div>
+            <div class="num">${ms(item.state_changes_per_min || 0)}</div>
+            <div class="num">${ms(item.state_attributes_only_per_min || 0)}</div>
+            <div class="num">${ms(item.state_repeated_per_min || 0)}</div>
           </div>${expanded ? this._renderStateDetail(item) : ""}`;
       })
       .join("");
     const updated = this._updated ? this._updated.toLocaleTimeString() : "";
     return `${tiles}<div class="card">
-        <div class="card-head states"><div>Integration</div><div class="num">Writes/min</div><div class="num">Same value</div><div class="num">Share</div></div>
+        <div class="card-head states"><div>Integration</div><div class="num">Changes</div><div class="num">Attributes</div><div class="num">Repeated</div></div>
         ${rows}
       </div>
-      <div class="footer">State writes per minute, counted at the event bus. "Same value" writes keep the state, with or without new attributes; they still wake the recorder, the dashboard and every automation watching the entity. Updated ${updated}</div>`;
+      <div class="footer">State writes per minute, counted exactly at the event bus. Changes and attribute-only changes reach the recorder, the dashboard and every automation that watches the entity. Repeated writes do not. Updated ${updated}</div>`;
   }
 
   _renderStateDetail(brief) {
@@ -933,7 +942,7 @@ class IntegrationInsightsPanel extends HTMLElement {
           `<span class="chip" title="${escapeHtml(entityId)}">${escapeHtml(names[entityId] || entityId)} · ${value}/min</span>`
       )
       .join("");
-    return `<div class="detail"><p class="note">${sw.per_min} writes per minute: ${sw.unchanged_per_min} kept the value, ${sw.attributes_only_per_min || 0} of them changed only attributes.</p><h3>Busiest entities</h3><div class="pairs">${chips}</div></div>`;
+    return `<div class="detail"><p class="note">${sw.per_min} writes per minute: ${sw.changes_per_min} changes, ${sw.attributes_only_per_min} changed only attributes, ${sw.repeated_per_min} repeated.</p><h3>Most changes</h3><div class="pairs">${chips}</div></div>`;
   }
 
   _sortHeader(key, label, extra = "") {
@@ -1052,7 +1061,7 @@ class IntegrationInsightsPanel extends HTMLElement {
         <div class="card-head mem"><div>Owner</div><div class="num">KiB</div><div class="num">Data KiB</div><div class="num">Listeners</div><div class="num col-wide">Timers</div><div class="num col-wide">Tasks</div></div>
         ${rows}
       </div>
-      <div class="footer">Every Python object counted once, for the first owner that holds it: integrations through their config entries, hass.data and entities; code per module; then Home Assistant core. Sizes are shallow, so memory held by native code shows only in "Outside Python objects".</div>`;
+      <div class="footer">Every Python object is counted once, for the first owner that holds it. Integrations come first, through their config entries, hass.data and entities. Then code per module, then Home Assistant core. Sizes are shallow, so memory held by native code shows only in "Outside Python objects".</div>`;
   }
 
   _renderDetail(brief) {
@@ -1078,7 +1087,12 @@ class IntegrationInsightsPanel extends HTMLElement {
         .map(([entityId, value]) => `<span class="chip">${escapeHtml(entityId)} · ${value}/min</span>`)
         .join("");
       parts.push(
-        `<h3>State writes</h3><p class="note">${sw.per_min} state updates per minute, ${sw.unchanged_per_min} of them with the same value, ${sw.attributes_only_per_min || 0} changing only attributes.</p><div class="pairs">${chips}</div>`
+        `<h3>State writes</h3><p class="note">${sw.per_min} writes per minute: ${sw.changes_per_min} changes, ${sw.attributes_only_per_min} changed only attributes, ${sw.repeated_per_min} repeated. Most changes:</p><div class="pairs">${chips}</div>`
+      );
+    }
+    if (item.stall) {
+      parts.push(
+        `<h3>Event loop stood still</h3><p class="note">${ms(item.stall.ms)} ms at a stretch, ended ${escapeHtml(localTime(item.stall.at))}. Running at that moment: <span class="code">${escapeHtml(item.stall.function)}</span>.</p>`
       );
     }
     if (item.callbacks) {

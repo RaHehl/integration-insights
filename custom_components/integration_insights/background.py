@@ -73,6 +73,7 @@ class Background:
         self.jobs: deque[JobRecord] = deque(maxlen=MAX_PENDING_JOBS)
         self.jobs_total = 0
         self._hooked: list[tuple[Executor, Callable[..., Future[Any]]]] = []
+        self._active = [False]
         self._thread_cpu: dict[int, int] = {}
         self._thread_owners: dict[int, tuple[threading.Thread, Owner | None]] = {}
         self._primed = False
@@ -84,8 +85,13 @@ class Background:
         original = executor.submit
         resolve = self.resolve
         jobs = self.jobs
+        active = self._active
 
         def submit(fn: Any, /, *args: Any, **kwargs: Any) -> Future[Any]:
+            # Once unhooked, a hook that something else wrapped in turn
+            # stays in the chain; it only passes jobs on
+            if not active[0]:
+                return original(fn, *args, **kwargs)
             try:
                 owner, label = resolve(fn, sys._getframe(1))  # noqa: SLF001
             except Exception:  # noqa: BLE001
@@ -94,11 +100,14 @@ class Background:
             self.jobs_total += 1
             return original(_timed, jobs, owner, label, fn, args, kwargs)
 
+        active[0] = True
         executor.submit = submit  # type: ignore[method-assign]
         self._hooked.append((executor, submit))
 
     def unhook_executors(self) -> None:
         """Remove the hooks that are still in place."""
+        self._active[0] = False
+        self._active = [False]
         for executor, submit in self._hooked:
             if vars(executor).get("submit") is submit:
                 del executor.submit
@@ -356,6 +365,7 @@ class LoopWait:
         self.wrapper_code: CodeType | None = None
         self._selector: Any = None
         self._hook: Callable[..., Any] | None = None
+        self._active = [False]
 
     def install(self, loop: Any) -> bool:
         """Wrap the loop's selector; return whether it worked."""
@@ -364,8 +374,11 @@ class LoopWait:
         if selector is None or original is None:
             return False
         perf = time.perf_counter_ns
+        active = self._active = [True]
 
         def select(timeout: float | None = None) -> Any:
+            if not active[0]:
+                return original(timeout)
             start = perf()
             try:
                 return original(timeout)
@@ -380,6 +393,7 @@ class LoopWait:
 
     def uninstall(self) -> None:
         """Remove the wrapper if it is still in place."""
+        self._active[0] = False
         if self._selector is not None and vars(self._selector).get("select") is (
             self._hook
         ):

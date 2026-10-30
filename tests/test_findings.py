@@ -433,56 +433,52 @@ def test_many_cheap_jobs_are_found() -> None:
 
 
 def test_one_long_block_is_found_at_once() -> None:
-    """A single callback that stopped the loop is named, no rate needed."""
+    """A stop of the loop is named by the code that ran, no rate needed."""
     item = {
         **_item("foo"),
-        "longest_ms": 3_200,
-        "longest_at": 1.0,
-        "longest_function": "custom_components.foo.api.Client.fetch",
+        "blocked_ms": 3_200,
+        "blocked_at": 1_700_000_000.0,
+        "blocked_function": "custom_components/foo/api.py Client.fetch",
+        # A long callback alone is not enough: its own code may have waited
+        "longest_ms": 9_000,
     }
-    detail = _detail(
-        callbacks={
-            "wall_ms_per_min": 400,
-            "per_min": 3,
-            "longest_ms": 3_200,
-            "longest_at": 1.0,
-            "longest_function": "custom_components.foo.api.Client.fetch",
-            "by_function": [
-                {
-                    "function": "custom_components.foo.api.Client.fetch",
-                    "wall_ms_per_min": 400,
-                    "per_min": 0.3,
-                }
-            ],
-        }
-    )
+    detail = _detail()
     findings = find(_summary([item]), lambda _: detail, {})
     assert _keys(findings) == [("loop_blocked", NOTICE, "foo")]
     assert findings[0].values == {
         "ms": "3,200",
-        "function": "custom_components.foo.api.Client.fetch",
+        "function": "custom_components/foo/api.py Client.fetch",
         "minutes": "15",
     }
     assert findings[0].evidence == [
-        "custom_components.foo.api.Client.fetch: 0.3/min, 400 ms/min"
+        "custom_components/foo/api.py Client.fetch: 3,200 ms,"
+        " ended 2023-11-14 22:13:20 UTC"
     ]
-    assert find(_summary([{**item, "longest_ms": 1_999}]), lambda _: detail, {}) == []
+    assert find(_summary([{**item, "blocked_ms": 1_999}]), lambda _: detail, {}) == []
     assert _keys(
-        find(_summary([{**item, "longest_ms": 12_000}]), lambda _: detail, {})
+        find(_summary([{**item, "blocked_ms": 12_000}]), lambda _: detail, {})
     ) == [("loop_blocked", PROBLEM, "foo")]
+    unnamed = {
+        key: value for key, value in item.items() if not key.startswith("blocked")
+    }
+    assert find(_summary([unnamed]), lambda _: detail, {}) == []
 
 
 def test_too_many_state_writes_are_found() -> None:
-    """Ten state writes a second is a device reporting, not changing."""
+    """Ten state changes a second is a device reporting, not changing."""
     item = {
         **_item("foo"),
-        "state_writes_per_min": 1_231,
-        "state_unchanged_per_min": 1_100,
+        "state_writes_per_min": 5_231,
+        "state_changes_per_min": 131,
+        "state_attributes_only_per_min": 1_100,
+        "state_repeated_per_min": 4_000,
     }
     detail = _detail(
         state_writes={
-            "per_min": 1_231,
-            "unchanged_per_min": 1_100,
+            "per_min": 5_231,
+            "changes_per_min": 131,
+            "attributes_only_per_min": 1_100,
+            "repeated_per_min": 4_000,
             "entities": {"sensor.foo_power": 900.4, "sensor.foo_temp": 300},
         }
     )
@@ -490,15 +486,20 @@ def test_too_many_state_writes_are_found() -> None:
     assert _keys(findings) == [("busy_states", NOTICE, "foo")]
     assert findings[0].values == {
         "per_min": "1,231",
-        "unchanged": "1,100",
+        "attributes_only": "1,100",
         "minutes": "15",
     }
     assert findings[0].evidence == [
         "sensor.foo_power: 900/min",
         "sensor.foo_temp: 300/min",
     ]
+    # Repeated writes change nothing and are cheap
     assert (
-        find(_summary([{**item, "state_writes_per_min": 599}]), lambda _: detail, {})
+        find(
+            _summary([{**item, "state_attributes_only_per_min": 468}]),
+            lambda _: detail,
+            {},
+        )
         == []
     )
     # Built-in integrations such as mqtt write state for what the user wired up
@@ -510,5 +511,5 @@ def test_too_many_state_writes_are_found() -> None:
     )
     assert built_in == []
     assert _keys(
-        find(_summary([{**item, "state_writes_per_min": 4_000}]), lambda _: detail, {})
+        find(_summary([{**item, "state_changes_per_min": 3_000}]), lambda _: detail, {})
     ) == [("busy_states", PROBLEM, "foo")]

@@ -91,6 +91,21 @@ def test_executor_jobs_are_timed_and_unhooked() -> None:
     assert background.drain_jobs() == []
 
 
+def test_unhooked_executor_below_another_hook_passes_jobs_on() -> None:
+    """Another tool wrapped the hook: after unhooking, jobs run untimed."""
+    background = _background()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        background.hook_executor(executor)
+        ours = executor.submit
+        executor.submit = lambda fn, *args: ours(fn, *args)  # type: ignore[method-assign]
+        background.unhook_executors()
+        # Not ours on top: the other hook stays in place
+        assert "submit" in vars(executor)
+        assert executor.submit(sum, [1, 2]).result() == 3
+    assert background.jobs_total == 0
+    assert background.drain_jobs() == []
+
+
 def test_job_exception_is_kept() -> None:
     """A failing job raises as before and is still recorded."""
     background = _background()
