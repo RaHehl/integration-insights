@@ -10,6 +10,7 @@ import signal
 import socket
 import subprocess
 import sys
+import time
 from unittest.mock import patch
 
 import pytest
@@ -191,7 +192,9 @@ def test_long_c_call_sends_one_signal() -> None:
     sampler = Sampler(interval_ns=1_000_000)
     sampler.install()
     try:
+        before = time.thread_time_ns()
         hashlib.pbkdf2_hmac("sha256", b"x", b"y", 1_000_000)
+        spent = time.thread_time_ns() - before
         sum(range(10))  # the handler runs between bytecodes
     finally:
         sampler.uninstall()
@@ -204,7 +207,7 @@ def test_long_c_call_sends_one_signal() -> None:
     theirs.close()
     assert sampler.count == received == 1
     # The whole call is one sample, weighted with its CPU
-    assert sampler.drain(0)[0][0].cpu_ns > 0.3e9
+    assert sampler.drain(0)[0][0].cpu_ns >= 0.9 * spent
 
 
 def _hook_drain(loop: asyncio.AbstractEventLoop, sampler: Sampler) -> None:

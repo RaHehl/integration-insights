@@ -302,7 +302,9 @@ async def test_findings_wait_for_home_assistant_to_settle(hass: HomeAssistant) -
 
     with patch(
         "custom_components.integration_insights.insights.time.monotonic",
-        return_value=started + 6 * 60,
+        # A second more, or float rounding of a large monotonic clock lands
+        # just below six minutes
+        return_value=started + 6 * 60 + 1,
     ):
         assert _keys(insights.findings()) == [("measuring", INFO, None)]
         assert insights.findings()[0].values == {"minutes": "5"}
