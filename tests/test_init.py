@@ -19,8 +19,8 @@ from custom_components.integration_insights.attribution import Packages
 from custom_components.integration_insights.const import DOMAIN
 from custom_components.integration_insights.sampler import is_supported
 from homeassistant.config_entries import ConfigEntryState
-from homeassistant.const import EVENT_HOMEASSISTANT_STOP
-from homeassistant.core import HomeAssistant
+from homeassistant.const import EVENT_HOMEASSISTANT_STARTED, EVENT_HOMEASSISTANT_STOP
+from homeassistant.core import CoreState, HomeAssistant
 from homeassistant.setup import async_setup_component
 
 from .helpers import spin_at
@@ -187,18 +187,40 @@ async def test_library_map_looks_up_seen_libraries(hass: HomeAssistant) -> None:
         assert insights.collector.library_map == {"aiofoo": "foo", "aiobar": "bar"}
         assert "aiobar" in looked_up
         assert "aiofoo" not in looked_up
-        looked_up.clear()
-
-        # A new component right after a map does not map everything again
-        hass.config.top_level_components.add("baz")
-        insights._async_drain()  # noqa: SLF001
-        await hass.async_block_till_done(wait_background_tasks=True)
-        assert looked_up == []
-        with patch(
-            "custom_components.integration_insights.insights.time.monotonic",
-            return_value=insights._mapped_at + 61,  # noqa: SLF001
-        ):
-            insights._async_drain()  # noqa: SLF001
-        await hass.async_block_till_done(wait_background_tasks=True)
-        assert {"foo", "bar", "baz"} <= insights._mapped_components  # noqa: SLF001
     assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@linux_only
+async def test_measuring_waits_for_home_assistant_to_start(
+    hass: HomeAssistant,
+) -> None:
+    """Nothing is measured while integrations set up; the start event begins it."""
+    hass.set_state(CoreState.starting)
+    entry = MockConfigEntry(domain=DOMAIN)
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    insights = entry.runtime_data
+    assert signal.getsignal(signal.SIGPROF) is signal.SIG_DFL
+    assert [f.key for f in insights.findings()] == ["measuring"]
+    assert insights.summary()["sampler"]["running_minutes"] == 0
+
+    hass.set_state(CoreState.running)
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+    await hass.async_block_till_done()
+    assert signal.getsignal(signal.SIGPROF) is not signal.SIG_DFL
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    assert signal.getsignal(signal.SIGPROF) is signal.SIG_DFL
+
+
+@linux_only
+async def test_unload_before_start_is_clean(hass: HomeAssistant) -> None:
+    """Unloading while still waiting for the start installs nothing later."""
+    hass.set_state(CoreState.starting)
+    entry = MockConfigEntry(domain=DOMAIN)
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    hass.set_state(CoreState.running)
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+    await hass.async_block_till_done()
+    assert signal.getsignal(signal.SIGPROF) is signal.SIG_DFL

@@ -8,6 +8,7 @@ and never released, such as event listeners, timers and tasks.
 import asyncio
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
 import functools
@@ -133,10 +134,8 @@ def _available_mib() -> float | None:
         available.append(int(meminfo["MemAvailable"].split()[0]) / _KIB)
     except OSError, ValueError, KeyError:
         pass
-    try:
+    with suppress(OSError, ValueError, IndexError):
         available.extend(_cgroup_available_mib(_cgroup_dir()))
-    except OSError, ValueError, IndexError:
-        pass
     return min(available) if available else None
 
 

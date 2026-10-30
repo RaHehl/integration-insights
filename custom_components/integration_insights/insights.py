@@ -11,8 +11,8 @@ import time
 from typing import Any
 
 from homeassistant.config_entries import current_entry
-from homeassistant.const import EVENT_HOMEASSISTANT_STOP
-from homeassistant.core import CALLBACK_TYPE, Event, HomeAssistant, callback
+from homeassistant.const import EVENT_HOMEASSISTANT_STARTED, EVENT_HOMEASSISTANT_STOP
+from homeassistant.core import CALLBACK_TYPE, CoreState, Event, HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.loader import IntegrationNotLoaded, async_get_loaded_integration
@@ -46,9 +46,6 @@ KEPT_SNAPSHOTS = 10
 STARTUP_MINUTES = 5
 # Findings shown this long ago no longer hold, see findings.HOLD.
 SHOWN_SECONDS = 120
-# During start-up every drain sees new components; mapping their libraries
-# again each time would cost more than the measurement.
-REMAP_SECONDS = 60
 # Panels stay subscribed across a reload, so the list outlives an instance.
 SUBSCRIBERS_KEY = f"{DOMAIN}_subscribers"
 
@@ -68,7 +65,6 @@ class Insights:
         self.started = 0.0
         self._position = 0
         self._mapped_components: frozenset[str] | None = None
-        self._mapped_at = 0.0
         self._mapping_lock = asyncio.Lock()
         self._packages = Packages()
         self._owners: dict[str, str] = {}
@@ -82,6 +78,7 @@ class Insights:
         self._wakeup_hook: Callable[[bytes], None] | None = None
         self._unsub_drain: CALLBACK_TYPE | None = None
         self._unsub_stop: CALLBACK_TYPE | None = None
+        self._unsub_started: CALLBACK_TYPE | None = None
         self._polling = False
         self._subscribers: list[tuple[int, Callable[[dict[str, Any]], None]]] = (
             hass.data.setdefault(SUBSCRIBERS_KEY, [])
@@ -96,8 +93,31 @@ class Insights:
         executors.append(getattr(self.hass, "import_executor", None))
         return [executor for executor in executors if executor is not None]
 
+    @callback
     def start(self) -> None:
-        """Install the sampler; raises SamplerError."""
+        """Measure from the moment Home Assistant has started; raises SamplerError.
+
+        Integrations setting up and the imports behind them are not the load
+        of a running system, and every new one would have the libraries
+        mapped again. Before the start nothing is measured.
+        """
+        # is_running is also true while starting, so look at the state.
+        if self.hass.state is CoreState.running:
+            self._start()
+            return
+        self._unsub_started = self.hass.bus.async_listen_once(
+            EVENT_HOMEASSISTANT_STARTED, self._async_on_started
+        )
+
+    @callback
+    def _async_on_started(self, _event: Event) -> None:
+        self._unsub_started = None
+        try:
+            self._start()
+        except SamplerError as err:
+            _LOGGER.error("Could not start the sampler: %s", err)
+
+    def _start(self) -> None:
         self.sampler.install()
         self._hook_wakeup_reads()
         for executor in self._executors():
@@ -123,6 +143,9 @@ class Insights:
     @callback
     def stop(self) -> None:
         """Remove the sampler."""
+        if self._unsub_started is not None:
+            self._unsub_started()
+            self._unsub_started = None
         if self._unsub_stop is not None:
             self._unsub_stop()
             self._unsub_stop = None
@@ -178,13 +201,8 @@ class Insights:
                 _LOGGER.warning("Could not re-arm the sampler: %s", err)
                 self._rearm_failed = True
         components = frozenset(self.hass.config.top_level_components)
-        mapped = self._mapped_components
-        if mapped is not None and (
-            components == mapped or time.monotonic() - self._mapped_at < REMAP_SECONDS
-        ):
-            components = mapped
         if not self._mapping_lock.locked() and (
-            components != mapped
+            components != self._mapped_components
             or not self.collector.seen_libraries <= self._checked_libraries
         ):
             self.hass.async_create_background_task(
@@ -256,7 +274,6 @@ class Insights:
             return
         if changed:
             self._mapped_components = components
-            self._mapped_at = time.monotonic()
             self._owners = owners
             self._checked_libraries = libraries
             self.collector.library_map = mapped
@@ -286,7 +303,9 @@ class Insights:
             "samples_lost": sampler.lost,
             "backoffs": sampler.backoffs,
             "executor_jobs_total": self.background.jobs_total,
-            "running_minutes": round((time.monotonic() - self.started) / 60, 1),
+            "running_minutes": round((time.monotonic() - self.started) / 60, 1)
+            if self.sampler.installed
+            else 0,
         }
 
     def _with_devices(self, item: dict[str, Any]) -> dict[str, Any]:
@@ -339,7 +358,9 @@ class Insights:
         """
         self.drain()
         now = time.monotonic()
-        settled = (now - self.started) / 60 - STARTUP_MINUTES
+        # Before the start nothing is measured; count as if it were now.
+        started = self.started if self.sampler.installed else now
+        settled = (now - started) / 60 - STARTUP_MINUTES
         # A window of n minutes starts on a minute boundary up to n + 1
         # minutes ago, so it must be a minute shorter than the settled time
         # to leave the start out.

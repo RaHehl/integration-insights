@@ -19,7 +19,7 @@ Finds the integration that slows Home Assistant down, keeps the CPU busy, or lea
 
 Each finding says what it means and what you can do: check for an update, look at the integration's issue tracker, or disable it for a while to compare. One button copies a report to paste into an issue.
 
-Findings start once Home Assistant has settled, about ten minutes after a start. The thresholds are high on purpose: when the overview says nothing is unusual, there is nothing worth your time.
+Measuring begins once Home Assistant has started, so the set-up of integrations is not counted as load. Findings start about ten minutes later. The thresholds are high on purpose: when the overview says nothing is unusual, there is nothing worth your time.
 
 ## Install
 
@@ -52,7 +52,7 @@ The Memory view walks the Python heap on request and splits it by integration, l
 
 ### Cost
 
-The panel shows its own cost under "Measuring costs". On a Raspberry Pi 3 the whole integration uses about 300 ms of CPU per minute once Home Assistant has started, half a percent of one core, less on faster hardware. During start-up it is higher while it maps libraries to integrations. A memory snapshot takes about half a minute on a Raspberry Pi 3 and needs memory for the walk. It is refused with a reason when memory is short.
+The panel shows its own cost under "Measuring costs". On a Raspberry Pi 3 the whole integration uses about 300 ms of CPU per minute, half a percent of one core, less on faster hardware. A memory snapshot takes about half a minute on a Raspberry Pi 3 and needs memory for the walk. It is refused with a reason when memory is short.
 
 ## Privacy
 
