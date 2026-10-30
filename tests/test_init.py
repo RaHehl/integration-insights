@@ -1,13 +1,17 @@
 """Tests for setup, unload and diagnostics."""
 
 from asyncio.events import Handle
+from datetime import timedelta
 from pathlib import Path
 import signal
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant_custom_component.common import (
+    MockConfigEntry,
+    async_fire_time_changed,
+)
 from pytest_homeassistant_custom_component.components.diagnostics import (
     get_diagnostics_for_config_entry,
 )
@@ -22,7 +26,9 @@ from custom_components.integration_insights.sampler import is_supported
 from homeassistant.config_entries import ConfigEntryState, current_entry
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED, EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import CoreState, HomeAssistant
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.setup import async_setup_component
+from homeassistant.util import dt as dt_util
 
 from .helpers import spin_at
 
@@ -239,7 +245,8 @@ async def test_callbacks_are_timed_and_charged_to_their_entry(
     namespace = {"__name__": "custom_components.blocker.api"}
     exec(  # noqa: S102
         compile(
-            "import time\ndef fetch():\n    time.sleep(0.05)\n",
+            "import time\ndef fetch():\n    time.sleep(0.05)\n"
+            "def poll(_now):\n    time.sleep(0.02)\n",
             "/config/custom_components/blocker/api.py",
             "exec",
         ),
@@ -252,7 +259,11 @@ async def test_callbacks_are_timed_and_charged_to_their_entry(
         hass.loop.call_soon(namespace["fetch"])
     finally:
         current_entry.reset(token)
+    # A YAML integration's timer: no entry, the helper must be looked through
+    unsub = async_track_time_interval(hass, namespace["poll"], timedelta(seconds=30))
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=31))
     await hass.async_block_till_done()
+    unsub()
 
     report = insights.report()
     row = next(item for item in report["integrations"] if item["domain"] == "blocker")
@@ -270,6 +281,10 @@ async def test_callbacks_are_timed_and_charged_to_their_entry(
         if item["domain"] == "blocker"
     )
     assert brief["longest_ms"] == callbacks["longest_ms"]
+    functions = {r["function"] for r in callbacks["by_function"]}
+    assert "custom_components.blocker.api.poll" in functions
+    # The sampler does not blame the timing wrapper for what it wraps
+    assert "integration_insights" not in row["triggered_by"]
     # A callback without an entry context counts for its module
     assert (
         insights.callback_domain("custom_components.hue.light.HueLight.turn_on", None)

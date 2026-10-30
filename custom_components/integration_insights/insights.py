@@ -24,6 +24,7 @@ from .attribution import (
     library_owners,
     module_domain,
     platform_domains,
+    top_package,
 )
 from .background import Background, LoopWait, ThreadRecord
 from .collector import WINDOW_MINUTES, CallbackRecord, Collector
@@ -135,6 +136,7 @@ class Insights:
         if self.loop_wait.install(self.hass.loop):
             self.sampler.select_wrapper = self.loop_wait.wrapper_code
         self.loop_timing.start()
+        self.sampler.skip_codes = frozenset({self.loop_timing.wrapper_code})
         self._wall_ns = time.perf_counter_ns()
         self._waiting_ns = self.loop_wait.waiting_ns
         self.started = time.monotonic()
@@ -169,6 +171,7 @@ class Insights:
         self.loop_wait.uninstall()
         self.loop_timing.stop()
         self.sampler.select_wrapper = None
+        self.sampler.skip_codes = frozenset()
 
     def _hook_wakeup_reads(self) -> None:
         # asyncio's selector loop hands the bytes it read from the wakeup
@@ -270,7 +273,10 @@ class Insights:
             if domain:
                 return domain
         domain = module_domain(label)
-        if domain is None or domain in self._platforms:
+        if domain is None:
+            # A library that only one loaded integration requires
+            return self.collector.library_map.get(top_package(label), "core")
+        if domain in self._platforms:
             return "core"
         return domain
 

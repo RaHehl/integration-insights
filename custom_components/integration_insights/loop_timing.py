@@ -16,8 +16,9 @@ import asyncio
 from asyncio import events
 from collections.abc import Callable
 from functools import partial
+import inspect
 import time
-from types import ModuleType
+from types import MemberDescriptorType, ModuleType
 from typing import Any, NamedTuple
 
 from homeassistant.config_entries import current_entry
@@ -28,6 +29,39 @@ MAX_ROWS = 10_000
 
 type _Key = tuple[Any, type | None, str | None]
 _OTHER: _Key = ("other", None, None)
+# Helpers that run an integration's job from a method of their own; the job
+# is the work, the helper is plumbing.
+_HELPER_MODULES = ("homeassistant.helpers.",)
+_HELPER_JOBS = ("_run_job", "job", "_job", "listener_job")
+# asyncio transports hand data to a protocol; the protocol is the work.
+_TRANSPORT_MODULES = ("asyncio.",)
+
+
+def _static(obj: Any, name: str) -> Any:
+    """Read an attribute without running Python code of the object."""
+    try:
+        value = inspect.getattr_static(obj, name)
+    except AttributeError:
+        return None
+    if isinstance(value, MemberDescriptorType):
+        try:
+            return value.__get__(obj, type(obj))
+        except AttributeError:
+            return None
+    return value
+
+
+def _unwrap_helper(owner: Any) -> Any:
+    """Return the integration's callable behind a helper or transport, or None."""
+    module = type(owner).__module__
+    if module.startswith(_HELPER_MODULES):
+        for name in _HELPER_JOBS:
+            if isinstance(job := _static(owner, name), HassJob):
+                return job.target
+        return None
+    if module.startswith(_TRANSPORT_MODULES):
+        return _static(owner, "_protocol")
+    return None
 
 
 class CallbackRecord(NamedTuple):
@@ -74,6 +108,8 @@ class LoopTiming:
         self._rows: dict[_Key, _Row] = {}
         self._original: Callable[[Any], None] | None = None
         self._wrapper: Callable[[Any], None] | None = None
+        # For the sampler: frames of the wrapper are not an integration's
+        self.wrapper_code: Any = None
         self.errors = 0
         self.started_at = 0.0
 
@@ -125,6 +161,17 @@ class LoopTiming:
                         # A callable instance is charged to its class
                         owner = func
                         func = type(func).__call__
+                    if owner is not None and (
+                        (inner := _unwrap_helper(owner)) is not None
+                    ):
+                        if callable(inner):
+                            func = inner
+                            while isinstance(func, partial):
+                                func = func.func
+                            owner = getattr(func, "__self__", None)
+                        else:
+                            # A protocol object: the transport's method ran for it
+                            owner = inner
                     func = getattr(func, "__func__", func)
                     code = getattr(func, "__code__", None)
                     module = getattr(func, "__module__", None)
@@ -171,6 +218,7 @@ class LoopTiming:
 
         self._original = original
         self._wrapper = _run
+        self.wrapper_code = _run.__code__
         self.started_at = time.time()
         events.Handle._run = _run  # type: ignore[method-assign, assignment]  # noqa: SLF001
 

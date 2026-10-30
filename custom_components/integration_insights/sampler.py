@@ -199,6 +199,8 @@ class Sampler:
         self._since_drain = 0
         # Code of a wrapper around the selector's select(), still idle time.
         self.select_wrapper: Any = None
+        # Code objects of our own wrappers on the loop's path, left out of stacks.
+        self.skip_codes: frozenset[Any] = frozenset()
         self._platforms = platform_domains()
         self._file_cache: dict[str, tuple[int, str | None]] = {}
         self._module_cache: dict[str, str | None] = {}
@@ -335,7 +337,7 @@ class Sampler:
 
         return handler
 
-    def walk(self, frame: FrameType | None, cpu_ns: int) -> Record:
+    def walk(self, frame: FrameType | None, cpu_ns: int) -> Record:  # noqa: C901
         """Classify a stack, innermost frame first."""
         file_cache = self._file_cache
         frames: list[Any] = []
@@ -364,9 +366,13 @@ class Sampler:
             )
         f = frame
         depth = 0
+        skip_codes = self.skip_codes
         while f is not None and depth < MAX_DEPTH:
             depth += 1
             code = f.f_code
+            if code in skip_codes:
+                f = f.f_back
+                continue
             info = file_cache.get(code.co_filename)
             if info is None:
                 info = file_cache[code.co_filename] = classify_file(code.co_filename)
