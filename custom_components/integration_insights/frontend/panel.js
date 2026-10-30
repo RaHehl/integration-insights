@@ -911,7 +911,7 @@ class IntegrationInsightsPanel extends HTMLElement {
       .join("");
     const updated = this._updated ? this._updated.toLocaleTimeString() : "";
     return `${tiles}<div class="card">
-        <div class="card-head states"><div>Integration</div><div class="num">Writes/min</div><div class="num">Unchanged</div><div class="num">Unchanged</div></div>
+        <div class="card-head states"><div>Integration</div><div class="num">Writes/min</div><div class="num">Unchanged</div><div class="num">Share</div></div>
         ${rows}
       </div>
       <div class="footer">State writes per minute, counted at the event bus. "Unchanged" writes set the same state again; they still wake the recorder, the dashboard and every automation watching the entity. Updated ${updated}</div>`;
