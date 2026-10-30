@@ -1,8 +1,9 @@
 """Stack sampler on the event loop thread's CPU clock (Linux, 64-bit).
 
 A POSIX timer on the loop thread's CPU clock sends SIGPROF to that thread after
-every interval of CPU it uses, so an idle loop gets almost no signals. The
-handler walks the interrupted stack and writes one record into a fixed ring.
+an interval of CPU it uses, so an idle loop gets almost no signals. The
+handler walks the interrupted stack, writes one record into a fixed ring and
+sets the timer again.
 Each record carries the loop thread CPU used since the previous record, which
 is its weight: a long C call that holds the GIL still gets its full share.
 """
@@ -42,6 +43,8 @@ MAX_LIBRARIES = 4
 # this many samples were taken without the loop reading the socket, and the
 # timer stops before the socket could fill. The first stage keeps 100 ms of
 # resolution, so the next callback in the same iteration still gets its share.
+# The timer fires once per handler run, so a long C call adds one byte, not
+# one per interval.
 BACKOFF_STAGES: tuple[tuple[int, int], ...] = (
     (32, 100_000_000),
     (96, 1_000_000_000),
@@ -155,11 +158,15 @@ class _CpuClockTimer:
             raise SamplerError(f"timer_create failed: {os.strerror(errno)}")
 
     def arm(self, interval_ns: int) -> None:
+        """Fire once after interval_ns of CPU; 0 stops the timer.
+
+        One shot, not periodic: Python runs the handler only between
+        bytecodes, and a periodic timer would keep sending signals through a
+        long C call, each one a byte in asyncio's wakeup socket.
+        """
         assert _libc is not None and self._timer_id is not None
         spec = _itimerspec()
-        sec, nsec = divmod(interval_ns, 1_000_000_000)
-        spec.it_value.tv_sec = spec.it_interval.tv_sec = sec
-        spec.it_value.tv_nsec = spec.it_interval.tv_nsec = nsec
+        spec.it_value.tv_sec, spec.it_value.tv_nsec = divmod(interval_ns, 1_000_000_000)
         if _libc.timer_settime(self._timer_id, 0, ctypes.byref(spec), None):
             raise SamplerError(
                 f"timer_settime failed: {os.strerror(ctypes.get_errno())}"
@@ -198,6 +205,8 @@ class Sampler:
         self._in_handler = False
         self._backed_off = False
         self._since_drain = 0
+        # The interval the handler sets the timer to next
+        self._next_ns = interval_ns
         # Code of a wrapper around the selector's select(), still idle time.
         self.select_wrapper: Any = None
         # Code objects of our own wrappers on the loop's path, left out of stacks.
@@ -224,6 +233,7 @@ class Sampler:
         try:
             signal.signal(SIGNAL, self._handler)
             signal.siginterrupt(SIGNAL, False)
+            self._next_ns = self.interval_ns
             self._timer.arm(self.interval_ns)
         except (OSError, ValueError, SamplerError) as err:
             self._teardown()
@@ -245,7 +255,8 @@ class Sampler:
         try:
             self._since_drain = 0
             self._backed_off = False
-            self._timer.arm(int(self.interval_ns * random.uniform(0.75, 1.25)))
+            self._next_ns = int(self.interval_ns * random.uniform(0.75, 1.25))
+            self._timer.arm(self._next_ns)
         finally:
             self._in_handler = False
 
@@ -262,6 +273,7 @@ class Sampler:
         self._in_handler = True
         try:
             self._backed_off = False
+            self._next_ns = self.interval_ns
             self._timer.arm(self.interval_ns)
         except SamplerError:
             self.errors += 1
@@ -308,8 +320,8 @@ class Sampler:
 
         def handler(signum: int, frame: FrameType | None) -> None:
             if self._in_handler:
-                # A collection inside walk outlasted an interval. Skip; the
-                # CPU goes into the next sample's weight.
+                # The timer fired while rearm() or loop_drained() set it,
+                # which they finish. The CPU goes into the next sample's weight.
                 return
             self._in_handler = True
             try:
@@ -319,13 +331,11 @@ class Sampler:
                 ring[index & mask] = record
                 self.count = index + 1
                 self._since_drain += 1
-                if (
-                    interval := backoff_at.get(self._since_drain)
-                ) is not None and self._timer is not None:
+                if (interval := backoff_at.get(self._since_drain)) is not None:
                     if not self._backed_off:
                         self._backed_off = True
                         self.backoffs += 1
-                    self._timer.arm(interval)
+                    self._next_ns = interval
                 # The handler's own CPU is cost, not part of the next sample.
                 end = thread_time_ns()
                 self.cost_ns += end - cpu
@@ -334,6 +344,11 @@ class Sampler:
                 # Never raise into whatever code the signal interrupted.
                 self.errors += 1
             finally:
+                try:
+                    if self._timer is not None and self._next_ns:
+                        self._timer.arm(self._next_ns)
+                except Exception:  # noqa: BLE001
+                    self.errors += 1
                 self._in_handler = False
 
         return handler

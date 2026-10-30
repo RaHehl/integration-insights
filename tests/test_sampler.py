@@ -2,9 +2,12 @@
 
 import asyncio
 from collections import Counter
+from contextlib import suppress
+import hashlib
 import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
 import sys
 from unittest.mock import patch
@@ -172,6 +175,36 @@ def test_long_block_keeps_asyncio_signals_working(
     # the last backed off sample, at most 100 ms.
     weights = _weights(sampler)
     assert 0.85e9 < weights["busy"] < 1.1e9
+
+
+@linux_only
+def test_long_c_call_sends_one_signal() -> None:
+    """Python runs the handler only after a C call, so the timer must not keep firing.
+
+    Every signal is a byte in the wakeup socket. A periodic timer wrote one per
+    scheduler tick through the call and filled the socket in about a second.
+    """
+    ours, theirs = socket.socketpair()
+    ours.setblocking(False)
+    theirs.setblocking(False)
+    previous = signal.set_wakeup_fd(ours.fileno())
+    sampler = Sampler(interval_ns=1_000_000)
+    sampler.install()
+    try:
+        hashlib.pbkdf2_hmac("sha256", b"x", b"y", 1_000_000)
+        sum(range(10))  # the handler runs between bytecodes
+    finally:
+        sampler.uninstall()
+        signal.set_wakeup_fd(previous)
+    received = 0
+    with suppress(BlockingIOError):
+        while chunk := theirs.recv(4096):
+            received += len(chunk)
+    ours.close()
+    theirs.close()
+    assert sampler.count == received == 1
+    # The whole call is one sample, weighted with its CPU
+    assert sampler.drain(0)[0][0].cpu_ns > 0.3e9
 
 
 def _hook_drain(loop: asyncio.AbstractEventLoop, sampler: Sampler) -> None:
