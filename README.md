@@ -66,7 +66,7 @@ The Memory view walks the Python heap on request and splits it by integration, l
 
 ### Cost
 
-The panel shows its own cost under "Measuring costs": sampling, timing the callbacks, and its own work. The cost grows with the number of callbacks on the event loop. A memory snapshot takes about half a minute on a Raspberry Pi 3 and needs memory for the walk. It is refused with a reason when memory is short.
+The panel shows its own cost under "Measuring costs": sampling, timing the callbacks, and its own work. The cost grows with the number of callbacks on the event loop. On a Raspberry Pi 3 with 250 callbacks a second it is about 2 s of CPU per minute, 3 % of one core, and a fraction of that on faster hardware. A memory snapshot takes about half a minute on a Raspberry Pi 3 and needs memory for the walk. It is refused with a reason when memory is short.
 
 ## Privacy
 

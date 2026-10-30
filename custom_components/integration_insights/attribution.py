@@ -245,6 +245,10 @@ def _scan_providers(import_names: Iterable[str]) -> dict[str, tuple[str, ...]]:
     return {name: tuple(dict.fromkeys(dists)) for name, dists in found.items()}
 
 
+# Seconds before a missing import name is looked for again
+MISSING_RETRY = 900.0
+
+
 class Packages:
     """Installed distributions, read on demand and cached.
 
@@ -267,6 +271,8 @@ class Packages:
         self._scan_providers = scan_providers
         self._requires: dict[str, tuple[str, ...]] = {}
         self._providers: dict[str, tuple[str, ...]] = {}
+        # Import names no distribution ships, with the time of the scan
+        self._missing: dict[str, float] = {}
 
     def requires(self, dist: str) -> tuple[str, ...]:
         """Return the distributions dist needs."""
@@ -293,9 +299,15 @@ class Packages:
         """Return the distributions that ship each import name."""
         result: dict[str, tuple[str, ...]] = {}
         missing: list[str] = []
+        now = time.monotonic()
         for name in import_names:
             if (found := self._providers.get(name)) is not None:
                 result[name] = found
+                continue
+            # A name no package ships is looked for again now and then: it
+            # may get installed later. Every look is a scan of all packages.
+            if now - self._missing.get(name, -MISSING_RETRY) < MISSING_RETRY:
+                result[name] = ()
                 continue
             dist = _normalize(name)
             if name in (self._read_imports(dist) or ()):
@@ -305,9 +317,10 @@ class Packages:
         if missing:
             for name, found in self._scan_providers(missing).items():
                 result[name] = found
-                # Not installed (yet) is not cached: it may get installed later.
                 if found:
                     self._providers[name] = found
+                else:
+                    self._missing[name] = now
         return result
 
 

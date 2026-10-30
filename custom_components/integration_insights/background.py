@@ -9,12 +9,13 @@ import asyncio
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import Executor, Future
+import functools
 import os
 from pathlib import Path
 import sys
 import threading
 import time
-from types import CodeType, FrameType
+from types import BuiltinFunctionType, CodeType, FrameType, FunctionType, MethodType
 from typing import Any, NamedTuple
 
 from .attribution import callable_owner, module_domain, top_package
@@ -59,6 +60,22 @@ class ThreadRecord(NamedTuple):
 type Walk = Callable[[FrameType | None, int], Record]
 
 
+# Callables whose owner is decided by themselves are resolved once
+MAX_RESOLVED = 2_000
+
+
+def _resolve_key(fn: Any) -> Any:
+    """Return a key that stands for every submission of the same callable."""
+    while isinstance(fn, functools.partial):
+        fn = fn.func
+    kind = type(fn)
+    if kind is FunctionType or kind is BuiltinFunctionType:
+        return fn
+    if kind is MethodType:
+        return (fn.__func__, type(fn.__self__))
+    return None
+
+
 class Background:
     """Charge executor jobs and threads to integrations."""
 
@@ -74,6 +91,8 @@ class Background:
         self.jobs_total = 0
         self._hooked: list[tuple[Executor, Callable[..., Future[Any]]]] = []
         self._active = [False]
+        self._resolved: dict[Any, tuple[Owner, str]] = {}
+        self.wrapper_codes: set[Any] = set()
         self._thread_cpu: dict[int, int] = {}
         self._thread_owners: dict[int, tuple[threading.Thread, Owner | None]] = {}
         self._primed = False
@@ -83,26 +102,39 @@ class Background:
     def hook_executor(self, executor: Executor) -> None:
         """Time every job submitted to executor from now on."""
         original = executor.submit
-        resolve = self.resolve
+        resolve = self._resolve
         jobs = self.jobs
         active = self._active
+        resolved = self._resolved
 
         def submit(fn: Any, /, *args: Any, **kwargs: Any) -> Future[Any]:
             # Once unhooked, a hook that something else wrapped in turn
             # stays in the chain; it only passes jobs on
             if not active[0]:
                 return original(fn, *args, **kwargs)
-            try:
-                owner, label = resolve(fn, sys._getframe(1))  # noqa: SLF001
-            except Exception:  # noqa: BLE001
-                # Whatever a callable does when looked at, the job must run.
-                owner, label = Owner("core", ()), "?"
+            # The same function is submitted again and again: resolved once
+            key = _resolve_key(fn)
+            if key is None or (hit := resolved.get(key)) is None:
+                try:
+                    owner, label, by_callable = resolve(fn, sys._getframe(1))  # noqa: SLF001
+                except Exception:  # noqa: BLE001
+                    # Whatever a callable does when looked at, the job must run.
+                    owner, label, by_callable = Owner("core", ()), "?", False
+                if by_callable and key is not None:
+                    if len(resolved) >= MAX_RESOLVED:
+                        resolved.clear()
+                    resolved[key] = (owner, label)
+            else:
+                owner, label = hit
             self.jobs_total += 1
             return original(_timed, jobs, owner, label, fn, args, kwargs)
 
         active[0] = True
         executor.submit = submit  # type: ignore[method-assign]
         self._hooked.append((executor, submit))
+        # For the sampler: the executor's own work under the hook is the
+        # caller's, not ours
+        self.wrapper_codes.add(submit.__code__)
 
     def unhook_executors(self) -> None:
         """Remove the hooks that are still in place."""
@@ -115,16 +147,21 @@ class Background:
 
     def resolve(self, fn: Any, frame: FrameType | None) -> tuple[Owner, str]:
         """Find the integration a job runs for: its callable, else its caller."""
+        owner, label, _by_callable = self._resolve(fn, frame)
+        return owner, label
+
+    def _resolve(self, fn: Any, frame: FrameType | None) -> tuple[Owner, str, bool]:
+        """Resolve; the flag says whether the callable alone decided it."""
         domain, libraries, label = callable_owner(fn)
         if domain is not None:
-            return Owner(domain, ()), label
+            return Owner(domain, ()), label, True
         library_map = self._library_map()
         for library in libraries:
             if (owner := library_map.get(library)) is not None:
-                return Owner(owner, libraries), label
+                return Owner(owner, libraries), label, True
         record = self._walk(frame, 0)
         domain = record.domain if record.domain != "idle" else "core"
-        return Owner(domain, record.libraries or libraries), label
+        return Owner(domain, record.libraries or libraries), label, False
 
     def drain_jobs(self) -> list[JobRecord]:
         """Return the jobs that finished since the last drain."""
@@ -361,11 +398,16 @@ class LoopWait:
 
     def __init__(self) -> None:
         """Initialize."""
-        self.waiting_ns = 0
+        self._waiting = [0]
         self.wrapper_code: CodeType | None = None
         self._selector: Any = None
         self._hook: Callable[..., Any] | None = None
         self._active = [False]
+
+    @property
+    def waiting_ns(self) -> int:
+        """Return the wall time spent in select() so far."""
+        return self._waiting[0]
 
     def install(self, loop: Any) -> bool:
         """Wrap the loop's selector; return whether it worked."""
@@ -375,15 +417,17 @@ class LoopWait:
             return False
         perf = time.perf_counter_ns
         active = self._active = [True]
+        waiting = self._waiting = [0]
 
         def select(timeout: float | None = None) -> Any:
             if not active[0]:
                 return original(timeout)
+            # Once per loop iteration, so no try/finally: an exception out
+            # of select() ends the loop anyway
             start = perf()
-            try:
-                return original(timeout)
-            finally:
-                self.waiting_ns += perf() - start
+            result = original(timeout)
+            waiting[0] += perf() - start
+            return result
 
         selector.select = select
         self._selector = selector

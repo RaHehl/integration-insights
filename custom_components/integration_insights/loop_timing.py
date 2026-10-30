@@ -25,7 +25,7 @@ from functools import partial
 import sys
 import threading
 import time
-from types import FrameType, MemberDescriptorType, ModuleType
+from types import FrameType, FunctionType, ModuleType
 from typing import Any, NamedTuple
 
 from homeassistant.config_entries import current_entry
@@ -33,9 +33,13 @@ from homeassistant.core import HassJob
 
 # Only code compiled at runtime can add rows without bound
 MAX_ROWS = 10_000
+# Coroutines remembered between two drains
+MAX_COROUTINES = 50_000
+
+
 # A callback this long is a block: the watchdog looks at the stack
 BLOCK_NS = 1_000_000_000
-WATCHDOG_INTERVAL = 0.25
+WATCHDOG_INTERVAL = 0.5
 MAX_BLOCKS = 100
 
 type _Key = tuple[Any, type | None, str | None]
@@ -48,55 +52,50 @@ _HELPER_JOBS = ("_run_job", "job", "_job", "listener_job")
 _TRANSPORT_MODULES = ("asyncio.",)
 
 
-_SLOTS: dict[tuple[type, str], Any] = {}
+# What kind of owner a class is, decided once per class: plain, a transport,
+# or a helper with the names under which it may hold a HassJob.
+_PLAIN = 0
+_TRANSPORT = 1
+_KINDS: dict[type, int | tuple[str, ...]] = {}
 
 
-def _static(obj: Any, name: str) -> Any:
-    """Read an instance attribute without running Python code of the object.
-
-    The instance dict first, then a slot; the slot descriptor is looked up
-    once per class, since this runs for many callbacks.
-    """
-    try:
-        value = object.__getattribute__(obj, "__dict__").get(name)
-    except AttributeError:
-        value = None
-    if value is not None:
-        return value
-    cls = type(obj)
-    if (descriptor := _SLOTS.get((cls, name), False)) is False:
-        descriptor = _SLOTS[(cls, name)] = next(
-            (
-                found
-                for klass in cls.__mro__
-                if isinstance(found := vars(klass).get(name), MemberDescriptorType)
-            ),
-            None,
+def _classify(cls: type, owner: Any) -> int | tuple[str, ...]:
+    module = cls.__module__
+    if module.startswith(_HELPER_MODULES):
+        instance = getattr(owner, "__dict__", None) or {}
+        names = tuple(
+            name
+            for name in _HELPER_JOBS
+            if name in instance or any(name in vars(klass) for klass in cls.__mro__)
         )
-    if descriptor is None:
-        return None
-    try:
-        return descriptor.__get__(obj, cls)
-    except AttributeError:
-        return None
+        return names or _PLAIN
+    if module.startswith(_TRANSPORT_MODULES):
+        return _TRANSPORT
+    return _PLAIN
 
 
 def _unwrap_helper(owner: Any) -> Any:
-    """Return the integration's callable behind a helper or transport, or None."""
-    module = type(owner).__module__
-    if module.startswith(_HELPER_MODULES):
-        for name in _HELPER_JOBS:
-            if isinstance(job := _static(owner, name), HassJob):
-                return job.target
+    """Return the integration's callable behind a helper or transport, or None.
+
+    Only helpers of Home Assistant and asyncio transports are looked into,
+    whose attributes are plain, so getattr runs no code of the object.
+    """
+    cls = type(owner)
+    if (kind := _KINDS.get(cls)) is None:
+        kind = _KINDS[cls] = _classify(cls, owner)
+    if kind == _PLAIN:
         return None
-    if module.startswith(_TRANSPORT_MODULES):
-        protocol = _static(owner, "_protocol")
+    if kind == _TRANSPORT:
+        protocol = getattr(owner, "_protocol", None)
         # An SSL protocol wraps the application's protocol
         if protocol is not None and type(protocol).__module__.startswith(
             _TRANSPORT_MODULES
         ):
-            protocol = _static(protocol, "_app_protocol") or protocol
+            protocol = getattr(protocol, "_app_protocol", None) or protocol
         return protocol
+    for name in kind:  # type: ignore[union-attr]
+        if isinstance(job := getattr(owner, name, None), HassJob):
+            return job.target
     return None
 
 
@@ -123,10 +122,12 @@ class BlockRecord(NamedTuple):
 class _Row:
     """What one owner did on the loop."""
 
-    __slots__ = ("count", "label", "max_at", "max_ns", "total_ns")
+    __slots__ = ("code", "count", "label", "max_at", "max_ns", "total_ns")
 
-    def __init__(self, label: str) -> None:
+    def __init__(self, label: str, code: Any = None) -> None:
         self.label = label
+        # Held so that the id of the code object in the row's key stays valid
+        self.code = code
         self.count = 0
         self.total_ns = 0
         self.max_ns = 0
@@ -160,12 +161,19 @@ class LoopTiming:
         self._loop = loop
         self._blocker = blocker
         self._rows: dict[_Key, _Row] = {}
+        # Coroutine -> its row, cleared with the rows; a coroutine that
+        # finished stays referenced until the next drain, nothing else
+        self._coro_rows: dict[Any, _Row] = {}
+        # (function, id(object), entry) -> (object, row); the object is kept
+        # so the id stays its own until the next drain
+        self._method_rows: dict[tuple[Any, int, str | None], tuple[Any, _Row]] = {}
         self._blocks: deque[BlockRecord] = deque(maxlen=MAX_BLOCKS)
         # Start of the callback running now, and who the watchdog saw in it
         self._running = [0]
         self._seen: dict[int, tuple[str, str] | None] = {}
         self._active = [False]
         self._overhead = [0]
+        self._resolves = [0]
         self._original: Callable[[Any], None] | None = None
         self._wrapper: Callable[[Any], None] | None = None
         self._watchdog: threading.Thread | None = None
@@ -176,107 +184,210 @@ class LoopTiming:
         self.started_at = 0.0
 
     @property
+    def resolves(self) -> int:
+        """Return how many callbacks were resolved the slow way."""
+        return self._resolves[0]
+
+    @property
     def overhead_ns(self) -> int:
         """Return the time the wrapper itself has used, in ns."""
         return self._overhead[0]
 
-    def start(self) -> None:
+    def start(self) -> None:  # noqa: C901
         """Install the wrapper on Handle._run."""
         if self._wrapper is not None:
             return
         original = events.Handle._run  # noqa: SLF001
         loop = self._loop
         rows = self._rows
+        coro_rows = self._coro_rows
+        method_rows = self._method_rows
+        kinds = _KINDS
+        resolves = self._resolves
+        function_type = FunctionType
+        partial_type = partial
         blocks = self._blocks
         running = self._running
         seen = self._seen
         active = self._active
         overhead = self._overhead
+        counter = [0]
         perf = time.perf_counter_ns
         wall = time.time
         task_type = asyncio.Task
 
-        # One function with everything inline: it runs once per callback
-        def _run(handle: Any) -> None:
+        def resolve(handle: Any, func: Any, owner: Any, coro: Any) -> _Row:
+            """Return the row of a callback, from the live objects."""
+            module = None
+            if coro is not None:
+                code = getattr(coro, "cr_code", None)
+                frame = getattr(coro, "cr_frame", None)
+                if frame is not None:
+                    owner = frame.f_locals.get("self")
+                    module = frame.f_globals.get("__name__")
+                else:
+                    owner = None
+                if code is None:
+                    # Not a coroutine: an async generator step, say
+                    func = coro
+            else:
+                args = handle._args  # noqa: SLF001
+                if args and isinstance(args[-1], HassJob):
+                    func = args[-1].target
+                while isinstance(func, partial):
+                    func = func.func
+                owner = getattr(func, "__self__", None)
+                if owner is None and not hasattr(func, "__qualname__"):
+                    # A callable instance is charged to its class
+                    owner = func
+                    func = type(func).__call__
+                if owner is not None and ((inner := _unwrap_helper(owner)) is not None):
+                    if callable(inner):
+                        func = inner
+                        while isinstance(func, partial):
+                            func = func.func
+                        owner = getattr(func, "__self__", None)
+                    else:
+                        # A protocol object: the transport's method ran for it
+                        owner = inner
+                func = getattr(func, "__func__", func)
+                code = getattr(func, "__code__", None)
+                module = getattr(func, "__module__", None)
+            if owner is None or isinstance(owner, ModuleType):
+                cls = None
+            else:
+                cls = owner if isinstance(owner, type) else type(owner)
+            entry = handle._context.get(current_entry)  # noqa: SLF001
+            # Code objects compare by value, so two alike functions in
+            # different modules would share a row, and hashing one costs
+            # with its size: the id stands for it, and the row holds the
+            # object so the id stays its own. C code has no code object;
+            # module and qualified name must do.
+            key: _Key = (
+                id(code)
+                if code is not None
+                else (
+                    module or type(func).__module__,
+                    getattr(func, "__qualname__", type(func).__qualname__),
+                ),
+                cls,
+                entry.entry_id if entry is not None else None,
+            )
+            if (row := rows.get(key)) is not None:
+                return row
+            if len(rows) >= MAX_ROWS:
+                key = _OTHER
+                if (row := rows.get(key)) is not None:
+                    return row
+            label = (
+                "other callbacks" if key is _OTHER else _label(func, code, cls, module)
+            )
+            row = rows[key] = _Row(label, code)
+            return row
+
+        # The wrapper runs once per callback: as little as possible inline
+        def _run(handle: Any) -> None:  # noqa: C901
             # Once stopped, a wrapper that something else wrapped in turn
             # stays in the chain; it only passes calls on
             if not active[0] or handle._loop is not loop:  # noqa: SLF001
                 original(handle)
                 return
-            entered = perf()
-            row = None
-            key: _Key = _OTHER
+            # The wrapper's own cost is measured on every 32nd callback
+            count = counter[0] = counter[0] + 1
+            entered = perf() if count & 31 == 0 else 0
             # Nothing in here may escape into the loop, hence one wide try
+            row = coro = mkey = None
+            pin: Any = None
             try:
                 # Before the run: a callback that cancels its handle drops
                 # _callback, and a coroutine that finishes drops its frame
                 func = handle._callback  # noqa: SLF001
                 owner = getattr(func, "__self__", None)
-                module = None
-                if isinstance(owner, task_type):
-                    coro: Any = owner.get_coro()
-                    code = getattr(coro, "cr_code", None)
-                    frame = getattr(coro, "cr_frame", None)
-                    if frame is not None:
-                        owner = frame.f_locals.get("self")
-                        module = frame.f_globals.get("__name__")
-                    else:
-                        owner = None
-                    if code is None:
-                        # Not a coroutine: an async generator step, say
-                        func = coro
+                if type(owner) is task_type:
+                    # Every step of a task runs the same coroutine for the same
+                    # object in the same context: resolved once
+                    coro = owner.get_coro()
+                    row = coro_rows.get(coro)
                 else:
+                    # The same row for every call in the same context. A
+                    # partial or a HassJob passed as argument is often a
+                    # long-lived object, a reader or a timer: its identity
+                    # is the key, a one-shot one is dropped with the next
+                    # drain
                     args = handle._args  # noqa: SLF001
-                    if args and isinstance(args[-1], HassJob):
-                        func = args[-1].target
-                    while isinstance(func, partial):
-                        func = func.func
-                    owner = getattr(func, "__self__", None)
-                    if owner is None and not hasattr(func, "__qualname__"):
-                        # A callable instance is charged to its class
-                        owner = func
-                        func = type(func).__call__
-                    if owner is not None and (
-                        (inner := _unwrap_helper(owner)) is not None
-                    ):
-                        if callable(inner):
-                            func = inner
-                            while isinstance(func, partial):
-                                func = func.func
-                            owner = getattr(func, "__self__", None)
+                    fn_key = None
+                    if type(func) is partial_type:
+                        pin = func
+                    elif args and isinstance(args[-1], HassJob):
+                        pin = args[-1]
+                    else:
+                        if owner is None and not hasattr(func, "__qualname__"):
+                            # A callable object, such as a helper that
+                            # schedules itself: its class is the key
+                            owner = func
+                            func = type(func).__call__
+                        if owner is None:
+                            # A closure made per call is a new function each
+                            # time, its code is not; C functions are themselves.
+                            # Code objects compare by value, so the pin holds
+                            # the object and the key is its id
+                            pin = func.__code__ if type(func) is function_type else func
                         else:
-                            # A protocol object: the transport's method ran for it
-                            owner = inner
-                    func = getattr(func, "__func__", func)
-                    code = getattr(func, "__code__", None)
-                    module = getattr(func, "__module__", None)
-                if owner is None or isinstance(owner, ModuleType):
-                    cls = None
-                else:
-                    cls = owner if isinstance(owner, type) else type(owner)
-                entry = handle._context.get(current_entry)  # noqa: SLF001
-                # C code has no code object; module and qualified name must do
-                key = (
-                    code
-                    if code is not None
-                    else (
-                        module or type(func).__module__,
-                        getattr(func, "__qualname__", type(func).__qualname__),
-                    ),
-                    cls,
-                    entry.entry_id if entry is not None else None,
-                )
-                if (row := rows.get(key)) is None:
-                    if len(rows) >= MAX_ROWS:
-                        key = _OTHER
-                        row = rows.get(key)
-                    if row is None:
-                        label = (
-                            "other callbacks"
-                            if key is _OTHER
-                            else _label(func, code, cls, module)
-                        )
-                        row = rows[key] = _Row(label)
+                            cls = type(owner)
+                            if (kind := kinds.get(cls)) is None:
+                                kind = kinds[cls] = _classify(cls, owner)
+                            if kind == _PLAIN:
+                                # A plain object's row depends on its class, so
+                                # a one-shot object such as a future hits too
+                                pin = cls
+                            elif kind != _TRANSPORT:
+                                # A one-shot helper such as a timer is a new
+                                # object each time, the job it runs is not
+                                for name in kind:  # type: ignore[union-attr]
+                                    if (job := getattr(owner, name, None)) is not None:
+                                        target = job.target
+                                        if (
+                                            inner := getattr(target, "__self__", None)
+                                        ) is not None:
+                                            func, owner = target, inner
+                                            pin = owner
+                                        elif type(target) is function_type:
+                                            func, owner = target, None
+                                        break
+                            if owner is not None:
+                                if pin is None:
+                                    pin = owner
+                                fn_key = (
+                                    getattr(func, "__func__", None)
+                                    or getattr(func, "__name__", None)
+                                    or func
+                                )
+                            else:
+                                pin = (
+                                    func.__code__
+                                    if type(func) is function_type
+                                    else func
+                                )
+                    entry = handle._context.get(current_entry)  # noqa: SLF001
+                    mkey = (
+                        fn_key,
+                        id(pin),
+                        entry.entry_id if entry is not None else None,
+                    )
+                    if (hit := method_rows.get(mkey)) is not None and hit[0] is pin:
+                        row = hit[1]
+                if row is None:
+                    resolves[0] += 1
+                    row = resolve(handle, func, owner, coro)
+                    if coro is not None:
+                        if len(coro_rows) >= MAX_COROUTINES:
+                            coro_rows.clear()
+                        coro_rows[coro] = row
+                    elif mkey is not None:
+                        if len(method_rows) >= MAX_COROUTINES:
+                            method_rows.clear()
+                        # The object or class is held so its id stays its own
+                        method_rows[mkey] = (pin, row)
             except Exception:  # noqa: BLE001
                 self.errors += 1
             outer = running[0]
@@ -302,7 +413,8 @@ class LoopTiming:
                             seen.pop(start, None),
                         )
                     )
-                overhead[0] += (start - entered) + (perf() - end)
+                if entered:
+                    overhead[0] += 32 * ((start - entered) + (perf() - end))
 
         self._original = original
         self._wrapper = _run
@@ -357,18 +469,37 @@ class LoopTiming:
     def drain(self) -> list[CallbackRecord]:
         """Return what ran since the last drain and start over.
 
-        Runs on the loop, like the wrapper, and clears in place: the wrapper
-        holds the same dict.
+        Runs on the loop, like the wrapper, and works in place: the wrapper
+        holds the same dicts. Rows that ran stay, with their counts reset,
+        so the caches pointing at them stay valid; rows that did not run are
+        dropped together with their cache entries, which also lets go of
+        the objects those entries hold.
         """
         rows = self._rows
+        idle = {id(row) for row in rows.values() if not row.count}
+        if idle:
+            coro_rows = self._coro_rows
+            for coro in [c for c, row in coro_rows.items() if id(row) in idle]:
+                del coro_rows[coro]
+            method_rows = self._method_rows
+            for mkey in [k for k, (_, row) in method_rows.items() if id(row) in idle]:
+                del method_rows[mkey]
+            for key in [k for k, row in rows.items() if id(row) in idle]:
+                del rows[key]
+        # A coroutine that finished keeps nothing but itself alive; still,
+        # there is no point in remembering it
+        coro_rows = self._coro_rows
+        for coro in [c for c in coro_rows if getattr(c, "cr_frame", False) is None]:
+            del coro_rows[coro]
         records = [
             CallbackRecord(
                 row.label, key[2], row.count, row.total_ns, row.max_ns, row.max_at
             )
             for key, row in rows.items()
-            if row.count
         ]
-        rows.clear()
+        for row in rows.values():
+            row.count = row.total_ns = row.max_ns = 0
+            row.max_at = 0.0
         return records
 
     def drain_blocks(self) -> list[BlockRecord]:

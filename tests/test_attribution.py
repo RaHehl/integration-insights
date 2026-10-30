@@ -2,6 +2,8 @@
 
 from pathlib import Path
 import sys
+import time
+from unittest.mock import patch
 
 import pytest
 
@@ -10,6 +12,7 @@ from custom_components.integration_insights.attribution import (
     K_INTEGRATION,
     K_LIB,
     K_PLATFORM,
+    MISSING_RETRY,
     Packages,
     _scan_providers,
     classify_file,
@@ -223,3 +226,23 @@ def test_scan_providers_reads_file_lists(
         "orjson": {"orjson"},
         "legacy": {"legacy"},
     }
+
+
+def test_a_missing_import_name_is_scanned_for_once_in_a_while() -> None:
+    """Every look for a name no package ships scans all packages, so not every time."""
+    scans: list[list[str]] = []
+
+    def scan(names: list[str]) -> dict[str, tuple[str, ...]]:
+        scans.append(list(names))
+        return dict.fromkeys(names, ())
+
+    packages = Packages(lambda _dist: (), lambda _dist: None, scan)
+    assert packages.providers(["ghost"]) == {"ghost": ()}
+    assert packages.providers(["ghost"]) == {"ghost": ()}
+    assert len(scans) == 1
+    with patch(
+        "custom_components.integration_insights.attribution.time.monotonic",
+        return_value=time.monotonic() + 2 * MISSING_RETRY,
+    ):
+        assert packages.providers(["ghost"]) == {"ghost": ()}
+    assert len(scans) == 2

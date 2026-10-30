@@ -312,3 +312,23 @@ def test_refuses_when_a_profiling_timer_runs() -> None:
     finally:
         signal.setitimer(signal.ITIMER_PROF, 0)
         signal.signal(signal.SIGPROF, signal.SIG_DFL)
+
+
+def test_a_wrapper_frame_is_left_out_unless_it_runs_itself() -> None:
+    """Skipped code in the middle of a stack is plumbing; as the innermost frame it is our cost."""
+    wrapper = compile_at(
+        "/config/custom_components/integration_insights/loop_timing.py",
+        "import sys\n"
+        "def run(inner):\n    return inner()\n"
+        "def own():\n    return sys._getframe()\n",
+    )
+    inner = compile_at(
+        "/config/custom_components/busy/api.py",
+        "import sys\ndef fetch():\n    return sys._getframe()\n",
+    )
+    sampler = Sampler()
+    sampler.skip_codes = frozenset({wrapper["run"].__code__, wrapper["own"].__code__})
+    through = sampler.walk(wrapper["run"](inner["fetch"]), 1)
+    assert through.domain == "busy"
+    assert through.trigger == "busy"
+    assert sampler.walk(wrapper["own"](), 1).domain == "integration_insights"

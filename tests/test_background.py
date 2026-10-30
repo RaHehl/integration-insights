@@ -6,6 +6,7 @@ import functools
 import hashlib
 import threading
 import time
+from unittest.mock import patch
 
 import pytest
 
@@ -276,3 +277,34 @@ def test_collector_reports_background_cpu() -> None:
     assert busy["threads"]["by_name"] == {"busy-thread": 20.0}
     assert foo["domain"] == "foo"
     assert "threads" not in foo
+
+
+def test_a_callable_that_names_its_owner_is_resolved_once() -> None:
+    """Resolving looks at the callable once; a core function depends on its caller."""
+    spin = _module(BUSY, "custom_components.busy.worker")["spin"]
+    background = _background()
+    calls: list[object] = []
+    original = callable_owner
+
+    def counting(fn: object) -> tuple:
+        calls.append(fn)
+        return original(fn)
+
+    with (
+        patch(
+            "custom_components.integration_insights.background.callable_owner",
+            counting,
+        ),
+        ThreadPoolExecutor(max_workers=1) as executor,
+    ):
+        background.hook_executor(executor)
+        for _ in range(3):
+            executor.submit(spin, 0.001).result()
+            executor.submit(functools.partial(spin, 0.001)).result()
+            executor.submit(time.sleep, 0.001).result()
+        background.unhook_executors()
+    jobs = background.drain_jobs()
+    assert [job.owner.domain for job in jobs].count("busy") == 6
+    # spin once for the function and its partials, sleep every time
+    assert calls.count(spin) == 1
+    assert calls.count(time.sleep) == 3

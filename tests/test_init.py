@@ -384,3 +384,23 @@ async def test_callbacks_are_timed_and_charged_to_their_entry(
     assert insights.callback_domain("aiofoo.client.Client.data_received", None) == "foo"
     assert await hass.config_entries.async_unload(entry.entry_id)
     assert Handle._run.__qualname__ == "Handle._run"  # noqa: SLF001
+
+
+async def test_library_map_waits_until_the_integrations_hold_still(
+    hass: HomeAssistant,
+) -> None:
+    """Integrations arriving one after another are mapped once they stop coming."""
+    entry = MockConfigEntry(domain=DOMAIN)
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    insights = entry.runtime_data
+    with patch.object(insights, "_async_update_library_map") as update:
+        for domain in ("foo", "bar"):
+            hass.config.components.add(domain)
+            insights._async_drain()  # noqa: SLF001
+            await hass.async_block_till_done()
+        assert update.call_count == 0
+        insights._async_drain()  # noqa: SLF001
+        await hass.async_block_till_done()
+        assert update.call_count == 1
+    assert await hass.config_entries.async_unload(entry.entry_id)

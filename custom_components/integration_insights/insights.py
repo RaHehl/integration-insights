@@ -89,6 +89,7 @@ class Insights:
         self.started = 0.0
         self._position = 0
         self._mapped_components: frozenset[str] | None = None
+        self._seen_components: frozenset[str] | None = None
         self._mapping_lock = asyncio.Lock()
         self._packages = Packages()
         self._owners: dict[str, str] = {}
@@ -161,7 +162,9 @@ class Insights:
         if self.loop_wait.install(self.hass.loop):
             self.sampler.select_wrapper = self.loop_wait.wrapper_code
         self.loop_timing.start()
-        self.sampler.skip_codes = frozenset({self.loop_timing.wrapper_code})
+        self.sampler.skip_codes = frozenset(
+            {self.loop_timing.wrapper_code, *self.background.wrapper_codes}
+        )
         self._listen_state_writes()
         self._wall_ns = time.perf_counter_ns()
         self._waiting_ns = self.loop_wait.waiting_ns
@@ -310,8 +313,12 @@ class Insights:
                 _LOGGER.warning("Could not re-arm the sampler: %s", err)
                 self._rearm_failed = True
         components = frozenset(self.hass.config.top_level_components)
+        # Integrations keep arriving for minutes after a start; mapping them
+        # costs seconds on small hardware, so wait until the set holds still
+        settled = components == self._seen_components
+        self._seen_components = components
         if not self._mapping_lock.locked() and (
-            components != self._mapped_components
+            (settled and components != self._mapped_components)
             or not self.collector.seen_libraries <= self._checked_libraries
         ):
             self.hass.async_create_background_task(
@@ -513,6 +520,13 @@ class Insights:
             if self.sampler.installed
             else 0,
             "timing_errors": self.loop_timing.errors,
+            "timing_resolves_per_min": round(
+                self.loop_timing.resolves
+                / max((time.monotonic() - self.started) / 60, 1 / 60),
+                1,
+            )
+            if self.sampler.installed
+            else 0,
             "running_minutes": round((time.monotonic() - self.started) / 60, 1)
             if self.sampler.installed
             else 0,

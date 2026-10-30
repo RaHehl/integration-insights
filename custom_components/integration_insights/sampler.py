@@ -392,7 +392,9 @@ class Sampler:
         while f is not None and depth < MAX_DEPTH:
             depth += 1
             code = f.f_code
-            if code in skip_codes:
+            # A wrapper of ours in the middle of a stack is left out; as the
+            # innermost frame it is running its own code, which is our cost
+            if code in skip_codes and depth > 1:
                 f = f.f_back
                 continue
             info = file_cache.get(code.co_filename)
