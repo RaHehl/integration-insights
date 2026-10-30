@@ -7,17 +7,14 @@ Each record carries the loop thread CPU used since the previous record, which
 is its weight: a long C call that holds the GIL still gets its full share.
 """
 
-from array import array
 import atexit
 from collections.abc import Callable
 from contextvars import ContextVar
 import ctypes
-import fcntl
 import os
 import random
 import signal
 import sys
-import termios
 import threading
 import time
 from types import FrameType
@@ -39,11 +36,19 @@ MAX_RECORDED_FRAMES = 32
 MAX_LIBRARY_FRAMES = 6
 MAX_LIBRARIES = 4
 # Every signal writes one byte to asyncio's wakeup socket, which the loop only
-# reads between callbacks. A long block would fill it (about 280 bytes) and
-# asyncio would then miss a real SIGTERM, so back off well before that.
-BACKOFF_PENDING_BYTES = 32
-BACKOFF_SAMPLES = 32  # without a wakeup socket to look at
-BACKOFF_INTERVAL_NS = 1_000_000_000
+# reads between its iterations. A long block would fill it (about 280 bytes)
+# and asyncio would then miss a real SIGTERM. So the rate drops by stages once
+# this many samples were taken without the loop reading the socket, and the
+# timer stops before the socket could fill. The first stage keeps 100 ms of
+# resolution, so the next callback in the same iteration still gets its share.
+BACKOFF_STAGES: tuple[tuple[int, int], ...] = (
+    (32, 100_000_000),
+    (96, 1_000_000_000),
+    (160, 10_000_000_000),
+    (224, 0),
+)
+BACKOFF_SAMPLES = BACKOFF_STAGES[0][0]
+_BACKOFF_AT = dict(BACKOFF_STAGES)
 
 
 class SamplerError(Exception):
@@ -173,17 +178,11 @@ class Sampler:
         interval_ns: int = 10_000_000,
         ring_size: int = 4096,
         entry_var: ContextVar[Any] | None = None,
-        wakeup_fd: int | None = None,
     ) -> None:
-        """Initialize the sampler.
-
-        ring_size must be a power of two. wakeup_fd is the read end of the
-        loop's wakeup socket, used to back off during long blocks.
-        """
+        """Initialize the sampler. ring_size must be a power of two."""
         assert ring_size & (ring_size - 1) == 0
         self.interval_ns = interval_ns
         self.entry_var = entry_var
-        self.wakeup_fd = wakeup_fd
         self.ring: list[Record | None] = [None] * ring_size
         self.count = 0  # records ever written
         self.lost = 0  # records overwritten before a drain
@@ -234,40 +233,32 @@ class Sampler:
     def rearm(self) -> None:
         """Restore the rate and pick a new random period.
 
-        The random period keeps samples from locking onto periodic work.
-        Raises SamplerError.
+        Call from the loop, which is then not blocked. The random period keeps
+        samples from locking onto periodic work. Raises SamplerError.
         """
-        if self._timer is None:
+        if self._timer is None or self._in_handler:
             return
-        if self._backed_off and self._wakeup_pending() >= BACKOFF_PENDING_BYTES:
-            return
-        self._backed_off = False
-        self._since_drain = 0
-        self._timer.arm(int(self.interval_ns * random.uniform(0.75, 1.25)))
+        self._in_handler = True
+        try:
+            self._since_drain = 0
+            self._backed_off = False
+            self._timer.arm(int(self.interval_ns * random.uniform(0.75, 1.25)))
+        finally:
+            self._in_handler = False
 
     def loop_drained(self) -> None:
-        """Restore the rate once the loop has read its wakeup socket.
+        """Note that the loop read its wakeup socket; restore the rate if needed.
 
-        Call from the loop when it reads the socket. While backed off the loop
-        sat in one long callback, so the CPU since the last sample still
-        belongs to the stack that sample saw.
+        Call from the loop when it reads the socket, which it does once per
+        iteration after a signal. The CPU since the last sample goes into the
+        next one, so a long block loses at most one backed off interval.
         """
+        self._since_drain = 0
         if not self._backed_off or self._timer is None or self._in_handler:
             return
         self._in_handler = True
         try:
-            cpu = time.thread_time_ns()
-            if self.count:
-                mask = len(self.ring) - 1
-                last = self.ring[(self.count - 1) & mask]
-                if last is not None:
-                    self.ring[self.count & mask] = last._replace(
-                        cpu_ns=cpu - self._last_cpu_ns
-                    )
-                    self.count += 1
-            self._last_cpu_ns = cpu
             self._backed_off = False
-            self._since_drain = 0
             self._timer.arm(self.interval_ns)
         except SamplerError:
             self.errors += 1
@@ -305,25 +296,12 @@ class Sampler:
         records = [ring[i & mask] for i in range(start, end)]
         return [r for r in records if r is not None], end
 
-    def _wakeup_pending(self) -> int:
-        if self.wakeup_fd is None:
-            return 0
-        buf = array("i", [0])
-        try:
-            fcntl.ioctl(self.wakeup_fd, termios.FIONREAD, buf, True)
-        except OSError:
-            return 0
-        return buf[0]
-
     def _make_handler(self) -> Callable[[int, FrameType | None], None]:
         thread_time_ns = time.thread_time_ns
         walk = self.walk
         ring = self.ring
         mask = len(ring) - 1
-        wakeup_fd = self.wakeup_fd
-        ioctl = fcntl.ioctl
-        fionread = termios.FIONREAD
-        pending = array("i", [0])
+        backoff_at = _BACKOFF_AT
 
         def handler(signum: int, frame: FrameType | None) -> None:
             if self._in_handler:
@@ -333,24 +311,22 @@ class Sampler:
             self._in_handler = True
             try:
                 cpu = thread_time_ns()
-                weight = cpu - self._last_cpu_ns
-                self._last_cpu_ns = cpu
-                record = walk(frame, weight)
+                record = walk(frame, cpu - self._last_cpu_ns)
                 index = self.count
                 ring[index & mask] = record
                 self.count = index + 1
-                if not self._backed_off and self._timer is not None:
-                    if wakeup_fd is not None:
-                        ioctl(wakeup_fd, fionread, pending, True)
-                        full = pending[0] >= BACKOFF_PENDING_BYTES
-                    else:
-                        self._since_drain += 1
-                        full = self._since_drain >= BACKOFF_SAMPLES
-                    if full:
+                self._since_drain += 1
+                if (
+                    interval := backoff_at.get(self._since_drain)
+                ) is not None and self._timer is not None:
+                    if not self._backed_off:
                         self._backed_off = True
                         self.backoffs += 1
-                        self._timer.arm(BACKOFF_INTERVAL_NS)
-                self.cost_ns += thread_time_ns() - cpu
+                    self._timer.arm(interval)
+                # The handler's own CPU is cost, not part of the next sample.
+                end = thread_time_ns()
+                self.cost_ns += end - cpu
+                self._last_cpu_ns = end
             except Exception:  # noqa: BLE001
                 # Never raise into whatever code the signal interrupted.
                 self.errors += 1

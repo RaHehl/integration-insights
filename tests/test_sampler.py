@@ -143,8 +143,7 @@ def test_long_block_keeps_asyncio_signals_working(
     loop = asyncio.new_event_loop()
     received: list[bool] = []
     loop.add_signal_handler(signal.SIGUSR1, lambda: received.append(True))
-    wakeup = loop._ssock.fileno()  # type: ignore[attr-defined]  # noqa: SLF001
-    sampler = Sampler(interval_ns=1_000_000, wakeup_fd=wakeup)
+    sampler = Sampler(interval_ns=1_000_000)
     spin = spin_at("/config/custom_components/busy/coordinator.py")
 
     def block() -> None:
@@ -156,13 +155,7 @@ def test_long_block_keeps_asyncio_signals_working(
         loop.call_soon(block)
         await asyncio.sleep(0.1)
 
-    original = loop._process_self_data  # type: ignore[attr-defined]  # noqa: SLF001
-
-    def process_self_data(data: bytes) -> None:
-        sampler.loop_drained()
-        original(data)
-
-    loop._process_self_data = process_self_data  # type: ignore[attr-defined]  # noqa: SLF001
+    _hook_drain(loop, sampler)
     sampler.install()
     try:
         loop.run_until_complete(main())
@@ -172,13 +165,68 @@ def test_long_block_keeps_asyncio_signals_working(
         loop.close()
 
     assert received == [True]
-    assert sampler.backoffs >= 1
+    assert sampler.backoffs == 1
     assert "wakeup fd" not in capfd.readouterr().err
     assert not sampler._backed_off  # noqa: SLF001
-    # The second of CPU in block() lands on busy, also the part after the
-    # back off, which the drain record carries.
+    # The second of CPU in block() lands on busy, except for the tail after
+    # the last backed off sample, at most 100 ms.
     weights = _weights(sampler)
-    assert 0.9e9 < weights["busy"] < 1.1e9
+    assert 0.85e9 < weights["busy"] < 1.1e9
+
+
+def _hook_drain(loop: asyncio.AbstractEventLoop, sampler: Sampler) -> None:
+    original = loop._process_self_data  # type: ignore[attr-defined]  # noqa: SLF001
+
+    def process_self_data(data: bytes) -> None:
+        sampler.loop_drained()
+        original(data)
+
+    loop._process_self_data = process_self_data  # type: ignore[attr-defined]  # noqa: SLF001
+
+
+@linux_only
+def test_backed_off_sampler_still_tells_callbacks_apart() -> None:
+    """Two long callbacks in one loop iteration each get their own CPU."""
+    loop = asyncio.new_event_loop()
+    sampler = Sampler(interval_ns=1_000_000)
+    first = spin_at("/config/custom_components/aaa/__init__.py")
+    second = spin_at("/config/custom_components/bbb/__init__.py")
+
+    async def main() -> None:
+        loop.call_soon(first, 0.5)
+        loop.call_soon(second, 0.5)
+        await asyncio.sleep(0.1)
+
+    _hook_drain(loop, sampler)
+    sampler.install()
+    try:
+        loop.run_until_complete(main())
+    finally:
+        sampler.uninstall()
+        loop.close()
+
+    assert sampler.backoffs == 1
+    weights = _weights(sampler)
+    assert 0.35e9 < weights["aaa"] < 0.65e9
+    assert 0.35e9 < weights["bbb"] < 0.65e9
+
+
+@linux_only
+def test_handler_cost_is_not_part_of_the_samples() -> None:
+    """The handler's own CPU is counted as cost, not charged to whoever runs."""
+    spin = spin_at("/config/custom_components/busy/x.py")
+    sampler = Sampler()  # 10 ms: no back off without a loop to drain it
+    sampler.install()
+    try:
+        spin(0.2)
+    finally:
+        sampler.uninstall()
+    assert sampler.cost_ns > 0
+    weights = _weights(sampler)
+    # spin() measures thread time, which includes the handler's: the samples
+    # and the cost together make the 200 ms, less the tail after the last
+    # sample, not the samples alone.
+    assert 0.18e9 < weights["busy"] + sampler.cost_ns < 0.205e9
 
 
 @linux_only

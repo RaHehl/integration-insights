@@ -45,22 +45,13 @@ KEPT_SNAPSHOTS = 10
 STARTUP_MINUTES = 5
 
 
-def _wakeup_fd(hass: HomeAssistant) -> int | None:
-    """Return the read end of the loop's wakeup socket, if it has one."""
-    sock = getattr(hass.loop, "_ssock", None)
-    try:
-        return sock.fileno() if sock is not None else None
-    except OSError:
-        return None
-
-
 class Insights:
     """Sample the event loop and keep the results."""
 
     def __init__(self, hass: HomeAssistant) -> None:
         """Initialize."""
         self.hass = hass
-        self.sampler = Sampler(entry_var=current_entry, wakeup_fd=_wakeup_fd(hass))
+        self.sampler = Sampler(entry_var=current_entry)
         self.collector = Collector()
         self.background = Background(
             self.sampler.walk, lambda: self.collector.library_map
@@ -132,8 +123,8 @@ class Insights:
 
     def _hook_wakeup_reads(self) -> None:
         # asyncio's selector loop hands the bytes it read from the wakeup
-        # socket to _process_self_data. That is the moment a long block is
-        # over, so the sampler can go back to its normal rate.
+        # socket to _process_self_data, once per iteration after a signal.
+        # That tells the sampler the loop is not blocked.
         loop = self.hass.loop
         original = getattr(loop, "_process_self_data", None)
         if original is None:

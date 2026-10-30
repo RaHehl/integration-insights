@@ -86,7 +86,11 @@ class Background:
         jobs = self.jobs
 
         def submit(fn: Any, /, *args: Any, **kwargs: Any) -> Future[Any]:
-            owner, label = resolve(fn, sys._getframe(1))  # noqa: SLF001
+            try:
+                owner, label = resolve(fn, sys._getframe(1))  # noqa: SLF001
+            except Exception:  # noqa: BLE001
+                # Whatever a callable does when looked at, the job must run.
+                owner, label = Owner("core", ()), "?"
             self.jobs_total += 1
             return original(_timed, jobs, owner, label, fn, args, kwargs)
 
