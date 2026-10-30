@@ -183,3 +183,36 @@ def test_entity_id_property_is_not_called() -> None:
     entity = namespace["Entity"]()
     assert entity.update(Sampler()).entity_id is None
     assert namespace["Entity"].calls == 0
+
+
+FINALIZER = """\
+def __del__(self):
+    import sys
+    return self.sampler.walk(sys._getframe(), 7)
+"""
+
+
+def test_finalizer_samples_go_to_the_owner_of_the_object() -> None:
+    """A __del__ running inside the garbage collector is not the allocator's cost."""
+    sampler = Sampler()
+    finalizer = compile_at("/usr/lib/python3.14/asyncio/selector_events.py", FINALIZER)[
+        "__del__"
+    ]
+    protocol = type("Handler", (), {"__module__": "aiofoo.client"})()
+    transport = type("Transport", (), {})()
+    transport.sampler = sampler
+    transport._protocol = protocol  # noqa: SLF001
+    record = finalizer(transport)
+    assert record.domain == "core"
+    assert record.libraries == ("aiofoo",)
+    assert record.cpu_ns == 7
+    assert len(record.frames) == 2  # only the finalizer, not the allocator's stack
+
+    ssl = type("SSLProtocol", (), {"__module__": "asyncio.sslproto"})()
+    ssl._app_protocol = type("App", (), {"__module__": "custom_components.foo.api"})()  # noqa: SLF001
+    transport._protocol = ssl  # noqa: SLF001
+    assert finalizer(transport).domain == "foo"
+
+    own = type("Thing", (), {"__module__": "custom_components.bar.x"})()
+    own.sampler = sampler
+    assert finalizer(own).domain == "bar"

@@ -27,6 +27,7 @@ from .attribution import (
     classify_file,
     module_domain,
     platform_domains,
+    top_package,
 )
 
 SIGNAL = signal.SIGPROF
@@ -339,6 +340,12 @@ class Sampler:
 
     def walk(self, frame: FrameType | None, cpu_ns: int) -> Record:  # noqa: C901
         """Classify a stack, innermost frame first."""
+        if frame is not None and frame.f_code.co_name == "__del__":
+            # A finalizer runs for whoever allocated and tripped the garbage
+            # collector, so the stack is theirs. The object being destroyed
+            # says who it belongs to.
+            if (record := self._finalizer(frame, cpu_ns)) is not None:
+                return record
         file_cache = self._file_cache
         frames: list[Any] = []
         domain: str | None = None
@@ -461,12 +468,55 @@ class Sampler:
             entity_id,
         )
 
+    def _finalizer(self, frame: FrameType, cpu_ns: int) -> Record | None:
+        """Charge a __del__ sample to the owner of the object being destroyed."""
+        obj = frame.f_locals.get("self")
+        if obj is None:
+            return None
+        # A transport belongs to the protocol it serves, an SSL protocol to
+        # the application's protocol behind it.
+        for name in ("_protocol", "_app_protocol"):
+            inner = _instance_attribute(obj, name)
+            if inner is None:
+                break
+            obj = inner
+        module = type(obj).__module__
+        if not isinstance(module, str):
+            return None
+        domain = module_domain(module)
+        libraries: tuple[str, ...] = ()
+        if domain is None:
+            package = top_package(module)
+            if package in sys.stdlib_module_names or package == "homeassistant":
+                domain = "core"
+            else:
+                domain = "core"
+                libraries = (package,)
+        return Record(
+            (frame.f_code, frame.f_lasti),
+            0,
+            domain,
+            None,
+            libraries,
+            None,
+            None,
+            cpu_ns,
+        )
+
     def _owner_domain(self, owner: object) -> str | None:
         module = type(owner).__module__
         cache = self._module_cache
         if module not in cache:
             cache[module] = module_domain(module)
         return cache[module]
+
+
+def _instance_attribute(obj: object, name: str) -> Any:
+    """Return an instance attribute without running any code."""
+    try:
+        return object.__getattribute__(obj, "__dict__").get(name)
+    except AttributeError:
+        return None
 
 
 def _entity_id(obj: object) -> str | None:
