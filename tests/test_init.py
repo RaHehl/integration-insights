@@ -1,5 +1,6 @@
 """Tests for setup, unload and diagnostics."""
 
+from asyncio.events import Handle
 from pathlib import Path
 import signal
 from types import SimpleNamespace
@@ -18,7 +19,7 @@ from pytest_homeassistant_custom_component.typing import (
 from custom_components.integration_insights.attribution import Packages
 from custom_components.integration_insights.const import DOMAIN
 from custom_components.integration_insights.sampler import is_supported
-from homeassistant.config_entries import ConfigEntryState
+from homeassistant.config_entries import ConfigEntryState, current_entry
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED, EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import CoreState, HomeAssistant
 from homeassistant.setup import async_setup_component
@@ -224,3 +225,66 @@ async def test_unload_before_start_is_clean(hass: HomeAssistant) -> None:
     hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
     await hass.async_block_till_done()
     assert signal.getsignal(signal.SIGPROF) is signal.SIG_DFL
+
+
+@linux_only
+async def test_callbacks_are_timed_and_charged_to_their_entry(
+    hass: HomeAssistant,
+) -> None:
+    """A callback that blocks the loop shows up with its integration, exactly."""
+    entry = MockConfigEntry(domain=DOMAIN)
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    insights = entry.runtime_data
+    namespace = {"__name__": "custom_components.blocker.api"}
+    exec(  # noqa: S102
+        compile(
+            "import time\ndef fetch():\n    time.sleep(0.05)\n",
+            "/config/custom_components/blocker/api.py",
+            "exec",
+        ),
+        namespace,
+    )
+    blocker = MockConfigEntry(domain="blocker", title="Blocker")
+    blocker.add_to_hass(hass)
+    token = current_entry.set(blocker)
+    try:
+        hass.loop.call_soon(namespace["fetch"])
+    finally:
+        current_entry.reset(token)
+    await hass.async_block_till_done()
+
+    report = insights.report()
+    row = next(item for item in report["integrations"] if item["domain"] == "blocker")
+    assert row["loop_wall_ms_per_min"] > 0
+    assert row["loop_cpu_ms_per_min"] == 0  # sleeping costs no CPU
+    callbacks = row["callbacks"]
+    assert callbacks["longest_ms"] >= 45
+    assert callbacks["longest_function"] == "custom_components.blocker.api.fetch"
+    assert callbacks["by_function"][0]["function"] == (
+        "custom_components.blocker.api.fetch"
+    )
+    brief = next(
+        item
+        for item in insights.summary()["integrations"]
+        if item["domain"] == "blocker"
+    )
+    assert brief["longest_ms"] == callbacks["longest_ms"]
+    # A callback without an entry context counts for its module
+    assert (
+        insights.callback_domain("custom_components.hue.light.HueLight.turn_on", None)
+        == "hue"
+    )
+    assert (
+        insights.callback_domain("homeassistant.components.light.LightEntity.x", None)
+        == "core"
+    )
+    assert (
+        insights.callback_domain(
+            "homeassistant.helpers.event._TrackTimeInterval.y", blocker.entry_id
+        )
+        == "blocker"
+    )
+    assert insights.callback_domain("asyncio.tasks.Task.step", "gone") == "core"
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    assert Handle._run.__qualname__ == "Handle._run"  # noqa: SLF001

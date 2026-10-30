@@ -430,3 +430,43 @@ def test_many_cheap_jobs_are_found() -> None:
     assert _keys(find(summary, lambda _: detail, {})) == [
         ("busy_executor", NOTICE, "foo")
     ]
+
+
+def test_one_long_block_is_found_at_once() -> None:
+    """A single callback that stopped the loop is named, no rate needed."""
+    item = {
+        **_item("foo"),
+        "longest_ms": 3_200,
+        "longest_at": 1.0,
+        "longest_function": "custom_components.foo.api.Client.fetch",
+    }
+    detail = _detail(
+        callbacks={
+            "wall_ms_per_min": 400,
+            "per_min": 3,
+            "longest_ms": 3_200,
+            "longest_at": 1.0,
+            "longest_function": "custom_components.foo.api.Client.fetch",
+            "by_function": [
+                {
+                    "function": "custom_components.foo.api.Client.fetch",
+                    "wall_ms_per_min": 400,
+                    "per_min": 3,
+                }
+            ],
+        }
+    )
+    findings = find(_summary([item]), lambda _: detail, {})
+    assert _keys(findings) == [("loop_blocked", NOTICE, "foo")]
+    assert findings[0].values == {
+        "ms": "3,200",
+        "function": "custom_components.foo.api.Client.fetch",
+        "minutes": "15",
+    }
+    assert findings[0].evidence == [
+        "custom_components.foo.api.Client.fetch: 3/min, 400 ms/min"
+    ]
+    assert find(_summary([{**item, "longest_ms": 1_999}]), lambda _: detail, {}) == []
+    assert _keys(
+        find(_summary([{**item, "longest_ms": 12_000}]), lambda _: detail, {})
+    ) == [("loop_blocked", PROBLEM, "foo")]

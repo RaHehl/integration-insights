@@ -43,6 +43,8 @@ const renderText = (text) =>
     .join("");
 
 const plainText = (text) => String(text).replace(/\[([^\]]+)\]\(([^)]+)\)/g, "$1 ($2)");
+const localTime = (epoch) => (epoch ? new Date(epoch * 1000).toLocaleTimeString() : "");
+const isoTime = (epoch) => (epoch ? new Date(epoch * 1000).toISOString() : "");
 
 const ms = (value) =>
   value >= 10 ? Math.round(value).toLocaleString() : value.toFixed(1);
@@ -645,6 +647,16 @@ class IntegrationInsightsPanel extends HTMLElement {
         `${item.samples} samples over ${report.window_minutes} min` +
         (item.low_confidence ? " (few samples)" : ""),
     ];
+    if (item.callbacks) {
+      const cb = item.callbacks;
+      lines.push(
+        `Event loop callbacks: ${cb.wall_ms_per_min} ms/min wall time, ${cb.per_min} per min, ` +
+          `longest ${cb.longest_ms} ms at ${isoTime(cb.longest_at)} in ${cb.longest_function}`
+      );
+      for (const row of cb.by_function) {
+        lines.push(`- ${row.function}: ${row.wall_ms_per_min} ms/min, ${row.per_min} per min`);
+      }
+    }
     if (item.executor) {
       const ex = item.executor;
       lines.push(
@@ -808,7 +820,7 @@ class IntegrationInsightsPanel extends HTMLElement {
         <div class="card-head"><div>Integration</div><div class="num">Loop ms/min</div><div class="num">Background</div><div class="num">of a core</div><div class="num col-samples">Samples</div></div>
         ${rows}
       </div>
-      <div class="footer">CPU time on the event loop, sampled every ${sampler.interval_ms} ms of loop CPU. Background is CPU in executor jobs and threads, measured exactly. Updated ${updated}${this._error ? ` · <span class="error">${escapeHtml(this._error)}</span>` : ""}</div>`;
+      <div class="footer">CPU time on the event loop, sampled every ${sampler.interval_ms} ms of loop CPU. Callbacks, executor jobs and threads are measured exactly. Updated ${updated}${this._error ? ` · <span class="error">${escapeHtml(this._error)}</span>` : ""}</div>`;
   }
 
   _ownerName(owner) {
@@ -934,6 +946,19 @@ class IntegrationInsightsPanel extends HTMLElement {
     if (item.via_library_ms_per_min) {
       parts.push(
         `<p class="note">${ms(item.via_library_ms_per_min)} ms/min of this ran in libraries that only this integration uses.</p>`
+      );
+    }
+    if (item.callbacks) {
+      const cb = item.callbacks;
+      const rows = cb.by_function
+        .map(
+          (row) => `<div class="spot"><div class="code">${escapeHtml(row.function)}</div>
+            <div class="num">${ms(row.wall_ms_per_min)} ms/min</div>
+            <div class="lines"><span class="chip">${row.per_min} per min</span></div></div>`
+        )
+        .join("");
+      parts.push(
+        `<h3>Event loop callbacks</h3><p class="note">${ms(cb.wall_ms_per_min)} ms/min of wall time on the event loop, measured exactly, ${cb.per_min} callbacks per minute. Longest: ${ms(cb.longest_ms)} ms at ${escapeHtml(localTime(cb.longest_at))} in <span class="code">${escapeHtml(cb.longest_function)}</span>.</p>${rows}`
       );
     }
     if (item.executor) {

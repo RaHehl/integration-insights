@@ -30,6 +30,9 @@ JOBS_NOTICE_PER_MIN = 600
 # Wall time on the loop beyond its CPU time: blocking calls or waits for the GIL.
 LOOP_WAIT_NOTICE_MS = 3_000
 LOOP_WAIT_PROBLEM_MS = 12_000
+# One callback that held the loop this long: everything else stood still.
+LOOP_BLOCK_NOTICE_MS = 2_000
+LOOP_BLOCK_PROBLEM_MS = 10_000
 # Shorter windows move too much to judge.
 MIN_MINUTES = 5
 # Lost samples are expected now and then, a steady share skews the numbers.
@@ -154,15 +157,35 @@ def _cpu_findings(
     background = item["background_cpu_ms_per_min"]
     background_notice = BACKGROUND_NOTICE_MS * factor
     background_problem = BACKGROUND_PROBLEM_MS * factor
+    longest = item.get("longest_ms", 0)
     if (
         loop < LOOP_NOTICE_MS * HOLD
         and background < background_notice * HOLD
         and item.get("jobs_per_min", 0) < JOBS_NOTICE_PER_MIN * factor * HOLD
+        and longest < LOOP_BLOCK_NOTICE_MS * HOLD
     ):
         return []
     if (info := detail(domain)) is None:
         return []
     findings = []
+    if longest >= LOOP_BLOCK_NOTICE_MS * hold("loop_blocked", domain):
+        callbacks = info.get("callbacks", {})
+        findings.append(
+            Finding(
+                "loop_blocked",
+                hold.severity("loop_blocked", domain, longest, LOOP_BLOCK_PROBLEM_MS),
+                domain,
+                {
+                    "ms": _number(longest),
+                    "function": item.get("longest_function", ""),
+                    "minutes": minutes,
+                },
+                [
+                    f"{row['function']}: {_number(row['per_min'])}/min, {_number(row['wall_ms_per_min'])} ms/min"
+                    for row in callbacks.get("by_function", [])[:EVIDENCE_LINES]
+                ],
+            )
+        )
     loop_hold = hold("busy_loop", domain)
     if (
         loop >= LOOP_NOTICE_MS * loop_hold

@@ -241,3 +241,55 @@ def test_summary_matches_report() -> None:
     assert {k: report["integrations"][0][k] for k in brief} == brief
     assert collector.detail("busy", 680.0, 0.0, 5) == report["integrations"][0]
     assert collector.detail("missing", 680.0, 0.0, 5) is None
+
+
+def test_callbacks_add_wall_time_and_the_longest_block() -> None:
+    """Timed callbacks give exact wall time per integration and the longest run."""
+    from custom_components.integration_insights.collector import CallbackRecord  # noqa: PLC0415
+
+    collector = Collector()
+    collector.add_callbacks(
+        [
+            CallbackRecord(
+                "foo", "custom_components.foo.a", 10, 300 * MS, 80 * MS, 1.0
+            ),
+            CallbackRecord("foo", "custom_components.foo.b", 2, 100 * MS, 90 * MS, 2.0),
+            CallbackRecord("bar", "custom_components.bar.c", 1, 50 * MS, 50 * MS, 3.0),
+        ],
+        now=60.0,
+    )
+    # A later minute with a longer block for foo
+    collector.add_callbacks(
+        [
+            CallbackRecord(
+                "foo", "custom_components.foo.a", 1, 2_500 * MS, 2_500 * MS, 4.0
+            )
+        ],
+        now=120.0,
+    )
+    summary = collector.summary(now=150.0, started=0.0, minutes=5)
+    assert summary["loop_wall_ms_per_min"] == 2_950 / 2.5
+    foo = next(item for item in summary["integrations"] if item["domain"] == "foo")
+    assert foo["loop_wall_ms_per_min"] == 2_900 / 2.5
+    assert (foo["longest_ms"], foo["longest_at"], foo["longest_function"]) == (
+        2_500,
+        4.0,
+        "custom_components.foo.a",
+    )
+    bar = next(item for item in summary["integrations"] if item["domain"] == "bar")
+    assert bar["longest_ms"] == 50
+
+    detail = collector.detail("foo", now=150.0, started=0.0, minutes=5)
+    assert detail is not None
+    callbacks = detail["callbacks"]
+    assert callbacks["per_min"] == 13 / 2.5
+    assert callbacks["longest_ms"] == 2_500
+    assert [row["function"] for row in callbacks["by_function"]] == [
+        "custom_components.foo.a",
+        "custom_components.foo.b",
+    ]
+    assert callbacks["by_function"][0]["per_min"] == 11 / 2.5
+
+    # Only the window's minutes count for the longest block
+    later = collector.summary(now=60 * 62.0, started=0.0, minutes=1)
+    assert all("longest_ms" not in item for item in later["integrations"])

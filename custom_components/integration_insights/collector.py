@@ -5,11 +5,13 @@ from collections import Counter, deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 import heapq
-from typing import Any
+from typing import Any, NamedTuple
 
 from .attribution import short_path
 from .background import JobRecord, Owner, ThreadRecord
 from .sampler import Record
+
+TOP_CALLBACKS = 5
 
 WINDOW_MINUTES = 60
 MAX_STACKS_PER_MINUTE = 500
@@ -25,6 +27,17 @@ KEPT_WINDOWS = (5, 15, 60)
 
 type Location = tuple[str, str, int]  # short path, qualname, line
 type Stack = tuple[Location, ...]
+
+
+class CallbackRecord(NamedTuple):
+    """Loop callbacks of one function for one integration, from one drain."""
+
+    domain: str
+    label: str
+    calls: int
+    total_ns: int
+    max_ns: int
+    max_at: float
 
 
 @dataclass(slots=True)
@@ -47,6 +60,18 @@ class _Domain:
     job_total: int = 0
     thread_cpu_ns: int = 0
     threads: Counter[str] = field(default_factory=Counter)
+    # Wall time of the integration's callbacks on the loop, measured exactly
+    loop_wall_ns: int = 0
+    callback_total: int = 0
+    callbacks: Counter[str] = field(default_factory=Counter)
+    callback_counts: Counter[str] = field(default_factory=Counter)
+    longest_ns: int = 0
+    longest_at: float = 0.0
+    longest_label: str = ""
+
+    def note_longest(self, ns: int, at: float, label: str) -> None:
+        if ns > self.longest_ns:
+            self.longest_ns, self.longest_at, self.longest_label = ns, at, label
 
     def merge(self, other: _Domain) -> None:
         self.cpu_ns += other.cpu_ns
@@ -66,9 +91,18 @@ class _Domain:
         self.job_total += other.job_total
         self.thread_cpu_ns += other.thread_cpu_ns
         self.threads.update(other.threads)
+        self.loop_wall_ns += other.loop_wall_ns
+        self.callback_total += other.callback_total
+        self.callbacks.update(other.callbacks)
+        self.callback_counts.update(other.callback_counts)
+        self.note_longest(other.longest_ns, other.longest_at, other.longest_label)
 
     def merge_totals(self, other: _Domain, sign: int = 1) -> None:
-        """Add (or with sign -1 remove) only the numbers, not the counters."""
+        """Add (or with sign -1 remove) only the numbers, not the counters.
+
+        The longest callback is not a sum: the window reads it from the
+        minute buckets.
+        """
         self.cpu_ns += sign * other.cpu_ns
         self.samples += sign * other.samples
         self.via_library_ns += sign * other.via_library_ns
@@ -76,6 +110,8 @@ class _Domain:
         self.executor_wall_ns += sign * other.executor_wall_ns
         self.job_total += sign * other.job_total
         self.thread_cpu_ns += sign * other.thread_cpu_ns
+        self.loop_wall_ns += sign * other.loop_wall_ns
+        self.callback_total += sign * other.callback_total
 
     def totals_are_zero(self) -> bool:
         return not (
@@ -86,6 +122,8 @@ class _Domain:
             or self.executor_wall_ns
             or self.job_total
             or self.thread_cpu_ns
+            or self.loop_wall_ns
+            or self.callback_total
         )
 
     @property
@@ -98,6 +136,7 @@ class _Bucket:
     minute: int
     cpu_ns: int = 0
     loop_busy_ns: int = 0
+    loop_wall_ns: int = 0
     executor_cpu_ns: int = 0
     thread_cpu_ns: int = 0
     samples: int = 0
@@ -111,6 +150,7 @@ class _Bucket:
         """Add (or remove) the numbers of another bucket, without counters."""
         self.cpu_ns += sign * other.cpu_ns
         self.loop_busy_ns += sign * other.loop_busy_ns
+        self.loop_wall_ns += sign * other.loop_wall_ns
         self.executor_cpu_ns += sign * other.executor_cpu_ns
         self.thread_cpu_ns += sign * other.thread_cpu_ns
         self.samples += sign * other.samples
@@ -201,6 +241,19 @@ class Collector:
             stats.thread_cpu_ns += thread.cpu_ns
             stats.threads[thread.name] += thread.cpu_ns
             bucket.thread_cpu_ns += thread.cpu_ns
+
+    def add_callbacks(self, callbacks: list[CallbackRecord], now: float) -> None:
+        """Add the loop callbacks timed before `now`, already mapped to owners."""
+        bucket = self._bucket(now)
+        for record in callbacks:
+            if (stats := bucket.domains.get(record.domain)) is None:
+                stats = bucket.domains[record.domain] = _Domain()
+            stats.loop_wall_ns += record.total_ns
+            stats.callback_total += record.calls
+            stats.callbacks[record.label] += record.total_ns
+            stats.callback_counts[record.label] += record.calls
+            stats.note_longest(record.max_ns, record.max_at, record.label)
+            bucket.loop_wall_ns += record.total_ns
 
     def add_loop_busy(self, busy_ns: int, now: float) -> None:
         """Add wall time the loop spent outside select() before `now`."""
@@ -377,21 +430,24 @@ class Collector:
         sums: dict[str, list[int]] = {}
         for part in parts:
             for domain, stats in part.domains.items():
-                row = sums.setdefault(domain, [0, 0, 0, 0, 0])
+                row = sums.setdefault(domain, [0, 0, 0, 0, 0, 0])
                 row[0] += stats.cpu_ns
                 row[1] += stats.executor_cpu_ns + stats.thread_cpu_ns
                 row[2] += stats.samples
                 row[3] += stats.via_library_ns
                 row[4] += stats.job_total
-        idle = sums.pop("idle", [0, 0, 0, 0, 0])
+                row[5] += stats.loop_wall_ns
+        idle = sums.pop("idle", [0, 0, 0, 0, 0, 0])
+        longest = self._longest(now, minutes)
         integrations = []
-        for domain, (loop_ns, background_ns, samples, via_ns, jobs) in sorted(
+        for domain, (loop_ns, background_ns, samples, via_ns, jobs, wall_ns) in sorted(
             sums.items(), key=lambda item: (-(item[1][0] + item[1][1]), item[0])
         ):
             item: dict[str, Any] = {
                 "domain": domain,
                 "cpu_ms_per_min": per_minute(loop_ns + background_ns),
                 "loop_cpu_ms_per_min": per_minute(loop_ns),
+                "loop_wall_ms_per_min": per_minute(wall_ns),
                 "background_cpu_ms_per_min": per_minute(background_ns),
                 "jobs_per_min": round(jobs / span, 1),
                 "samples": samples,
@@ -399,11 +455,16 @@ class Collector:
             }
             if via_ns:
                 item["via_library_ms_per_min"] = per_minute(via_ns)
+            if (block := longest.get(domain)) is not None:
+                item["longest_ms"] = round(block[0] / 1e6, 1)
+                item["longest_at"] = block[1]
+                item["longest_function"] = block[2]
             integrations.append(item)
         return {
             "window_minutes": round(span, 1),
             "loop_cpu_ms_per_min": per_minute(sum(p.cpu_ns for p in parts)),
             "loop_busy_ms_per_min": per_minute(sum(p.loop_busy_ns for p in parts)),
+            "loop_wall_ms_per_min": per_minute(sum(p.loop_wall_ns for p in parts)),
             "executor_cpu_ms_per_min": per_minute(
                 sum(p.executor_cpu_ns for p in parts)
             ),
@@ -417,6 +478,22 @@ class Collector:
             ),
             "integrations": integrations,
         }
+
+    def _longest(self, now: float, minutes: int) -> dict[str, tuple[int, float, str]]:
+        """Return the longest callback per integration in the window."""
+        first_minute = self._first_minute(now, minutes)
+        longest: dict[str, tuple[int, float, str]] = {}
+        for bucket in self._buckets:
+            if bucket.minute < first_minute:
+                continue
+            for domain, stats in bucket.domains.items():
+                if stats.longest_ns > longest.get(domain, (0, 0.0, ""))[0]:
+                    longest[domain] = (
+                        stats.longest_ns,
+                        stats.longest_at,
+                        stats.longest_label,
+                    )
+        return longest
 
     def detail(
         self, domain: str, now: float, started: float, minutes: int = WINDOW_MINUTES
@@ -491,6 +568,7 @@ def _item(domain: str, stats: _Domain, span: float) -> dict[str, Any]:
         "domain": domain,
         "cpu_ms_per_min": per_minute(stats.total_cpu_ns),
         "loop_cpu_ms_per_min": per_minute(stats.cpu_ns),
+        "loop_wall_ms_per_min": per_minute(stats.loop_wall_ns),
         "background_cpu_ms_per_min": per_minute(
             stats.executor_cpu_ns + stats.thread_cpu_ns
         ),
@@ -531,6 +609,22 @@ def _item(domain: str, stats: _Domain, span: float) -> dict[str, Any]:
         item["threads"] = {
             "cpu_ms_per_min": per_minute(stats.thread_cpu_ns),
             "by_name": top(stats.threads, TOP_THREADS),
+        }
+    if stats.callback_total:
+        item["callbacks"] = {
+            "wall_ms_per_min": per_minute(stats.loop_wall_ns),
+            "per_min": round(stats.callback_total / span, 1),
+            "longest_ms": round(stats.longest_ns / 1e6, 1),
+            "longest_at": stats.longest_at,
+            "longest_function": stats.longest_label,
+            "by_function": [
+                {
+                    "function": label,
+                    "wall_ms_per_min": per_minute(ns),
+                    "per_min": round(stats.callback_counts[label] / span, 1),
+                }
+                for label, ns in _ranked(stats.callbacks, TOP_CALLBACKS)
+            ],
         }
     return item
 

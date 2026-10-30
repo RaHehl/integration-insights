@@ -18,11 +18,18 @@ from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.loader import IntegrationNotLoaded, async_get_loaded_integration
 from homeassistant.util import dt as dt_util
 
-from .attribution import Packages, distribution_owners, library_owners
+from .attribution import (
+    Packages,
+    distribution_owners,
+    library_owners,
+    module_domain,
+    platform_domains,
+)
 from .background import Background, LoopWait, ThreadRecord
-from .collector import WINDOW_MINUTES, Collector
+from .collector import WINDOW_MINUTES, CallbackRecord, Collector
 from .const import DOMAIN
 from .findings import INFO, MIN_MINUTES, Finding, Shown, find
+from .loop_timing import LoopTiming
 from .memory import (
     Snapshot,
     account_heap,
@@ -62,6 +69,9 @@ class Insights:
             self.sampler.walk, lambda: self.collector.library_map
         )
         self.loop_wait = LoopWait()
+        self.loop_timing = LoopTiming(hass.loop)
+        self._entry_domains: dict[str, str] = {}
+        self._platforms = platform_domains()
         self.started = 0.0
         self._position = 0
         self._mapped_components: frozenset[str] | None = None
@@ -124,6 +134,7 @@ class Insights:
             self.background.hook_executor(executor)
         if self.loop_wait.install(self.hass.loop):
             self.sampler.select_wrapper = self.loop_wait.wrapper_code
+        self.loop_timing.start()
         self._wall_ns = time.perf_counter_ns()
         self._waiting_ns = self.loop_wait.waiting_ns
         self.started = time.monotonic()
@@ -156,6 +167,7 @@ class Insights:
         self._unhook_wakeup_reads()
         self.background.unhook_executors()
         self.loop_wait.uninstall()
+        self.loop_timing.stop()
         self.sampler.select_wrapper = None
 
     def _hook_wakeup_reads(self) -> None:
@@ -216,6 +228,20 @@ class Insights:
         now = time.monotonic()
         self.collector.add(records, now)
         self.collector.add_jobs(self.background.drain_jobs(), now)
+        self.collector.add_callbacks(
+            [
+                CallbackRecord(
+                    self.callback_domain(timed.label, timed.entry_id),
+                    timed.label,
+                    timed.calls,
+                    timed.total_ns,
+                    timed.max_ns,
+                    timed.max_at,
+                )
+                for timed in self.loop_timing.drain()
+            ],
+            now,
+        )
         lost, errors = self.sampler.lost, self.sampler.errors
         self.collector.add_losses(
             lost - self._lost_seen, errors - self._errors_seen, now
@@ -227,6 +253,26 @@ class Insights:
         self._wall_ns, self._waiting_ns = wall, waiting
         if self.loop_wait.wrapper_code is not None and busy > 0:
             self.collector.add_loop_busy(busy, now)
+
+    def callback_domain(self, label: str, entry_id: str | None) -> str:
+        """Return the integration a timed callback ran for.
+
+        The config entry in the callback's context decides; without one the
+        module of the function or class does. A platform's own code without
+        an entry is core: it runs for whoever registered the entity.
+        """
+        if entry_id is not None:
+            if (domain := self._entry_domains.get(entry_id)) is None:
+                entry = self.hass.config_entries.async_get_entry(entry_id)
+                domain = self._entry_domains[entry_id] = (
+                    entry.domain if entry is not None else ""
+                )
+            if domain:
+                return domain
+        domain = module_domain(label)
+        if domain is None or domain in self._platforms:
+            return "core"
+        return domain
 
     async def _async_poll_threads(self, skip: set[int]) -> None:
         try:

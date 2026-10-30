@@ -35,6 +35,14 @@
       "title": "{name} keeps Home Assistant busy",
       "description": "Over the last {minutes} minutes, {name} used the event loop for {ms} ms a minute, {share}% of all CPU time on the event loop. While it runs, everything else waits: automations, the dashboard and other integrations.\n\nWhat you can do:\n- {name} is part of Home Assistant and updates with it. Check whether a newer Home Assistant fixes it.\n- Look for a report, or open one, at [the Home Assistant issue tracker]({issues_url}), and add the report from this page.\n- To confirm, [disable {name}]({config_url}) for a while and compare."
     },
+    "loop_blocked": {
+      "title": "{name} stopped Home Assistant for {ms} ms",
+      "description": "Over the last {minutes} minutes, one callback of {name} held the event loop for {ms} ms at a stretch, in {function}. While it ran, nothing else in Home Assistant moved: no automation, no dashboard update, no other integration. A block this long is usually a call that waits on the network or a file without yielding.\n\nWhat you can do:\n- Check whether an update of {name} is available.\n- Look for a report, or open one, at [the issue tracker]({issues_url}), and add the report from this page.\n- To confirm, [disable {name}]({config_url}) for a while and compare."
+    },
+    "loop_blocked_built_in": {
+      "title": "{name} stopped Home Assistant for {ms} ms",
+      "description": "Over the last {minutes} minutes, one callback of {name} held the event loop for {ms} ms at a stretch, in {function}. While it ran, nothing else in Home Assistant moved: no automation, no dashboard update, no other integration. A block this long is usually a call that waits on the network or a file without yielding.\n\nWhat you can do:\n- {name} is part of Home Assistant and updates with it. Check whether a newer Home Assistant fixes it.\n- Look for a report, or open one, at [the Home Assistant issue tracker]({issues_url}), and add the report from this page.\n- To confirm, [disable {name}]({config_url}) for a while and compare."
+    },
     "busy_thread": {
       "title": "{name} keeps background threads busy",
       "description": "Over the last {minutes} minutes, threads of {name} used {ms} ms of CPU a minute. They run beside the event loop, but they cost CPU and power, and that adds up on small hardware.\n\nWhat you can do:\n- Check whether an update of {name} is available.\n- Look for a report, or open one, at [the issue tracker]({issues_url}), and add the report from this page."
