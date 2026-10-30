@@ -181,7 +181,7 @@ def _cpu_findings(
                     "minutes": minutes,
                 },
                 [
-                    f"{row['function']}: {_number(row['per_min'])}/min, {_number(row['wall_ms_per_min'])} ms/min"
+                    f"{row['function']}: {_rate(row['per_min'])}/min, {_number(row['wall_ms_per_min'])} ms/min"
                     for row in callbacks.get("by_function", [])[:EVIDENCE_LINES]
                 ],
             )
@@ -297,3 +297,8 @@ def _memory_findings(memory: dict[str, Any]) -> list[Finding]:
 
 def _number(value: float) -> str:
     return f"{value:,.0f}"
+
+
+def _rate(value: float) -> str:
+    """Format a rate; small ones keep a decimal so 2 in 6 minutes is not 0."""
+    return f"{value:.1f}" if value < 10 else _number(value)

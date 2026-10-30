@@ -272,6 +272,9 @@ class Insights:
                 )
             if domain:
                 return domain
+        if label.endswith("._read_from_self"):
+            # The loop reading its wakeup socket: mostly the sampler's signals
+            return DOMAIN
         domain = module_domain(label)
         if domain is None:
             # A library that only one loaded integration requires

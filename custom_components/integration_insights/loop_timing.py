@@ -60,7 +60,13 @@ def _unwrap_helper(owner: Any) -> Any:
                 return job.target
         return None
     if module.startswith(_TRANSPORT_MODULES):
-        return _static(owner, "_protocol")
+        protocol = _static(owner, "_protocol")
+        # An SSL protocol wraps the application's protocol
+        if protocol is not None and type(protocol).__module__.startswith(
+            _TRANSPORT_MODULES
+        ):
+            protocol = _static(protocol, "_app_protocol") or protocol
+        return protocol
     return None
 
 

@@ -451,7 +451,7 @@ def test_one_long_block_is_found_at_once() -> None:
                 {
                     "function": "custom_components.foo.api.Client.fetch",
                     "wall_ms_per_min": 400,
-                    "per_min": 3,
+                    "per_min": 0.3,
                 }
             ],
         }
@@ -464,7 +464,7 @@ def test_one_long_block_is_found_at_once() -> None:
         "minutes": "15",
     }
     assert findings[0].evidence == [
-        "custom_components.foo.api.Client.fetch: 3/min, 400 ms/min"
+        "custom_components.foo.api.Client.fetch: 0.3/min, 400 ms/min"
     ]
     assert find(_summary([{**item, "longest_ms": 1_999}]), lambda _: detail, {}) == []
     assert _keys(

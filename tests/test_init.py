@@ -301,5 +301,13 @@ async def test_callbacks_are_timed_and_charged_to_their_entry(
         == "blocker"
     )
     assert insights.callback_domain("asyncio.tasks.Task.step", "gone") == "core"
+    assert (
+        insights.callback_domain(
+            "asyncio.unix_events._UnixSelectorEventLoop._read_from_self", None
+        )
+        == DOMAIN
+    )
+    insights.collector.library_map["aiofoo"] = "foo"
+    assert insights.callback_domain("aiofoo.client.Client.data_received", None) == "foo"
     assert await hass.config_entries.async_unload(entry.entry_id)
     assert Handle._run.__qualname__ == "Handle._run"  # noqa: SLF001
