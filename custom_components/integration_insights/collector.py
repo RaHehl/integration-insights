@@ -101,6 +101,8 @@ class _Bucket:
     executor_cpu_ns: int = 0
     thread_cpu_ns: int = 0
     samples: int = 0
+    samples_lost: int = 0
+    handler_errors: int = 0
     stack_count: int = 0
     dropped_stack_ns: int = 0
     domains: dict[str, _Domain] = field(default_factory=dict)
@@ -112,6 +114,8 @@ class _Bucket:
         self.executor_cpu_ns += sign * other.executor_cpu_ns
         self.thread_cpu_ns += sign * other.thread_cpu_ns
         self.samples += sign * other.samples
+        self.samples_lost += sign * other.samples_lost
+        self.handler_errors += sign * other.handler_errors
         self.dropped_stack_ns += sign * other.dropped_stack_ns
         for domain, stats in other.domains.items():
             if (total := self.domains.get(domain)) is None:
@@ -137,14 +141,18 @@ GAP: Location = ("...", "", 0)
 
 
 class Collector:
-    """Keep the last hour of samples in one minute buckets."""
+    """Keep the last hour of samples in one minute buckets.
+
+    A window of n minutes covers the last n finished minutes and the current
+    one, so it spans at least n minutes.
+    """
 
     def __init__(self) -> None:
         """Initialize the collector."""
         self.library_map: dict[str, str] = {}
         # Libraries seen where no integration frame was on the stack.
         self.seen_libraries: set[str] = set()
-        self._buckets: deque[_Bucket] = deque(maxlen=WINDOW_MINUTES)
+        self._buckets: deque[_Bucket] = deque(maxlen=WINDOW_MINUTES + 1)
         # Keyed by id: code objects compare equal across files when their
         # bytecode matches. The value keeps the code alive so ids stay unique.
         self._locations: dict[tuple[int, int], tuple[Any, Location]] = {}
@@ -197,6 +205,12 @@ class Collector:
     def add_loop_busy(self, busy_ns: int, now: float) -> None:
         """Add wall time the loop spent outside select() before `now`."""
         self._bucket(now).loop_busy_ns += busy_ns
+
+    def add_losses(self, samples_lost: int, handler_errors: int, now: float) -> None:
+        """Add samples lost and handler errors that happened before `now`."""
+        bucket = self._bucket(now)
+        bucket.samples_lost += samples_lost
+        bucket.handler_errors += handler_errors
 
     def add(self, records: list[Record], now: float) -> None:
         """Add records that were sampled before `now` (monotonic seconds)."""
@@ -311,9 +325,9 @@ class Collector:
         return line if line is not None else code.co_firstlineno
 
     def _window(self, minutes: int, now: float) -> _Window:
-        """Return the sum of the finished minutes of the last `minutes`."""
+        """Return the sum of the last `minutes` finished minutes."""
         current = int(now // 60)
-        first = current - minutes + 1
+        first = current - minutes
         window = self._windows.get(minutes) if minutes in KEPT_WINDOWS else None
         if window is None:
             window = _Window()
@@ -332,13 +346,16 @@ class Collector:
                 window.minutes[minute] = bucket
         return window
 
+    @staticmethod
+    def _first_minute(now: float, minutes: int) -> int:
+        return int(now // 60) - min(minutes, WINDOW_MINUTES)
+
     def _view(
         self, now: float, started: float, minutes: int
     ) -> tuple[float, _Bucket, _Bucket | None]:
         """Return the span in minutes, the finished minutes and the current one."""
         minutes = min(minutes, WINDOW_MINUTES)
-        first_minute = int(now // 60) - minutes + 1
-        window_start = max(started, first_minute * 60)
+        window_start = max(started, self._first_minute(now, minutes) * 60)
         span = max((now - window_start) / 60, 1 / 60)
         current = (
             self._buckets[-1]
@@ -393,6 +410,8 @@ class Collector:
             "thread_cpu_ms_per_min": per_minute(sum(p.thread_cpu_ns for p in parts)),
             "idle_ms_per_min": per_minute(idle[0]),
             "samples": sum(p.samples for p in parts),
+            "samples_lost": sum(p.samples_lost for p in parts),
+            "handler_errors": sum(p.handler_errors for p in parts),
             "stacks_not_kept_ms_per_min": per_minute(
                 sum(p.dropped_stack_ns for p in parts)
             ),
@@ -404,7 +423,7 @@ class Collector:
     ) -> dict[str, Any] | None:
         """Return everything known about one integration, or None."""
         span, _finished, _current = self._view(now, started, minutes)
-        first_minute = int(now // 60) - min(minutes, WINDOW_MINUTES) + 1
+        first_minute = self._first_minute(now, minutes)
         stats = _Domain()
         found = False
         for bucket in self._buckets:

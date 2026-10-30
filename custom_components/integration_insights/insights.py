@@ -21,7 +21,7 @@ from homeassistant.util import dt as dt_util
 from .attribution import Packages, distribution_owners, library_owners
 from .background import Background, LoopWait, ThreadRecord
 from .collector import WINDOW_MINUTES, Collector
-from .findings import INFO, MIN_MINUTES, Finding, find
+from .findings import INFO, MIN_MINUTES, Finding, Shown, find
 from .memory import (
     Snapshot,
     account_heap,
@@ -43,6 +43,8 @@ TOP_ENTITIES = 20
 KEPT_SNAPSHOTS = 10
 # Left out of findings after a start.
 STARTUP_MINUTES = 5
+# Findings shown this long ago no longer hold, see findings.HOLD.
+SHOWN_SECONDS = 120
 
 
 class Insights:
@@ -64,8 +66,11 @@ class Insights:
         self._packages = Packages()
         self._owners: dict[str, str] = {}
         self._checked_libraries: set[str] = set()
-        # Findings of the last call per window, see findings.HOLD
-        self._shown: dict[int, frozenset[tuple[str, str | None]]] = {}
+        # Findings of the last call and when, see findings.HOLD
+        self._shown: Shown = {}
+        self._shown_at = 0.0
+        self._lost_seen = 0
+        self._errors_seen = 0
         self._rearm_failed = False
         self._wakeup_hook: Callable[[bytes], None] | None = None
         self._unsub_drain: CALLBACK_TYPE | None = None
@@ -179,6 +184,11 @@ class Insights:
         now = time.monotonic()
         self.collector.add(records, now)
         self.collector.add_jobs(self.background.drain_jobs(), now)
+        lost, errors = self.sampler.lost, self.sampler.errors
+        self.collector.add_losses(
+            lost - self._lost_seen, errors - self._errors_seen, now
+        )
+        self._lost_seen, self._errors_seen = lost, errors
         wall = time.perf_counter_ns()
         waiting = self.loop_wait.waiting_ns
         busy = (wall - self._wall_ns) - (waiting - self._waiting_ns)
@@ -285,9 +295,12 @@ class Insights:
     def summary(self, minutes: int = WINDOW_MINUTES) -> dict[str, Any]:
         """Return totals and the load per integration over the last `minutes`."""
         self.drain()
+        return self._summary_at(time.monotonic(), minutes)
+
+    def _summary_at(self, now: float, minutes: int) -> dict[str, Any]:
         return {
             "sampler": self._sampler_stats(),
-            **self.collector.summary(time.monotonic(), self.started, minutes),
+            **self.collector.summary(now, self.started, minutes),
         }
 
     def detail(
@@ -295,7 +308,12 @@ class Insights:
     ) -> dict[str, Any] | None:
         """Return everything known about one integration, or None."""
         self.drain()
-        item = self.collector.detail(domain, time.monotonic(), self.started, minutes)
+        return self._detail_at(domain, time.monotonic(), minutes)
+
+    def _detail_at(
+        self, domain: str, now: float, minutes: int
+    ) -> dict[str, Any] | None:
+        item = self.collector.detail(domain, now, self.started, minutes)
         return None if item is None else self._with_devices(item)
 
     def findings(self, minutes: int = WINDOW_MINUTES) -> list[Finding]:
@@ -304,9 +322,12 @@ class Insights:
         The minutes right after a start are left out: imports, the library map
         and integrations setting up would look like a load that is not there.
         """
-        settled = (time.monotonic() - self.started) / 60 - STARTUP_MINUTES
-        # A window of n minutes starts on a minute boundary and can span a
-        # little less than n, so wait one minute more than find() needs.
+        self.drain()
+        now = time.monotonic()
+        settled = (now - self.started) / 60 - STARTUP_MINUTES
+        # A window of n minutes starts on a minute boundary up to n + 1
+        # minutes ago, so it must be a minute shorter than the settled time
+        # to leave the start out.
         if settled < MIN_MINUTES + 1:
             return [
                 Finding(
@@ -315,15 +336,18 @@ class Insights:
                     values={"minutes": f"{math.ceil(MIN_MINUTES + 1 - settled)}"},
                 )
             ]
-        window = min(minutes, math.floor(settled))
+        window = min(minutes, math.floor(settled) - 1)
+        if now - self._shown_at > SHOWN_SECONDS:
+            self._shown = {}
         findings = find(
-            self.summary(window),
-            lambda domain: self.detail(domain, window),
+            self._summary_at(now, window),
+            lambda domain: self._detail_at(domain, now, window),
             self.memory_report(),
             self._built_in,
-            self._shown.get(minutes, frozenset()),
+            self._shown,
         )
-        self._shown[minutes] = frozenset((f.key, f.domain) for f in findings)
+        self._shown = {(f.key, f.domain): f.severity for f in findings}
+        self._shown_at = now
         return findings
 
     def _built_in(self, domain: str) -> bool:

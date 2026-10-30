@@ -121,10 +121,14 @@ def test_window_drops_old_minutes() -> None:
     collector = Collector()
     collector.add([_record(_frames((spin, 6)), "foo", 60 * MS)], now=0.0)
     collector.add([_record(_frames((spin, 6)), "bar", 60 * MS)], now=3600.0)
-    report = collector.report(now=3630.0, started=0.0)
+    report = collector.report(now=3690.0, started=0.0)
 
     assert [item["domain"] for item in report["integrations"]] == ["bar"]
-    assert report["window_minutes"] == 59.5
+    # 60 finished minutes and the current one
+    assert report["window_minutes"] == 60.5
+    assert (
+        collector.report(now=3630.0, started=0.0)["integrations"][1]["domain"] == "foo"
+    )
 
 
 def test_hot_spot_prefers_the_integrations_own_code() -> None:

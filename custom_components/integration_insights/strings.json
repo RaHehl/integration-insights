@@ -25,19 +25,39 @@
     },
     "measuring_incomplete": {
       "title": "Some measurements were lost",
-      "description": "The sampler lost samples or ran into errors. The numbers still show who uses the most, but they are less exact."
+      "description": "Over the last {minutes} minutes, the sampler lost samples or ran into errors. The numbers still show who uses the most, but they are less exact."
     },
     "busy_loop": {
       "title": "{name} keeps Home Assistant busy",
       "description": "Over the last {minutes} minutes, {name} used the event loop for {ms} ms a minute, {share}% of all CPU time on the event loop. While it runs, everything else waits: automations, the dashboard and other integrations.\n\nWhat you can do:\n- Check whether an update of {name} is available.\n- Look for a report, or open one, at [the issue tracker]({issues_url}), and add the report from this page.\n- To confirm, [disable {name}]({config_url}) for a while and compare."
     },
+    "busy_loop_built_in": {
+      "title": "{name} keeps Home Assistant busy",
+      "description": "Over the last {minutes} minutes, {name} used the event loop for {ms} ms a minute, {share}% of all CPU time on the event loop. While it runs, everything else waits: automations, the dashboard and other integrations.\n\nWhat you can do:\n- {name} is part of Home Assistant and updates with it. Check whether a newer Home Assistant fixes it.\n- Look for a report, or open one, at [the Home Assistant issue tracker]({issues_url}), and add the report from this page.\n- To confirm, [disable {name}]({config_url}) for a while and compare."
+    },
     "busy_thread": {
       "title": "{name} keeps background threads busy",
       "description": "Over the last {minutes} minutes, threads of {name} used {ms} ms of CPU a minute. They run beside the event loop, but they cost CPU and power, and that adds up on small hardware.\n\nWhat you can do:\n- Check whether an update of {name} is available.\n- Look for a report, or open one, at [the issue tracker]({issues_url}), and add the report from this page."
     },
+    "busy_thread_built_in": {
+      "title": "{name} keeps background threads busy",
+      "description": "Over the last {minutes} minutes, threads of {name} used {ms} ms of CPU a minute. They run beside the event loop, but they cost CPU and power, and that adds up on small hardware.\n\nWhat you can do:\n- {name} is part of Home Assistant and updates with it. Check whether a newer Home Assistant fixes it.\n- Look for a report, or open one, at [the Home Assistant issue tracker]({issues_url}), and add the report from this page."
+    },
     "busy_executor": {
       "title": "{name} keeps handing off work",
       "description": "Over the last {minutes} minutes, {name} ran {jobs} jobs a minute in the background, using {ms} ms of CPU a minute. That many jobs can mean it polls or reads files more often than it needs to.\n\nWhat you can do:\n- Check the options of {name} for an update interval.\n- Check whether an update of {name} is available.\n- Look for a report, or open one, at [the issue tracker]({issues_url}), and add the report from this page."
+    },
+    "busy_executor_built_in": {
+      "title": "{name} keeps handing off work",
+      "description": "Over the last {minutes} minutes, {name} ran {jobs} jobs a minute in the background, using {ms} ms of CPU a minute. That many jobs can mean it polls or reads files more often than it needs to.\n\nWhat you can do:\n- Check the options of {name} for an update interval.\n- {name} is part of Home Assistant and updates with it. Check whether a newer Home Assistant fixes it.\n- Look for a report, or open one, at [the Home Assistant issue tracker]({issues_url}), and add the report from this page."
+    },
+    "heavy_executor": {
+      "title": "{name} does heavy work in the background",
+      "description": "Over the last {minutes} minutes, background jobs of {name} used {ms} ms of CPU a minute, in {jobs} jobs a minute. They run beside the event loop, but they cost CPU and power, and they take turns with the event loop for Python's interpreter lock.\n\nWhat you can do:\n- Check the options of {name} for an update interval.\n- Check whether an update of {name} is available.\n- Look for a report, or open one, at [the issue tracker]({issues_url}), and add the report from this page."
+    },
+    "heavy_executor_built_in": {
+      "title": "{name} does heavy work in the background",
+      "description": "Over the last {minutes} minutes, background jobs of {name} used {ms} ms of CPU a minute, in {jobs} jobs a minute. They run beside the event loop, but they cost CPU and power, and they take turns with the event loop for Python's interpreter lock.\n\nWhat you can do:\n- Check the options of {name} for an update interval.\n- {name} is part of Home Assistant and updates with it. Check whether a newer Home Assistant fixes it.\n- Look for a report, or open one, at [the Home Assistant issue tracker]({issues_url}), and add the report from this page."
     },
     "loop_waits": {
       "title": "The event loop often waits",

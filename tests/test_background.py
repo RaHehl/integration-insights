@@ -246,7 +246,7 @@ def test_collector_reports_background_cpu() -> None:
         [ThreadRecord(Owner("busy", ()), "busy-thread", 20 * ms)], now
     )
     collector.add_loop_busy(70 * ms, now)
-    report = collector.report(now + 60, 0.0, minutes=2)
+    report = collector.report(now + 60, 0.0, minutes=1)
     assert report["executor_cpu_ms_per_min"] == 45.0
     assert report["thread_cpu_ms_per_min"] == 20.0
     assert report["loop_busy_ms_per_min"] == 70.0

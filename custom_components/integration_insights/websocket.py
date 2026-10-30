@@ -1,6 +1,7 @@
 """WebSocket API for the panel."""
 
 from contextlib import suppress
+import re
 from typing import Any
 
 import probatio as vol
@@ -18,6 +19,7 @@ from .insights import Insights
 from .memory import SnapshotRefused
 
 MINUTES = vol.All(int, vol.Range(min=1, max=WINDOW_MINUTES))
+_PLACEHOLDER = re.compile(r"\{(\w+)\}")
 
 
 @callback
@@ -250,6 +252,7 @@ def _render(
         "domain": finding.domain,
         "evidence": finding.evidence,
     }
+    key = finding.key
     if finding.domain is not None:
         about = _about(hass, finding.domain)
         item.update(about)
@@ -258,13 +261,20 @@ def _render(
             issues_url=about["issues_url"],
             config_url=f"/config/integrations/integration/{finding.domain}",
         )
-    prefix = f"component.{DOMAIN}.issues.{finding.key}."
+        # Advice for a built-in integration differs: it updates with Home
+        # Assistant and its reports go to the core issue tracker.
+        if about["built_in"] and f"{_prefix(key)}_built_in.title" in translations:
+            key = f"{key}_built_in"
     for part in ("title", "description"):
-        text = translations.get(prefix + part, "")
-        for key, value in values.items():
-            text = text.replace(f"{{{key}}}", value)
-        item[part] = text
+        item[part] = _PLACEHOLDER.sub(
+            lambda match: values.get(match.group(1), match.group(0)),
+            translations.get(f"{_prefix(key)}.{part}", ""),
+        )
     return item
+
+
+def _prefix(key: str) -> str:
+    return f"component.{DOMAIN}.issues.{key}"
 
 
 def _about(hass: HomeAssistant, domain: str) -> dict[str, Any]:

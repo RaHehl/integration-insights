@@ -5,7 +5,7 @@ report. Thresholds are high on purpose: a false alarm costs a user more time
 than a borderline case that is not mentioned.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 import math
 from typing import Any
@@ -42,6 +42,7 @@ RESOURCES = ("listeners", "dispatcher", "timers", "tasks")
 BUILT_IN_BACKGROUND_FACTOR = 5
 # A finding that is shown stays until its number falls this far below the
 # threshold, so a value close to it does not make the finding come and go.
+# The same goes for its severity.
 HOLD = 0.8
 # Home Assistant itself, nothing a user can update or turn off, and this
 # integration, whose own cost the panel shows as measuring cost.
@@ -60,40 +61,56 @@ class Finding:
     evidence: list[str] = field(default_factory=list)
 
 
+type Shown = Mapping[tuple[str, str | None], str]
+
+
+class _Hold:
+    """Thresholds, lowered for what the last call already showed."""
+
+    def __init__(self, shown: Shown) -> None:
+        self._shown = shown
+
+    def __call__(self, key: str, domain: str | None = None) -> float:
+        """Return the factor for the threshold of a finding."""
+        return HOLD if (key, domain) in self._shown else 1
+
+    def severity(
+        self, key: str, domain: str | None, value: float, problem: float
+    ) -> str:
+        """Return the severity of a finding, holding a problem a little longer."""
+        factor = HOLD if self._shown.get((key, domain)) == PROBLEM else 1
+        return PROBLEM if value >= problem * factor else NOTICE
+
+
 def find(
     summary: dict[str, Any],
     detail: Callable[[str], dict[str, Any] | None],
     memory: dict[str, Any],
     built_in: Callable[[str], bool] = lambda _domain: False,
-    shown: frozenset[tuple[str, str | None]] = frozenset(),
+    shown: Shown = {},  # noqa: B006
 ) -> list[Finding]:
     """Return the findings, the most severe first.
 
-    `shown` holds the (key, domain) of the findings of the last call, which
-    only end below HOLD times their threshold.
+    `shown` maps (key, domain) of the findings of the last call to their
+    severity. They only end, or drop in severity, below HOLD times the
+    threshold.
     """
-
-    def hold(key: str, domain: str | None = None) -> float:
-        return HOLD if (key, domain) in shown else 1
-
+    hold = _Hold(shown)
     if summary["window_minutes"] < MIN_MINUTES:
         # Too short to judge, and nothing else would be true to say yet
         left = math.ceil(MIN_MINUTES - summary["window_minutes"])
         return [Finding("measuring", INFO, values={"minutes": str(left)})]
     findings: list[Finding] = []
     minutes = _number(summary["window_minutes"])
-    sampler = summary["sampler"]
-    if (
-        sampler["handler_errors"]
-        or sampler["samples_lost"] > LOST_SHARE * sampler["samples_total"]
-    ):
+    lost = summary["samples_lost"]
+    errors = summary["handler_errors"]
+    if errors or lost > LOST_SHARE * summary["samples"]:
         findings.append(
             Finding(
                 "measuring_incomplete",
                 INFO,
-                evidence=[
-                    f"errors {sampler['handler_errors']}, lost {sampler['samples_lost']} of {sampler['samples_total']}"
-                ],
+                values={"minutes": minutes},
+                evidence=[f"errors {errors}, lost {lost} of {summary['samples']}"],
             )
         )
     total_loop = summary["loop_cpu_ms_per_min"]
@@ -107,7 +124,7 @@ def find(
         findings.append(
             Finding(
                 "loop_waits",
-                PROBLEM if waiting >= LOOP_WAIT_PROBLEM_MS else NOTICE,
+                hold.severity("loop_waits", None, waiting, LOOP_WAIT_PROBLEM_MS),
                 values={"ms": _number(waiting), "minutes": minutes},
             )
         )
@@ -129,7 +146,7 @@ def _cpu_findings(
     total_loop: float,
     detail: Callable[[str], dict[str, Any] | None],
     factor: int,
-    hold: Callable[[str, str | None], float],
+    hold: _Hold,
     minutes: str,
 ) -> list[Finding]:
     domain = item["domain"]
@@ -154,7 +171,7 @@ def _cpu_findings(
         findings.append(
             Finding(
                 "busy_loop",
-                PROBLEM if loop >= LOOP_PROBLEM_MS else NOTICE,
+                hold.severity("busy_loop", domain, loop, LOOP_PROBLEM_MS),
                 domain,
                 {
                     "ms": _number(loop),
@@ -170,7 +187,7 @@ def _cpu_findings(
         findings.append(
             Finding(
                 "busy_thread",
-                PROBLEM if thread_ms >= background_problem else NOTICE,
+                hold.severity("busy_thread", domain, thread_ms, background_problem),
                 domain,
                 {"ms": _number(thread_ms), "minutes": minutes},
                 [
@@ -182,27 +199,27 @@ def _cpu_findings(
     executor = info.get("executor", {})
     executor_ms = executor.get("cpu_ms_per_min", 0)
     jobs = executor.get("jobs_per_min", 0)
-    executor_hold = hold("busy_executor", domain)
-    if (
-        executor_ms >= background_notice * executor_hold
-        or jobs >= JOBS_NOTICE_PER_MIN * factor * executor_hold
-    ):
-        findings.append(
-            Finding(
-                "busy_executor",
-                PROBLEM if executor_ms >= background_problem else NOTICE,
-                domain,
-                {
-                    "ms": _number(executor_ms),
-                    "jobs": _number(jobs),
-                    "minutes": minutes,
-                },
-                [
-                    f"{job['function']}: {_number(job['per_min'])}/min, {_number(job['cpu_ms_per_min'])} ms/min"
-                    for job in executor["jobs"][:EVIDENCE_LINES]
-                ],
-            )
+    # Heavy work and many small jobs are different stories; one of them.
+    if executor_ms >= background_notice * hold("heavy_executor", domain):
+        key = "heavy_executor"
+        severity = hold.severity(key, domain, executor_ms, background_problem)
+    elif jobs >= JOBS_NOTICE_PER_MIN * factor * hold("busy_executor", domain):
+        key = "busy_executor"
+        severity = NOTICE
+    else:
+        return findings
+    findings.append(
+        Finding(
+            key,
+            severity,
+            domain,
+            {"ms": _number(executor_ms), "jobs": _number(jobs), "minutes": minutes},
+            [
+                f"{job['function']}: {_number(job['per_min'])}/min, {_number(job['cpu_ms_per_min'])} ms/min"
+                for job in executor["jobs"][:EVIDENCE_LINES]
+            ],
         )
+    )
     return findings
 
 

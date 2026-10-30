@@ -1,5 +1,6 @@
 """Tests for findings."""
 
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -23,18 +24,16 @@ def _summary(
     loop: float = 3_000,
     busy: float | None = None,
     minutes: float = 15,
-    **sampler: int,
+    samples_lost: int = 0,
+    handler_errors: int = 0,
 ) -> dict[str, Any]:
     return {
         "window_minutes": minutes,
         "loop_cpu_ms_per_min": loop,
         "loop_busy_ms_per_min": loop if busy is None else busy,
-        "sampler": {
-            "handler_errors": 0,
-            "samples_lost": 0,
-            "samples_total": 10_000,
-            **sampler,
-        },
+        "samples": 10_000,
+        "samples_lost": samples_lost,
+        "handler_errors": handler_errors,
         "integrations": integrations,
     }
 
@@ -119,12 +118,33 @@ def test_background_threads_and_jobs() -> None:
         "thread AnyIO worker thread (watchfiles.RustNotify.watch): 510 ms/min"
     ]
     assert findings[1].values == {"ms": "40", "jobs": "900", "minutes": "15"}
+    assert findings[1].evidence == ["foo.api.Client.read: 900/min, 40 ms/min"]
 
     quiet = _detail(
         threads={"cpu_ms_per_min": 299, "by_name": {}},
         executor={"cpu_ms_per_min": 0, "jobs_per_min": 599, "jobs": []},
     )
     assert find(_summary([_item("solar", 0, 300)]), lambda _: quiet, {}) == []
+
+
+def test_heavy_executor_work_is_its_own_finding() -> None:
+    """Few jobs that use a lot of CPU are heavy work, not polling."""
+    heavy = _detail(
+        executor={
+            "cpu_ms_per_min": 7_000,
+            "jobs_per_min": 2,
+            "jobs": [{"function": "foo.render", "per_min": 2, "cpu_ms_per_min": 7_000}],
+        }
+    )
+    findings = find(_summary([_item("foo", 0, 7_000)]), lambda _: heavy, {})
+    assert _keys(findings) == [("heavy_executor", PROBLEM, "foo")]
+    assert findings[0].values == {"ms": "7,000", "jobs": "2", "minutes": "15"}
+
+    # Heavy and many at once: one finding, the heavy one
+    both = _detail(executor={"cpu_ms_per_min": 400, "jobs_per_min": 900, "jobs": []})
+    assert _keys(find(_summary([_item("foo", 0, 400)]), lambda _: both, {})) == [
+        ("heavy_executor", NOTICE, "foo")
+    ]
 
 
 def test_home_assistant_itself_is_not_flagged() -> None:
@@ -145,8 +165,10 @@ def test_loop_waits_measuring_and_sampler() -> None:
         ("loop_waits", PROBLEM, None),
         ("measuring_incomplete", INFO, None),
     ]
+    assert findings[1].evidence == ["errors 0, lost 200 of 10000"]
     assert verdict(findings) == PROBLEM
     assert find(_summary([], loop=1_000, busy=3_999), lambda _: None, {}) == []
+    assert find(_summary([], samples_lost=99), lambda _: None, {}) == []
 
     # Too short a window: only say so, and how long it takes
     (short,) = find(_summary([], busy=14_000, minutes=3.2), lambda _: None, {})
@@ -220,8 +242,37 @@ async def test_findings_are_rendered_with_where_to_act(
     assert (
         "(https://github.com/RaHehl/integration-insights/issues)" in item["description"]
     )
+    assert "update of Integration Insights" in item["description"]
     assert item["built_in"] is False
     assert item["evidence"] == ["thread X: 510 ms/min"]
+
+    # A built-in integration updates with Home Assistant
+    built_in = Finding(
+        "busy_loop", NOTICE, "recorder", {"ms": "1,500", "minutes": "{name}"}
+    )
+    recorder = SimpleNamespace(
+        name="Recorder", is_built_in=True, version=None, issue_tracker=None
+    )
+    with (
+        patch(
+            "custom_components.integration_insights.insights.Insights.findings",
+            return_value=[built_in],
+        ),
+        patch(
+            "custom_components.integration_insights.websocket.async_get_loaded_integration",
+            return_value=recorder,
+        ),
+    ):
+        await client.send_json_auto_id({"type": f"{DOMAIN}/findings", "language": "en"})
+        (item,) = (await client.receive_json())["result"]["findings"]
+    assert item["key"] == "busy_loop"
+    assert item["built_in"] is True
+    assert item["title"] == "Recorder keeps Home Assistant busy"
+    assert "part of Home Assistant" in item["description"]
+    assert "update of Recorder" not in item["description"]
+    assert "label%3A%22integration%3A+recorder%22" in item["description"]
+    # A value is not scanned for placeholders again
+    assert "Over the last {name} minutes" in item["description"]
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 
@@ -258,7 +309,7 @@ async def test_findings_wait_for_home_assistant_to_settle(hass: HomeAssistant) -
     with (
         patch(
             "custom_components.integration_insights.insights.time.monotonic",
-            return_value=started + 12 * 60,
+            return_value=started + 11 * 60,
         ),
         patch(
             "custom_components.integration_insights.insights.find", return_value=[]
@@ -266,7 +317,26 @@ async def test_findings_wait_for_home_assistant_to_settle(hass: HomeAssistant) -
     ):
         assert insights.findings(60) == []
     summary = find_mock.call_args.args[0]
-    assert summary["window_minutes"] <= 7  # The first five minutes are left out
+    # The first five minutes are left out, the window is still long enough
+    assert 5 <= summary["window_minutes"] <= 6
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_five_minute_window_is_long_enough_for_findings(
+    hass: HomeAssistant,
+) -> None:
+    """The shortest window the panel offers covers at least five minutes."""
+    entry = MockConfigEntry(domain=DOMAIN)
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    insights = entry.runtime_data
+    for seconds in range(0, 60, 7):
+        with patch(
+            "custom_components.integration_insights.insights.time.monotonic",
+            return_value=insights.started + 30 * 60 + seconds,
+        ):
+            assert "measuring" not in [f.key for f in insights.findings(5)]
+            assert insights.summary(5)["window_minutes"] >= 5
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 
@@ -279,14 +349,12 @@ def test_shown_findings_hold_until_clearly_below() -> None:
     summary = _summary([_item("foo", 900, 280)], loop=4_000, busy=6_500)
     assert find(summary, lambda _: detail, {}) == []
 
-    shown = frozenset(
-        {
-            ("busy_loop", "foo"),
-            ("busy_thread", "foo"),
-            ("busy_executor", "foo"),
-            ("loop_waits", None),
-        }
-    )
+    shown = {
+        ("busy_loop", "foo"): NOTICE,
+        ("busy_thread", "foo"): NOTICE,
+        ("busy_executor", "foo"): NOTICE,
+        ("loop_waits", None): NOTICE,
+    }
     assert _keys(find(summary, lambda _: detail, {}, shown=shown)) == [
         ("busy_loop", NOTICE, "foo"),
         ("busy_thread", NOTICE, "foo"),
@@ -299,29 +367,53 @@ def test_shown_findings_hold_until_clearly_below() -> None:
     assert find(summary, lambda _: low, {}, shown=shown) == []
 
 
+def test_severity_holds_near_the_problem_threshold() -> None:
+    """A problem does not flip to a notice and back at the boundary."""
+    detail = _detail(threads={"cpu_ms_per_min": 5_500, "by_name": {}})
+    summary = _summary([_item("foo", 5_500, 5_500)], loop=6_000, busy=17_000)
+    assert _keys(find(summary, lambda _: detail, {})) == [
+        ("busy_loop", NOTICE, "foo"),
+        ("busy_thread", NOTICE, "foo"),
+        ("loop_waits", NOTICE, None),
+    ]
+    shown = {
+        ("busy_loop", "foo"): PROBLEM,
+        ("busy_thread", "foo"): PROBLEM,
+        ("loop_waits", None): PROBLEM,
+    }
+    assert _keys(find(summary, lambda _: detail, {}, shown=shown)) == [
+        ("busy_loop", PROBLEM, "foo"),
+        ("busy_thread", PROBLEM, "foo"),
+        ("loop_waits", PROBLEM, None),
+    ]
+    shown = dict.fromkeys(shown, NOTICE)
+    assert all(
+        f.severity == NOTICE for f in find(summary, lambda _: detail, {}, shown=shown)
+    )
+
+
 async def test_insights_remember_what_was_shown(hass: HomeAssistant) -> None:
-    """Each window passes the findings of its last call on to the next one."""
+    """The findings of the last call hold for a while, whatever the window."""
     entry = MockConfigEntry(domain=DOMAIN)
     entry.add_to_hass(hass)
     assert await hass.config_entries.async_setup(entry.entry_id)
     insights = entry.runtime_data
     finding = Finding("busy_thread", NOTICE, "foo")
+    monotonic = "custom_components.integration_insights.insights.time.monotonic"
 
-    with (
-        patch(
-            "custom_components.integration_insights.insights.time.monotonic",
-            return_value=insights.started + 30 * 60,
-        ),
-        patch(
-            "custom_components.integration_insights.insights.find",
-            return_value=[finding],
-        ) as find_mock,
-    ):
-        insights.findings(15)
-        insights.findings(15)
-        insights.findings(60)
-    shown = [call.args[4] for call in find_mock.call_args_list]
-    assert shown == [frozenset(), {("busy_thread", "foo")}, frozenset()]
+    with patch(
+        "custom_components.integration_insights.insights.find",
+        return_value=[finding],
+    ) as find_mock:
+        with patch(monotonic, return_value=insights.started + 30 * 60):
+            insights.findings(15)
+            insights.findings(15)
+            insights.findings(60)
+        with patch(monotonic, return_value=insights.started + 40 * 60):
+            insights.findings(15)
+    shown = [dict(call.args[4]) for call in find_mock.call_args_list]
+    held = {("busy_thread", "foo"): NOTICE}
+    assert shown == [{}, held, held, {}]
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 
