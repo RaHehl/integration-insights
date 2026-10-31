@@ -364,6 +364,8 @@ class IntegrationInsightsPanel extends HTMLElement {
     this._view = "overview";
     this._sort = "cpu_ms_per_min";
     this._sortAscending = false;
+    this._statesSort = "state_changes_per_min";
+    this._statesAscending = false;
     this._findings = undefined;
     this._memory = undefined;
     this._memExpanded = new Set();
@@ -535,6 +537,13 @@ class IntegrationInsightsPanel extends HTMLElement {
       else {
         this._sort = value;
         this._sortAscending = false;
+      }
+      this._render();
+    } else if (action === "sort-states") {
+      if (this._statesSort === value) this._statesAscending = !this._statesAscending;
+      else {
+        this._statesSort = value;
+        this._statesAscending = false;
       }
       this._render();
     } else if (action === "snapshot") {
@@ -874,14 +883,16 @@ class IntegrationInsightsPanel extends HTMLElement {
         : `<div class="message">Loading…</div>`;
     }
     const { report } = this._data;
+    const key = this._statesSort;
+    const direction = this._statesAscending ? 1 : -1;
     const integrations = report.integrations
       .filter((item) => item.state_writes_per_min)
-      .sort((a, b) => b.state_writes_per_min - a.state_writes_per_min);
+      .sort((a, b) => direction * ((a[key] || 0) - (b[key] || 0)) || a.domain.localeCompare(b.domain));
     const sum = (key) => integrations.reduce((total, item) => total + (item[key] || 0), 0);
     const changes = sum("state_changes_per_min");
     const attributesOnly = sum("state_attributes_only_per_min");
     const repeated = sum("state_repeated_per_min");
-    const busiest = integrations[0];
+    const busiest = [...integrations].sort((a, b) => b.state_writes_per_min - a.state_writes_per_min)[0];
     const tiles = `<div class="summary">
       <div class="tile"><div class="label">Changes</div>
         <div class="value">${ms(changes)} per min</div>
@@ -902,12 +913,12 @@ class IntegrationInsightsPanel extends HTMLElement {
     if (!integrations.length) {
       return `${tiles}<div class="card"><div class="message">No state writes in this window yet.</div></div>`;
     }
-    const top = integrations[0].state_writes_per_min;
+    const top = Math.max(...integrations.map((item) => item[key] || 0), 1);
     const rows = integrations
       .map((item) => {
         const expanded = this._expanded.has(item.domain);
         const name = this._data.names[item.domain] || item.domain;
-        const width = Math.max((item.state_writes_per_min / top) * 100, 1);
+        const width = Math.max(((item[key] || 0) / top) * 100, 1);
         return `<div class="row states" data-action="toggle" data-value="${escapeHtml(item.domain)}" role="button" tabindex="0" aria-expanded="${expanded}">
             <div class="name">
               <div class="title"><svg class="chev" viewBox="0 0 24 24"><path fill="currentColor" d="M8.59,16.58L13.17,12L8.59,7.41L10,6L16,12L10,18L8.59,16.58Z"></path></svg>
@@ -923,7 +934,7 @@ class IntegrationInsightsPanel extends HTMLElement {
       .join("");
     const updated = this._updated ? this._updated.toLocaleTimeString() : "";
     return `${tiles}<div class="card">
-        <div class="card-head states"><div>Integration</div><div class="num">Changes</div><div class="num">Attributes</div><div class="num">Repeated</div></div>
+        <div class="card-head states"><div>Integration</div>${this._statesHeader("state_changes_per_min", "Changes")}${this._statesHeader("state_attributes_only_per_min", "Attributes")}${this._statesHeader("state_repeated_per_min", "Repeated")}</div>
         ${rows}
       </div>
       <div class="footer">State writes per minute, counted exactly at the event bus. Changes and attribute-only changes reach the recorder, the dashboard and every automation that watches the entity. Repeated writes do not. Updated ${updated}</div>`;
@@ -943,6 +954,12 @@ class IntegrationInsightsPanel extends HTMLElement {
       )
       .join("");
     return `<div class="detail"><p class="note">${sw.per_min} writes per minute: ${sw.changes_per_min} changes, ${sw.attributes_only_per_min} changed only attributes, ${sw.repeated_per_min} repeated.</p><h3>Most changes</h3><div class="pairs">${chips}</div></div>`;
+  }
+
+  _statesHeader(key, label) {
+    const active = this._statesSort === key;
+    const arrow = active ? (this._statesAscending ? " ▲" : " ▼") : "";
+    return `<button class="num sort${active ? " active" : ""}" data-action="sort-states" data-value="${key}" aria-sort="${active ? (this._statesAscending ? "ascending" : "descending") : "none"}">${label}${arrow}</button>`;
   }
 
   _sortHeader(key, label, extra = "") {
@@ -1010,7 +1027,8 @@ class IntegrationInsightsPanel extends HTMLElement {
     if (!this._memory) return error || `<div class="message">Loading…</div>`;
     const latest = this._memory.memory.latest;
     if (!latest) {
-      return `${error}<div class="card"><div class="message">No snapshot yet. A snapshot walks the Python heap once and splits it into what each integration holds, its code and the parts of Home Assistant core. Take two some time apart to see what grows.</div></div>`;
+      return `${error}<div class="card"><div class="message">No snapshot yet. A snapshot walks the Python heap once and splits it into what each integration holds, its code and the parts of Home Assistant core. Take two some time apart to see what grows.</div>
+        <div class="actions"><button class="action" data-action="snapshot" ${this._snapshotting ? "disabled" : ""}>${this._snapshotting ? "Taking snapshot…" : "Take snapshot"}</button></div></div>`;
     }
     const delta = (value, unit = "") => {
       if (value === undefined || value === null || value === 0) return "";
