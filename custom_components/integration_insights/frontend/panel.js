@@ -51,6 +51,9 @@ const isoTime = (epoch) => (epoch ? new Date(epoch * 1000).toISOString() : "");
 const ms = (value) =>
   value >= 10 ? Math.round(value).toLocaleString() : value.toFixed(1);
 
+// A rate that may be missing: an empty cell is clearer than a zero
+const rate = (value) => (value ? ms(value) : "");
+
 // ms of CPU per minute as percent of one core
 const corePercent = (value) => {
   const percent = value / 600;
@@ -366,6 +369,10 @@ class IntegrationInsightsPanel extends HTMLElement {
     this._sortAscending = false;
     this._statesSort = "state_changes_per_min";
     this._statesAscending = false;
+    this._logsSort = "log_warnings_per_min";
+    this._logsAscending = false;
+    this._filesSort = "store_writes_per_min";
+    this._filesAscending = false;
     this._findings = undefined;
     this._memory = undefined;
     this._memExpanded = new Set();
@@ -537,6 +544,14 @@ class IntegrationInsightsPanel extends HTMLElement {
       else {
         this._sort = value;
         this._sortAscending = false;
+      }
+      this._render();
+    } else if (action === "sort-logs" || action === "sort-files") {
+      const which = action === "sort-logs" ? "_logs" : "_files";
+      if (this[`${which}Sort`] === value) this[`${which}Ascending`] = !this[`${which}Ascending`];
+      else {
+        this[`${which}Sort`] = value;
+        this[`${which}Ascending`] = false;
       }
       this._render();
     } else if (action === "sort-states") {
@@ -790,6 +805,7 @@ class IntegrationInsightsPanel extends HTMLElement {
       ["overview", "Overview"],
       ["cpu", "CPU"],
       ["states", "States"],
+      ["logs", "Logs"],
       ["memory", "Memory"],
     ]
       .map(
@@ -798,7 +814,7 @@ class IntegrationInsightsPanel extends HTMLElement {
       )
       .join("");
     const tools =
-      this._view === "states"
+      this._view === "states" || this._view === "logs"
         ? `<div class="segmented" role="group" aria-label="Time window">${windows}</div>`
         : this._view === "overview"
         ? ""
@@ -816,6 +832,7 @@ class IntegrationInsightsPanel extends HTMLElement {
     if (this._view === "memory") return this._renderMemory();
     if (this._view === "overview") return this._renderOverview();
     if (this._view === "states") return this._renderStates();
+    if (this._view === "logs") return this._renderLogs();
     if (!this._data) {
       return this._error
         ? `<div class="message error">${escapeHtml(this._error)}</div>`
@@ -989,6 +1006,110 @@ class IntegrationInsightsPanel extends HTMLElement {
       ? `<h3>Changed attributes, ${sw.attribute_kib_per_min} KiB per minute</h3><div class="pairs">${sizes}</div>`
       : "";
     return `<div class="detail"><p class="note">${sw.per_min} writes per minute: ${sw.changes_per_min} changes, ${sw.attributes_only_per_min} changed only attributes, ${sw.repeated_per_min} repeated.</p><h3>Most changes</h3><div class="pairs">${chips}</div>${attributes}</div>`;
+  }
+
+  _renderLogs() {
+    if (!this._data) {
+      return this._error
+        ? `<div class="message error">${escapeHtml(this._error)}</div>`
+        : `<div class="message">Loading…</div>`;
+    }
+    const { report } = this._data;
+    const all = report.integrations;
+    const sum = (items, key) => items.reduce((total, item) => total + (item[key] || 0), 0);
+    const logged = all.filter(
+      (item) => item.log_warnings_per_min || item.log_errors_per_min || item.log_debug_per_min
+    );
+    const saving = all.filter((item) => item.store_writes_per_min);
+    const sorted = (items, key, ascending) =>
+      [...items].sort(
+        (a, b) => (ascending ? 1 : -1) * ((a[key] || 0) - (b[key] || 0)) || a.domain.localeCompare(b.domain)
+      );
+    const tiles = `<div class="summary">
+      <div class="tile"><div class="label">Warnings</div>
+        <div class="value">${ms(sum(logged, "log_warnings_per_min"))} per min</div>
+        <div class="sub">a steady stream hides the messages that matter</div></div>
+      <div class="tile"><div class="label">Errors</div>
+        <div class="value">${ms(sum(logged, "log_errors_per_min"))} per min</div>
+        <div class="sub">errors and critical messages</div></div>
+      <div class="tile"><div class="label">Debug and info</div>
+        <div class="value">${ms(sum(logged, "log_debug_per_min"))} per min</div>
+        <div class="sub">a lot of them usually means debug logging was left on</div></div>
+      <div class="tile"><div class="label">Saved files</div>
+        <div class="value">${ms(sum(saving, "store_writes_per_min"))} per min</div>
+        <div class="sub">${ms(sum(saving, "store_kib_per_min"))} KiB per min, every save replaces a whole file</div></div>
+      <div class="tile"><div class="label">Window</div>
+        <div class="value">${report.window_minutes} min</div>
+        <div class="sub">counted where they happen, exactly</div></div>
+    </div>`;
+    const row = (item, cells) => {
+      const expanded = this._expanded.has(item.domain);
+      const name = this._data.names[item.domain] || item.domain;
+      return `<div class="row states" data-action="toggle" data-value="${escapeHtml(item.domain)}" role="button" tabindex="0" aria-expanded="${expanded}">
+          <div class="name">
+            <div class="title"><svg class="chev" viewBox="0 0 24 24"><path fill="currentColor" d="M8.59,16.58L13.17,12L8.59,7.41L10,6L16,12L10,18L8.59,16.58Z"></path></svg>
+              <span>${escapeHtml(name)}</span></div>
+            <div class="domain">${escapeHtml(item.domain)}</div>
+          </div>
+          ${cells.map((value) => `<div class="num">${value}</div>`).join("")}
+        </div>${expanded ? this._renderOutputDetail(item) : ""}`;
+    };
+    const header = (action, sortKey, ascending, columns) =>
+      columns
+        .map(([key, label]) => {
+          const active = sortKey === key;
+          const arrow = active ? (ascending ? " ▲" : " ▼") : "";
+          return `<button class="num sort${active ? " active" : ""}" data-action="${action}" data-value="${key}" aria-sort="${active ? (ascending ? "ascending" : "descending") : "none"}">${label}${arrow}</button>`;
+        })
+        .join("");
+    const logRows = sorted(logged, this._logsSort, this._logsAscending)
+      .map((item) =>
+        row(item, [
+          rate(item.log_warnings_per_min),
+          rate(item.log_errors_per_min),
+          rate(item.log_debug_per_min),
+        ])
+      )
+      .join("");
+    const fileRows = sorted(saving, this._filesSort, this._filesAscending)
+      .map((item) => row(item, [rate(item.store_writes_per_min), ms(item.store_kib_per_min || 0), ""]))
+      .join("");
+    const logs = logged.length
+      ? `<div class="card">
+        <div class="card-head states"><div>Log</div>${header("sort-logs", this._logsSort, this._logsAscending, [
+          ["log_warnings_per_min", "Warnings"],
+          ["log_errors_per_min", "Errors"],
+          ["log_debug_per_min", "Debug"],
+        ])}</div>${logRows}</div>`
+      : `<div class="card"><div class="message">Nothing logged in this window.</div></div>`;
+    const files = saving.length
+      ? `<div class="card">
+        <div class="card-head states"><div>Saved files</div>${header("sort-files", this._filesSort, this._filesAscending, [
+          ["store_writes_per_min", "Saves"],
+          ["store_kib_per_min", "KiB"],
+        ])}<div></div></div>${fileRows}</div>`
+      : `<div class="card"><div class="message">No files saved in this window.</div></div>`;
+    const updated = this._updated ? this._updated.toLocaleTimeString() : "";
+    return `${tiles}${logs}${files}
+      <div class="footer">Per minute. Log records are counted by logger as they reach Home Assistant's log, files when they are saved through Home Assistant's storage helper. Updated ${updated}</div>`;
+  }
+
+  _renderOutputDetail(brief) {
+    const detail = this._details.get(brief.domain);
+    if (!detail) return `<div class="detail"><p class="note">Loading…</p></div>`;
+    const item = detail.item || {};
+    const chips = (entries, unit) =>
+      Object.entries(entries || {})
+        .map(([name, value]) => `<span class="chip">${escapeHtml(name)} · ${value}${unit}</span>`)
+        .join("");
+    const parts = [];
+    if (item.logs) {
+      parts.push(`<h3>Loggers with the most warnings and errors</h3><div class="pairs">${chips(item.logs.loggers, "/min") || "none"}</div>`);
+    }
+    if (item.storage) {
+      parts.push(`<h3>Files saved most</h3><div class="pairs">${chips(item.storage.files, "/min")}</div>`);
+    }
+    return `<div class="detail">${parts.join("") || `<p class="note">Nothing in this window.</p>`}</div>`;
   }
 
   _statesHeader(key, label) {

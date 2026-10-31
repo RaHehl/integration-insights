@@ -55,6 +55,8 @@ The CPU view lists every integration with its time on the event loop and in the 
 
 "Copy as text" gives all of it in one block for an issue or a profiler session. The diagnostics download has the same numbers as JSON.
 
+The Logs view lists warnings, errors and debug lines per integration, with the loggers behind them, and the files each integration saves.
+
 The Memory view walks the Python heap on request and splits it by integration, library and Home Assistant itself, with listeners, dispatcher connections, timers and tasks per integration. A second snapshot shows what changed.
 
 ### How it measures
