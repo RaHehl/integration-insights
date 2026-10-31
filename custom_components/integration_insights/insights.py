@@ -520,6 +520,7 @@ class Insights:
             if self.sampler.installed
             else 0,
             "timing_errors": self.loop_timing.errors,
+            "timing_overflowed": self.loop_timing.overflowed,
             "timing_resolves_per_min": round(
                 self.loop_timing.resolves
                 / max((time.monotonic() - self.started) / 60, 1 / 60),

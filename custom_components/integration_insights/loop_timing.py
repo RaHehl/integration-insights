@@ -8,7 +8,8 @@ method and class, each split by the config entry whose context it runs in.
 Unlike the sampler this sees time a callback spends waiting, not only CPU.
 
 A callback times everything that runs inside it, including listeners of
-other integrations it triggers. So a long block is not blamed on the
+other integrations it triggers and the first step of an eager task it
+creates. So a long block is not blamed on the
 callback: a watchdog thread looks at the loop thread's stack while the
 block lasts and names the code that is actually running.
 
@@ -22,6 +23,7 @@ from asyncio import events
 from collections import deque
 from collections.abc import Callable
 from functools import partial
+import logging
 import sys
 import threading
 import time
@@ -30,6 +32,8 @@ from typing import Any, NamedTuple
 
 from homeassistant.config_entries import current_entry
 from homeassistant.core import HassJob
+
+_LOGGER = logging.getLogger(__name__)
 
 # Only code compiled at runtime can add rows without bound
 MAX_ROWS = 10_000
@@ -181,6 +185,8 @@ class LoopTiming:
         # For the sampler: frames of the wrapper are not an integration's
         self.wrapper_code: Any = None
         self.errors = 0
+        # Callbacks counted under "other callbacks" because the table was full
+        self.overflowed = 0
         self.started_at = 0.0
 
     @property
@@ -276,13 +282,20 @@ class LoopTiming:
             if (row := rows.get(key)) is not None:
                 return row
             if len(rows) >= MAX_ROWS:
-                key = _OTHER
-                if (row := rows.get(key)) is not None:
-                    return row
-            label = (
-                "other callbacks" if key is _OTHER else _label(func, code, cls, module)
-            )
-            row = rows[key] = _Row(label, code)
+                self.overflowed += 1
+                if self.overflowed == 1:
+                    _LOGGER.warning(
+                        "Callback timing keeps %s callbacks apart; the rest"
+                        " count under other callbacks",
+                        MAX_ROWS,
+                    )
+                return other_row()
+            row = rows[key] = _Row(_label(func, code, cls, module), code)
+            return row
+
+        def other_row() -> _Row:
+            if (row := rows.get(_OTHER)) is None:
+                row = rows[_OTHER] = _Row("other callbacks")
             return row
 
         # The wrapper runs once per callback: as little as possible inline
@@ -388,8 +401,15 @@ class LoopTiming:
                             method_rows.clear()
                         # The object or class is held so its id stays its own
                         method_rows[mkey] = (pin, row)
-            except Exception:  # noqa: BLE001
+            except Exception:
+                # The time still counts, under the row for everything else
                 self.errors += 1
+                row = other_row()
+                if self.errors == 1:
+                    _LOGGER.warning(
+                        "Could not attribute a callback of the event loop",
+                        exc_info=True,
+                    )
             outer = running[0]
             start = running[0] = perf()
             try:
@@ -463,6 +483,11 @@ class LoopTiming:
             return
         if events.Handle._run is self._wrapper:  # noqa: SLF001
             events.Handle._run = self._original  # type: ignore[method-assign, assignment]  # noqa: SLF001
+        else:
+            _LOGGER.warning(
+                "Something else patched Handle._run after Integration Insights;"
+                " its wrapper stays in place and passes calls through"
+            )
         self._wrapper = None
         self._original = None
 

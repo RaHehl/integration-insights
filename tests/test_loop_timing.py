@@ -6,7 +6,10 @@ import contextvars
 import functools
 import time
 from types import FrameType, SimpleNamespace
+from typing import Any
 from unittest.mock import patch
+
+import pytest
 
 from custom_components.integration_insights import loop_timing
 from custom_components.integration_insights.loop_timing import LoopTiming
@@ -322,6 +325,61 @@ def test_interval_jobs_and_reader_partials_are_resolved_once() -> None:
         # One resolve each, plus the sleep coroutine
         assert timing.resolves - before <= 3
         assert _records(timing)[(f"{__name__}._Worker.tick", None)] == 10
+    finally:
+        timing.stop()
+        loop.close()
+
+
+def test_an_unattributable_callback_still_counts(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A callable that breaks when looked at runs, and its time lands under other callbacks."""
+
+    class Prickly:
+        # Only the name breaks: asyncio's debug mode looks at other attributes
+        def __getattr__(self, name: str) -> Any:
+            if name == "__qualname__":
+                raise RuntimeError("do not look at me")
+            raise AttributeError(name)
+
+        def __call__(self) -> None:
+            ran.append(True)
+
+    ran: list[bool] = []
+    loop = asyncio.new_event_loop()
+    timing = LoopTiming(loop)
+    try:
+        timing.start()
+        loop.call_soon(Prickly())
+        loop.call_soon(Prickly())
+        loop.run_until_complete(asyncio.sleep(0))
+        assert ran == [True, True]
+        assert timing.errors >= 1
+        calls = {label: n for (label, _entry), n in _records(timing).items()}
+        assert calls["other callbacks"] == 2
+        assert caplog.text.count("Could not attribute a callback") == 1
+    finally:
+        timing.stop()
+        loop.close()
+
+
+def test_a_full_table_counts_the_rest_under_other_callbacks(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Past the cap, new callbacks share one row, are counted and warned about once."""
+    loop = asyncio.new_event_loop()
+    timing = LoopTiming(loop)
+    try:
+        with patch.object(loop_timing, "MAX_ROWS", 1):
+            timing.start()
+            loop.run_until_complete(asyncio.sleep(0))
+            loop.call_soon(int)
+            loop.call_soon(str)
+            loop.run_until_complete(asyncio.sleep(0))
+        calls = {label: n for (label, _entry), n in _records(timing).items()}
+        assert calls.get("other callbacks", 0) >= 2
+        assert timing.overflowed >= 2
+        assert caplog.text.count("keeps 1 callbacks apart") == 1
     finally:
         timing.stop()
         loop.close()
