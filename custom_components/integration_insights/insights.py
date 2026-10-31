@@ -20,6 +20,7 @@ from homeassistant.const import (
 from homeassistant.core import CALLBACK_TYPE, CoreState, Event, HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.json import json_bytes
 from homeassistant.loader import IntegrationNotLoaded, async_get_loaded_integration
 from homeassistant.util import dt as dt_util
 
@@ -56,6 +57,7 @@ from .memory import (
     read_process,
     to_report,
 )
+from .outputs import LogCounter, StoreCounter, logger_domain, store_domain
 from .sampler import Sampler, SamplerError
 
 _LOGGER = logging.getLogger(__name__)
@@ -108,6 +110,10 @@ class Insights:
         self._unsub_states: list[CALLBACK_TYPE] = []
         # domain -> [changes, reports, entities], filled by the event filters
         self._state_writes: dict[str, list[Any]] = {}
+        self.logs = LogCounter()
+        self.stores = StoreCounter()
+        self._logger_domains: dict[str, str] = {}
+        self._logger_map: Any = None
         self._polling = False
         self._subscribers: list[tuple[int, Callable[[dict[str, Any]], None]]] = (
             hass.data.setdefault(SUBSCRIBERS_KEY, [])
@@ -162,6 +168,8 @@ class Insights:
         if self.loop_wait.install(self.hass.loop):
             self.sampler.select_wrapper = self.loop_wait.wrapper_code
         self.loop_timing.start()
+        self.logs.install()
+        self.stores.install()
         self.sampler.skip_codes = frozenset(
             {self.loop_timing.wrapper_code, *self.background.wrapper_codes}
         )
@@ -199,6 +207,8 @@ class Insights:
         self.background.unhook_executors()
         self.loop_wait.uninstall()
         self.loop_timing.stop()
+        self.logs.uninstall()
+        self.stores.uninstall()
         self.sampler.select_wrapper = None
         self.sampler.skip_codes = frozenset()
         for unsub in self._unsub_states:
@@ -217,7 +227,7 @@ class Insights:
         # entity_id -> integration; the registry lookup is slow for a hot path
         platforms: dict[str, str | None] = {}
 
-        def count(entity_id: str, slot: int) -> bool:
+        def count(entity_id: str, slot: int, size: int = 0) -> bool:
             if entity_id in platforms:
                 platform = platforms[entity_id]
             else:
@@ -228,11 +238,14 @@ class Insights:
             if platform is None:
                 return False
             if (row := writes.get(platform)) is None:
-                row = writes[platform] = [0, 0, 0, Counter()]
+                row = writes[platform] = [0, 0, 0, Counter(), 0, Counter()]
             row[slot] += 1
             if slot != 1:
                 # Busiest entities by what reaches listeners and the recorder
                 row[3][entity_id] += 1
+            if size:
+                row[4] += size
+                row[5][entity_id] += size
             return False
 
         @callback
@@ -241,7 +254,17 @@ class Insights:
             # listener and the recorder like a change
             old, new = data["old_state"], data["new_state"]
             same = old is not None and new is not None and old.state == new.state
-            return count(data["entity_id"], 2 if same else 0)
+            size = 0
+            # Core keeps the old attributes object when nothing in it changed,
+            # so only new attributes are measured: what the recorder stores
+            if new is not None and (
+                old is None or new.attributes is not old.attributes
+            ):
+                try:
+                    size = len(json_bytes(new.attributes))
+                except Exception:  # noqa: BLE001
+                    size = 0
+            return count(data["entity_id"], 2 if same else 0, size)
 
         @callback
         def reported(data: Any) -> bool:
@@ -336,12 +359,28 @@ class Insights:
             # Cleared in place: the event filters hold this dict
             self.collector.add_state_writes(
                 [
-                    StateWrites(domain, row[0], row[1], row[2], row[3])
+                    StateWrites(domain, row[0], row[1], row[2], row[3], row[4], row[5])
                     for domain, row in writes.items()
                 ],
                 now,
             )
             writes.clear()
+        library_map = self.collector.library_map
+        logger_domains = self._logger_domains
+        # A new library map can own loggers that counted for core before
+        if library_map is not self._logger_map or len(logger_domains) > 5_000:
+            logger_domains.clear()
+            self._logger_map = library_map
+        self.collector.add_logs(
+            self.logs.drain(
+                lambda name: logger_domain(name, library_map, logger_domains)
+            ),
+            now,
+        )
+        components = self.hass.config.top_level_components
+        self.collector.add_store_writes(
+            self.stores.drain(lambda key: store_domain(key, components)), now
+        )
         self.collector.add_blocks(
             [
                 BlockRecord(

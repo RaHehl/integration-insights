@@ -338,7 +338,11 @@ async def test_callbacks_are_timed_and_charged_to_their_entry(
         "attributes_only_per_min",
         "repeated_per_min",
         "entities",
+        "attribute_kib_per_min",
+        "attribute_entities",
     }
+    # Only the write with the voltage attribute had attributes to measure
+    assert list(row["state_writes"]["attribute_entities"]) == [entity_id]
     # 5 writes: 2 changed the value, 2 repeated it, 1 changed only attributes
     sw = row["state_writes"]
     assert sw["attributes_only_per_min"] > 0

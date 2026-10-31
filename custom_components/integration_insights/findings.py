@@ -40,6 +40,20 @@ LOOP_BLOCK_PROBLEM_MS = 10_000
 # not count.
 STATE_WRITES_NOTICE_PER_MIN = 600
 STATE_WRITES_PROBLEM_PER_MIN = 3_000
+# Attributes that changed, in KiB per minute. The recorder stores a new row
+# for each, so this is roughly what the database grows by.
+ATTRIBUTES_NOTICE_KIB = 100
+ATTRIBUTES_PROBLEM_KIB = 1_000
+# Warnings and errors per minute. Each one is formatted and written to the log
+# file, and a steady stream hides the messages that matter.
+LOG_NOTICE_PER_MIN = 10
+LOG_PROBLEM_PER_MIN = 100
+# Debug and info lines per minute: debug logging that was left on.
+DEBUG_NOTICE_PER_MIN = 300
+# Files written through the storage helper per minute. Each write replaces a
+# whole file, which wears out the SD card of a Raspberry Pi.
+STORE_NOTICE_PER_MIN = 6
+STORE_PROBLEM_PER_MIN = 60
 # Shorter windows move too much to judge.
 MIN_MINUTES = 5
 # Lost samples are expected now and then, a steady share skews the numbers.
@@ -168,12 +182,22 @@ def _cpu_findings(
     writes = item.get("state_changes_per_min", 0) + item.get(
         "state_attributes_only_per_min", 0
     )
+    attribute_kib = item.get("attribute_kib_per_min", 0)
+    log_warnings = item.get("log_warnings_per_min", 0) + item.get(
+        "log_errors_per_min", 0
+    )
+    log_debug = item.get("log_debug_per_min", 0)
+    store_writes = item.get("store_writes_per_min", 0)
     if (
         loop < LOOP_NOTICE_MS * HOLD
         and background < background_notice * HOLD
         and item.get("jobs_per_min", 0) < JOBS_NOTICE_PER_MIN * factor * HOLD
         and blocked < LOOP_BLOCK_NOTICE_MS * HOLD
         and writes < STATE_WRITES_NOTICE_PER_MIN * factor * HOLD
+        and attribute_kib < ATTRIBUTES_NOTICE_KIB * factor * HOLD
+        and log_warnings < LOG_NOTICE_PER_MIN * HOLD
+        and log_debug < DEBUG_NOTICE_PER_MIN * HOLD
+        and store_writes < STORE_NOTICE_PER_MIN * factor * HOLD
     ):
         return []
     if (info := detail(domain)) is None:
@@ -203,6 +227,11 @@ def _cpu_findings(
                 ],
             )
         )
+    findings.extend(
+        _output_findings(
+            item, info, factor, hold, minutes, attribute_kib, log_warnings, log_debug
+        )
+    )
     if blocked >= LOOP_BLOCK_NOTICE_MS * hold("loop_blocked", domain):
         findings.append(
             Finding(
@@ -277,6 +306,91 @@ def _cpu_findings(
             ],
         )
     )
+    return findings
+
+
+def _output_findings(
+    item: dict[str, Any],
+    info: dict[str, Any],
+    factor: int,
+    hold: _Hold,
+    minutes: str,
+    attribute_kib: float,
+    log_warnings: float,
+    log_debug: float,
+) -> list[Finding]:
+    """Findings about what an integration writes: attributes, logs, files."""
+    domain = item["domain"]
+    findings = []
+    if attribute_kib >= ATTRIBUTES_NOTICE_KIB * factor * hold("big_attributes", domain):
+        entities = info.get("state_writes", {}).get("attribute_entities", {})
+        findings.append(
+            Finding(
+                "big_attributes",
+                hold.severity(
+                    "big_attributes",
+                    domain,
+                    attribute_kib,
+                    ATTRIBUTES_PROBLEM_KIB * factor,
+                ),
+                domain,
+                {"kib": _number(attribute_kib), "minutes": minutes},
+                [
+                    f"{entity_id}: {_rate(kib)} KiB/min"
+                    for entity_id, kib in list(entities.items())[:EVIDENCE_LINES]
+                ],
+            )
+        )
+    loggers = info.get("logs", {}).get("loggers", {})
+    if log_warnings >= LOG_NOTICE_PER_MIN * hold("noisy_logs", domain):
+        findings.append(
+            Finding(
+                "noisy_logs",
+                hold.severity("noisy_logs", domain, log_warnings, LOG_PROBLEM_PER_MIN),
+                domain,
+                {
+                    "per_min": _rate(log_warnings),
+                    "errors": _rate(item.get("log_errors_per_min", 0)),
+                    "minutes": minutes,
+                },
+                [
+                    f"{name}: {_rate(per_min)}/min"
+                    for name, per_min in list(loggers.items())[:EVIDENCE_LINES]
+                ],
+            )
+        )
+    if log_debug >= DEBUG_NOTICE_PER_MIN * hold("debug_logging", domain):
+        findings.append(
+            Finding(
+                "debug_logging",
+                NOTICE,
+                domain,
+                {"per_min": _number(log_debug), "minutes": minutes},
+            )
+        )
+    store = info.get("storage", {})
+    store_writes = item.get("store_writes_per_min", 0)
+    if store_writes >= STORE_NOTICE_PER_MIN * factor * hold("busy_storage", domain):
+        findings.append(
+            Finding(
+                "busy_storage",
+                hold.severity(
+                    "busy_storage", domain, store_writes, STORE_PROBLEM_PER_MIN * factor
+                ),
+                domain,
+                {
+                    "per_min": _rate(store_writes),
+                    "kib": _number(item.get("store_kib_per_min", 0)),
+                    "minutes": minutes,
+                },
+                [
+                    f"{key}: {_rate(per_min)}/min"
+                    for key, per_min in list(store.get("files", {}).items())[
+                        :EVIDENCE_LINES
+                    ]
+                ],
+            )
+        )
     return findings
 
 

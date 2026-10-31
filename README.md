@@ -16,6 +16,9 @@ Finds the integration that slows Home Assistant down, keeps the CPU busy, or lea
 - Integrations that hand a lot of work to the executor, usually polling more often than needed.
 - The event loop standing still for seconds, named by the integration and function that ran at that moment, the first time it happens.
 - An integration that changes the state or attributes of its entities many times a second. Each change is recorded and reaches the dashboard and every automation that watches the entity.
+- Entities whose attributes change by a lot of data. The recorder stores them again each time, so the database grows.
+- An integration that logs many warnings or errors, or has debug logging left on.
+- An integration that saves its files every few seconds, which wears out the SD card of a Raspberry Pi.
 - An event loop that often waits, usually on a blocking call.
 - Listeners, timers and tasks that pile up between two memory snapshots, a sign of a leak.
 
@@ -62,6 +65,9 @@ The Memory view walks the Python heap on request and splits it by integration, l
 - A sample goes to the integration whose code runs. Code in an entity platform base class goes to the integration that owns the entity. A library that only one loaded integration requires goes to that integration. Core and shared library code with no integration on the stack, such as aiohttp parsing a response, goes to the config entry whose context it runs in, which Home Assistant sets while an entry is set up and every task and connection started from there inherits.
 - A finalizer running inside the garbage collector is charged to the owner of the object being destroyed, not to whoever allocated enough to trigger the collection.
 - State writes are counted per integration in the bus event filters, at the cost of one dictionary update per write. A write is a change, a change of attributes only, or a repeat that changes nothing. Repeats are cheap: Home Assistant only moves the last reported time.
+- The size of attributes is measured only when they change. Home Assistant keeps the old attributes object when nothing in it changed, so unchanged writes cost nothing.
+- Log records are counted by a handler on the root logger, by logger and level. They are not formatted or written a second time.
+- Files saved through Home Assistant's storage helper are counted with their size, by storage key.
 - Executor jobs are timed exactly with the worker thread's CPU clock. A job goes to the integration whose callable it runs, else to the one that submitted it. Other threads are read from `/proc` every 10 seconds. A pool thread is charged to what it runs, and for anyio to the task waiting for it.
 
 ### Cost
@@ -70,7 +76,7 @@ The panel shows its own cost under "Measuring costs": sampling, timing the callb
 
 ## Privacy
 
-Reports contain code locations (file, function, line), integration domains, thread names and the IDs of config entries, devices and entities, including the entities that write state most. Entity IDs can say something about your home, such as `light.bedroom`. Thread names are chosen by integrations and libraries and can contain a host name or address. Look before you post a report. Reports contain no arguments, values, entity states or local paths. Names of entries, devices and entities only appear in the panel and in "Copy as text", not in the diagnostics download.
+Reports contain code locations (file, function, line), integration domains, thread names, logger names, storage keys and the IDs of config entries, devices and entities, including the entities that write state most. Entity IDs can say something about your home, such as `light.bedroom`. Thread names are chosen by integrations and libraries and can contain a host name or address. Look before you post a report. Reports contain no arguments, values, entity states or local paths. Names of entries, devices and entities only appear in the panel and in "Copy as text", not in the diagnostics download.
 
 Nothing leaves Home Assistant. The integration sends no data anywhere.
 

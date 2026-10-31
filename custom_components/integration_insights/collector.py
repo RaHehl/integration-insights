@@ -13,6 +13,8 @@ from .sampler import Record
 
 TOP_CALLBACKS = 5
 TOP_STATE_ENTITIES = 5
+TOP_LOGGERS = 5
+TOP_STORE_KEYS = 5
 MAX_STATE_ENTITIES_PER_MINUTE = 100
 
 WINDOW_MINUTES = 60
@@ -39,6 +41,28 @@ class StateWrites(NamedTuple):
     reports: int  # writes that changed nothing
     attributes_only: int  # writes with the same value and other attributes
     entities: Counter[str]
+    # Size of the attributes that changed, in bytes, in total and by entity
+    attribute_bytes: int = 0
+    attribute_entities: Counter[str] | None = None
+
+
+class LogCounts(NamedTuple):
+    """Log records of one integration since the last drain."""
+
+    domain: str
+    debug: int  # debug and info
+    warning: int
+    error: int  # error and critical
+    loggers: Counter[str]  # warnings and errors by logger
+
+
+class StoreWrites(NamedTuple):
+    """Files one integration wrote through Home Assistant's storage helper."""
+
+    domain: str
+    writes: int
+    size: int  # bytes
+    keys: Counter[str]
 
 
 class BlockRecord(NamedTuple):
@@ -101,6 +125,18 @@ class _Domain:
     state_reports: int = 0
     state_attributes_only: int = 0
     state_entities: Counter[str] = field(default_factory=Counter)
+    # Bytes of attributes that changed, and by entity
+    attribute_bytes: int = 0
+    attribute_entities: Counter[str] = field(default_factory=Counter)
+    # Log records that reached the handlers
+    log_debug: int = 0
+    log_warning: int = 0
+    log_error: int = 0
+    log_loggers: Counter[str] = field(default_factory=Counter)
+    # Files written through the storage helper
+    store_writes: int = 0
+    store_bytes: int = 0
+    store_keys: Counter[str] = field(default_factory=Counter)
 
     def note_block(self, ns: int, at: float, function: str) -> None:
         if ns > self.block_ns:
@@ -139,6 +175,15 @@ class _Domain:
         self.state_reports += other.state_reports
         self.state_attributes_only += other.state_attributes_only
         self.state_entities.update(other.state_entities)
+        self.attribute_bytes += other.attribute_bytes
+        self.attribute_entities.update(other.attribute_entities)
+        self.log_debug += other.log_debug
+        self.log_warning += other.log_warning
+        self.log_error += other.log_error
+        self.log_loggers.update(other.log_loggers)
+        self.store_writes += other.store_writes
+        self.store_bytes += other.store_bytes
+        self.store_keys.update(other.store_keys)
 
     def merge_totals(self, other: _Domain, sign: int = 1) -> None:
         """Add (or with sign -1 remove) only the numbers, not the counters.
@@ -159,6 +204,12 @@ class _Domain:
         self.state_changes += sign * other.state_changes
         self.state_reports += sign * other.state_reports
         self.state_attributes_only += sign * other.state_attributes_only
+        self.attribute_bytes += sign * other.attribute_bytes
+        self.log_debug += sign * other.log_debug
+        self.log_warning += sign * other.log_warning
+        self.log_error += sign * other.log_error
+        self.store_writes += sign * other.store_writes
+        self.store_bytes += sign * other.store_bytes
 
     def totals_are_zero(self) -> bool:
         return not (
@@ -176,6 +227,11 @@ class _Domain:
             or self.state_reports
             or self.state_attributes_only
             or self.block_ns
+            or self.attribute_bytes
+            or self.log_debug
+            or self.log_warning
+            or self.log_error
+            or self.store_writes
         )
 
     @property
@@ -324,13 +380,33 @@ class Collector:
             stats.state_changes += record.changes
             stats.state_reports += record.reports
             stats.state_attributes_only += record.attributes_only
-            entities = stats.state_entities
-            entities.update(record.entities)
-            if len(entities) > 2 * MAX_STATE_ENTITIES_PER_MINUTE:
-                # The panel shows the busiest few, a long tail only costs memory
-                stats.state_entities = Counter(
-                    dict(entities.most_common(MAX_STATE_ENTITIES_PER_MINUTE))
+            stats.state_entities = _capped(stats.state_entities, record.entities)
+            if record.attribute_bytes:
+                stats.attribute_bytes += record.attribute_bytes
+                stats.attribute_entities = _capped(
+                    stats.attribute_entities, record.attribute_entities or Counter()
                 )
+
+    def add_logs(self, logs: list[LogCounts], now: float) -> None:
+        """Add log records counted before `now`."""
+        bucket = self._bucket(now)
+        for record in logs:
+            if (stats := bucket.domains.get(record.domain)) is None:
+                stats = bucket.domains[record.domain] = _Domain()
+            stats.log_debug += record.debug
+            stats.log_warning += record.warning
+            stats.log_error += record.error
+            stats.log_loggers = _capped(stats.log_loggers, record.loggers)
+
+    def add_store_writes(self, writes: list[StoreWrites], now: float) -> None:
+        """Add storage writes counted before `now`."""
+        bucket = self._bucket(now)
+        for record in writes:
+            if (stats := bucket.domains.get(record.domain)) is None:
+                stats = bucket.domains[record.domain] = _Domain()
+            stats.store_writes += record.writes
+            stats.store_bytes += record.size
+            stats.store_keys = _capped(stats.store_keys, record.keys)
 
     def add_loop_busy(self, busy_ns: int, now: float) -> None:
         """Add wall time the loop spent outside select() before `now`."""
@@ -515,7 +591,7 @@ class Collector:
         sums: dict[str, list[int]] = {}
         for part in parts:
             for domain, stats in part.domains.items():
-                row = sums.setdefault(domain, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+                row = sums.setdefault(domain, [0] * 16)
                 row[0] += stats.cpu_ns
                 row[1] += stats.executor_cpu_ns + stats.thread_cpu_ns
                 row[2] += stats.samples
@@ -526,7 +602,13 @@ class Collector:
                 row[7] += stats.state_changes
                 row[8] += stats.state_reports
                 row[9] += stats.state_attributes_only
-        idle = sums.pop("idle", [0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+                row[10] += stats.attribute_bytes
+                row[11] += stats.log_debug
+                row[12] += stats.log_warning
+                row[13] += stats.log_error
+                row[14] += stats.store_writes
+                row[15] += stats.store_bytes
+        idle = sums.pop("idle", [0] * 16)
         longest = self._longest(now, minutes)
         integrations = []
         for domain, (
@@ -540,6 +622,12 @@ class Collector:
             changes,
             reports,
             attributes_only,
+            attribute_bytes,
+            log_debug,
+            log_warning,
+            log_error,
+            store_writes,
+            store_bytes,
         ) in sorted(
             sums.items(), key=lambda item: (-(item[1][0] + item[1][1]), item[0])
         ):
@@ -564,6 +652,15 @@ class Collector:
                 item["state_changes_per_min"] = round(changes / span, 1)
                 item["state_attributes_only_per_min"] = round(attributes_only / span, 1)
                 item["state_repeated_per_min"] = round(reports / span, 1)
+            if attribute_bytes:
+                item["attribute_kib_per_min"] = round(attribute_bytes / 1024 / span, 1)
+            if log_debug or log_warning or log_error:
+                item["log_debug_per_min"] = round(log_debug / span, 1)
+                item["log_warnings_per_min"] = round(log_warning / span, 1)
+                item["log_errors_per_min"] = round(log_error / span, 1)
+            if store_writes:
+                item["store_writes_per_min"] = round(store_writes / span, 1)
+                item["store_kib_per_min"] = round(store_bytes / 1024 / span, 1)
             if (block := longest.get(domain)) is not None:
                 if block[0]:
                     item["longest_ms"] = round(block[0] / 1e6, 1)
@@ -663,6 +760,14 @@ def _hot_spots(
     ]
 
 
+def _capped(kept: Counter[str], new: Counter[str]) -> Counter[str]:
+    """Add new counts; past twice the cap keep the busiest, a long tail only costs memory."""
+    kept.update(new)
+    if len(kept) > 2 * MAX_STATE_ENTITIES_PER_MINUTE:
+        return Counter(dict(kept.most_common(MAX_STATE_ENTITIES_PER_MINUTE)))
+    return kept
+
+
 def _ranked[K](counter: Counter[K], n: int | None = None) -> list[tuple[K, int]]:
     """Return the largest entries, ties ordered by key so every sum ranks alike."""
     if n is None:
@@ -739,6 +844,33 @@ def _item(domain: str, stats: _Domain, span: float) -> dict[str, Any]:
                 for entity_id, count in _ranked(
                     stats.state_entities, TOP_STATE_ENTITIES
                 )
+            },
+        }
+    if stats.attribute_bytes:
+        item.setdefault("state_writes", {})["attribute_kib_per_min"] = round(
+            stats.attribute_bytes / 1024 / span, 1
+        )
+        item["state_writes"]["attribute_entities"] = {
+            entity_id: round(size / 1024 / span, 1)
+            for entity_id, size in _ranked(stats.attribute_entities, TOP_STATE_ENTITIES)
+        }
+    if stats.log_debug or stats.log_warning or stats.log_error:
+        item["logs"] = {
+            "debug_per_min": round(stats.log_debug / span, 1),
+            "warnings_per_min": round(stats.log_warning / span, 1),
+            "errors_per_min": round(stats.log_error / span, 1),
+            "loggers": {
+                name: round(count / span, 1)
+                for name, count in _ranked(stats.log_loggers, TOP_LOGGERS)
+            },
+        }
+    if stats.store_writes:
+        item["storage"] = {
+            "writes_per_min": round(stats.store_writes / span, 1),
+            "kib_per_min": round(stats.store_bytes / 1024 / span, 1),
+            "files": {
+                key: round(count / span, 1)
+                for key, count in _ranked(stats.store_keys, TOP_STORE_KEYS)
             },
         }
     if stats.block_ns:

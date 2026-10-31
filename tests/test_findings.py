@@ -515,3 +515,65 @@ def test_too_many_state_writes_are_found() -> None:
     assert _keys(
         find(_summary([{**item, "state_changes_per_min": 3_000}]), lambda _: detail, {})
     ) == [("busy_states", PROBLEM, "foo")]
+
+
+def test_large_attribute_changes_are_found() -> None:
+    """Changed attributes are what the recorder stores again; a lot of them is a finding."""
+    item = {**_item("foo"), "attribute_kib_per_min": 150}
+    detail = _detail(
+        state_writes={
+            "attribute_entities": {"sensor.foo_forecast": 140, "sensor.foo_x": 10}
+        }
+    )
+    findings = find(_summary([item]), lambda _: detail, {})
+    assert _keys(findings) == [("big_attributes", NOTICE, "foo")]
+    assert findings[0].values == {"kib": "150", "minutes": "15"}
+    assert findings[0].evidence[0] == "sensor.foo_forecast: 140 KiB/min"
+    assert (
+        find(_summary([{**item, "attribute_kib_per_min": 99}]), lambda _: detail, {})
+        == []
+    )
+    assert _keys(
+        find(_summary([{**item, "attribute_kib_per_min": 1_000}]), lambda _: detail, {})
+    ) == [("big_attributes", PROBLEM, "foo")]
+
+
+def test_noisy_logs_and_debug_logging_are_found() -> None:
+    """Warnings and errors name the loggers; a flood of debug lines is debug logging left on."""
+    item = {
+        **_item("foo"),
+        "log_warnings_per_min": 8,
+        "log_errors_per_min": 4,
+        "log_debug_per_min": 400,
+    }
+    detail = _detail(logs={"loggers": {"custom_components.foo.api": 12}})
+    findings = find(_summary([item]), lambda _: detail, {})
+    assert sorted(_keys(findings)) == [
+        ("debug_logging", NOTICE, "foo"),
+        ("noisy_logs", NOTICE, "foo"),
+    ]
+    noisy = next(f for f in findings if f.key == "noisy_logs")
+    assert noisy.values == {"per_min": "12", "errors": "4.0", "minutes": "15"}
+    assert noisy.evidence == ["custom_components.foo.api: 12/min"]
+    quiet = {
+        **item,
+        "log_warnings_per_min": 5,
+        "log_errors_per_min": 4,
+        "log_debug_per_min": 299,
+    }
+    assert find(_summary([quiet]), lambda _: detail, {}) == []
+
+
+def test_frequent_storage_writes_are_found() -> None:
+    """A file saved every few seconds wears out flash storage."""
+    item = {**_item("foo"), "store_writes_per_min": 12, "store_kib_per_min": 30}
+    detail = _detail(storage={"files": {"foo.cache": 12}})
+    findings = find(_summary([item]), lambda _: detail, {})
+    assert _keys(findings) == [("busy_storage", NOTICE, "foo")]
+    assert findings[0].evidence == ["foo.cache: 12/min"]
+    assert (
+        find(_summary([{**item, "store_writes_per_min": 5}]), lambda _: detail, {})
+        == []
+    )
+    # Built-in integrations save what the user set up, such as the entity registry
+    assert find(_summary([item]), lambda _: detail, {}, built_in=lambda _d: True) == []

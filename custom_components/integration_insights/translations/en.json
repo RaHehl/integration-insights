@@ -82,6 +82,38 @@
     "growing_resources": {
       "title": "{name} may be leaking",
       "description": "Between the last two memory snapshots {name} added {what} and did not release them. If this keeps growing over hours, memory use rises until Home Assistant restarts.\n\nWhat you can do:\n- Take another snapshot later. If the numbers keep growing, report it at [the issue tracker]({issues_url}) with the report from this page.\n- Check whether an update of {name} is available."
+    },
+    "big_attributes": {
+      "title": "{name} writes large attributes",
+      "description": "Over the last {minutes} minutes, the attributes of entities of {name} changed by {kib} KiB a minute. For every change the recorder stores the attributes again, and the dashboard receives them, so the database grows by about this much.\n\nWhat you can do:\n- Exclude the entities from the recorder if you do not need their history.\n- Check whether an update of {name} is available.\n- Look for a report, or open one, at [the issue tracker]({issues_url}), and add the report from this page."
+    },
+    "big_attributes_built_in": {
+      "title": "{name} writes large attributes",
+      "description": "Over the last {minutes} minutes, the attributes of entities of {name} changed by {kib} KiB a minute. For every change the recorder stores the attributes again, and the dashboard receives them, so the database grows by about this much.\n\nWhat you can do:\n- Exclude the entities from the recorder if you do not need their history.\n- {name} is part of Home Assistant and updates with it. Check whether a newer Home Assistant fixes it.\n- Look for a report, or open one, at [the Home Assistant issue tracker]({issues_url}), and add the report from this page."
+    },
+    "noisy_logs": {
+      "title": "{name} logs many warnings",
+      "description": "Over the last {minutes} minutes, {name} logged {per_min} warnings and errors a minute, {errors} of them errors. Each one is formatted and written to the log file, and a steady stream hides the messages that matter.\n\nWhat you can do:\n- Open the log and look at what it reports. Often it is a device that cannot be reached or a setting that needs attention.\n- Check whether an update of {name} is available.\n- Look for a report, or open one, at [the issue tracker]({issues_url}), and add the report from this page."
+    },
+    "noisy_logs_built_in": {
+      "title": "{name} logs many warnings",
+      "description": "Over the last {minutes} minutes, {name} logged {per_min} warnings and errors a minute, {errors} of them errors. Each one is formatted and written to the log file, and a steady stream hides the messages that matter.\n\nWhat you can do:\n- Open the log and look at what it reports. Often it is a device that cannot be reached or a setting that needs attention.\n- {name} is part of Home Assistant and updates with it. Check whether a newer Home Assistant fixes it.\n- Look for a report, or open one, at [the Home Assistant issue tracker]({issues_url}), and add the report from this page."
+    },
+    "debug_logging": {
+      "title": "Debug logging for {name} is on",
+      "description": "Over the last {minutes} minutes, {name} logged {per_min} debug and info lines a minute. That usually means debug logging was turned on and left on. Each line is formatted and written to the log file.\n\nWhat you can do:\n- When you have what you need, [open {name}]({config_url}) and turn debug logging off.\n- Check the `logger` section of your configuration for a debug level you no longer need."
+    },
+    "debug_logging_built_in": {
+      "title": "Debug logging for {name} is on",
+      "description": "Over the last {minutes} minutes, {name} logged {per_min} debug and info lines a minute. That usually means debug logging was turned on and left on. Each line is formatted and written to the log file.\n\nWhat you can do:\n- When you have what you need, [open {name}]({config_url}) and turn debug logging off.\n- Check the `logger` section of your configuration for a debug level you no longer need."
+    },
+    "busy_storage": {
+      "title": "{name} writes files often",
+      "description": "Over the last {minutes} minutes, {name} saved its files {per_min} times a minute, {kib} KiB a minute. Each save replaces a whole file, which wears out the SD card of a Raspberry Pi and other flash storage.\n\nWhat you can do:\n- Check whether an update of {name} is available.\n- Look for a report, or open one, at [the issue tracker]({issues_url}), and add the report from this page."
+    },
+    "busy_storage_built_in": {
+      "title": "{name} writes files often",
+      "description": "Over the last {minutes} minutes, {name} saved its files {per_min} times a minute, {kib} KiB a minute. Each save replaces a whole file, which wears out the SD card of a Raspberry Pi and other flash storage.\n\nWhat you can do:\n- {name} is part of Home Assistant and updates with it. Check whether a newer Home Assistant fixes it.\n- Look for a report, or open one, at [the Home Assistant issue tracker]({issues_url}), and add the report from this page."
     }
   }
 }

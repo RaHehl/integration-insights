@@ -675,8 +675,30 @@ class IntegrationInsightsPanel extends HTMLElement {
       lines.push(
         `State writes: ${sw.per_min} per min, ${sw.changes_per_min} changes, ${sw.attributes_only_per_min} attributes only, ${sw.repeated_per_min} repeated`
       );
-      for (const [entityId, value] of Object.entries(sw.entities)) {
+      for (const [entityId, value] of Object.entries(sw.entities || {})) {
         lines.push(`- ${entityId}: ${value} per min`);
+      }
+      if (sw.attribute_kib_per_min) {
+        lines.push(`Changed attributes: ${sw.attribute_kib_per_min} KiB per min`);
+        for (const [entityId, value] of Object.entries(sw.attribute_entities || {})) {
+          lines.push(`- ${entityId}: ${value} KiB per min`);
+        }
+      }
+    }
+    if (item.logs) {
+      const lg = item.logs;
+      lines.push(
+        `Log records: ${lg.warnings_per_min} warnings and ${lg.errors_per_min} errors per min, ${lg.debug_per_min} debug and info`
+      );
+      for (const [name, value] of Object.entries(lg.loggers)) {
+        lines.push(`- ${name}: ${value} per min`);
+      }
+    }
+    if (item.storage) {
+      const st = item.storage;
+      lines.push(`Storage writes: ${st.writes_per_min} per min, ${st.kib_per_min} KiB per min`);
+      for (const [key, value] of Object.entries(st.files)) {
+        lines.push(`- ${key}: ${value} per min`);
       }
     }
     if (item.stall) {
@@ -892,6 +914,7 @@ class IntegrationInsightsPanel extends HTMLElement {
     const changes = sum("state_changes_per_min");
     const attributesOnly = sum("state_attributes_only_per_min");
     const repeated = sum("state_repeated_per_min");
+    const attributeKib = sum("attribute_kib_per_min");
     const busiest = [...integrations].sort((a, b) => b.state_writes_per_min - a.state_writes_per_min)[0];
     const tiles = `<div class="summary">
       <div class="tile"><div class="label">Changes</div>
@@ -903,6 +926,9 @@ class IntegrationInsightsPanel extends HTMLElement {
       <div class="tile"><div class="label">Repeated</div>
         <div class="value">${ms(repeated)} per min</div>
         <div class="sub">nothing changed. Cheap, only the last reported time moves</div></div>
+      <div class="tile"><div class="label">Changed attributes</div>
+        <div class="value">${ms(attributeKib)} KiB per min</div>
+        <div class="sub">stored again by the recorder each time they change</div></div>
       <div class="tile"><div class="label">Busiest</div>
         <div class="value">${busiest ? escapeHtml(this._data.names[busiest.domain] || busiest.domain) : "none"}</div>
         <div class="sub">${busiest ? `${ms(busiest.state_writes_per_min)} writes per min` : "no state writes yet"}</div></div>
@@ -953,7 +979,16 @@ class IntegrationInsightsPanel extends HTMLElement {
           `<span class="chip" title="${escapeHtml(entityId)}">${escapeHtml(names[entityId] || entityId)} · ${value}/min</span>`
       )
       .join("");
-    return `<div class="detail"><p class="note">${sw.per_min} writes per minute: ${sw.changes_per_min} changes, ${sw.attributes_only_per_min} changed only attributes, ${sw.repeated_per_min} repeated.</p><h3>Most changes</h3><div class="pairs">${chips}</div></div>`;
+    const sizes = Object.entries(sw.attribute_entities || {})
+      .map(
+        ([entityId, value]) =>
+          `<span class="chip" title="${escapeHtml(entityId)}">${escapeHtml(names[entityId] || entityId)} · ${value} KiB/min</span>`
+      )
+      .join("");
+    const attributes = sw.attribute_kib_per_min
+      ? `<h3>Changed attributes, ${sw.attribute_kib_per_min} KiB per minute</h3><div class="pairs">${sizes}</div>`
+      : "";
+    return `<div class="detail"><p class="note">${sw.per_min} writes per minute: ${sw.changes_per_min} changes, ${sw.attributes_only_per_min} changed only attributes, ${sw.repeated_per_min} repeated.</p><h3>Most changes</h3><div class="pairs">${chips}</div>${attributes}</div>`;
   }
 
   _statesHeader(key, label) {
@@ -1104,8 +1139,27 @@ class IntegrationInsightsPanel extends HTMLElement {
       const chips = Object.entries(sw.entities)
         .map(([entityId, value]) => `<span class="chip">${escapeHtml(entityId)} · ${value}/min</span>`)
         .join("");
+      const size = sw.attribute_kib_per_min ? ` Changed attributes: ${sw.attribute_kib_per_min} KiB per minute.` : "";
       parts.push(
-        `<h3>State writes</h3><p class="note">${sw.per_min} writes per minute: ${sw.changes_per_min} changes, ${sw.attributes_only_per_min} changed only attributes, ${sw.repeated_per_min} repeated. Most changes:</p><div class="pairs">${chips}</div>`
+        `<h3>State writes</h3><p class="note">${sw.per_min} writes per minute: ${sw.changes_per_min} changes, ${sw.attributes_only_per_min} changed only attributes, ${sw.repeated_per_min} repeated.${size} Most changes:</p><div class="pairs">${chips}</div>`
+      );
+    }
+    if (item.logs) {
+      const lg = item.logs;
+      const chips = Object.entries(lg.loggers)
+        .map(([name, value]) => `<span class="chip">${escapeHtml(name)} · ${value}/min</span>`)
+        .join("");
+      parts.push(
+        `<h3>Log</h3><p class="note">${lg.warnings_per_min} warnings and ${lg.errors_per_min} errors per minute, ${lg.debug_per_min} debug and info lines.</p><div class="pairs">${chips}</div>`
+      );
+    }
+    if (item.storage) {
+      const st = item.storage;
+      const chips = Object.entries(st.files)
+        .map(([key, value]) => `<span class="chip">${escapeHtml(key)} · ${value}/min</span>`)
+        .join("");
+      parts.push(
+        `<h3>Saved files</h3><p class="note">${st.writes_per_min} saves per minute, ${st.kib_per_min} KiB per minute.</p><div class="pairs">${chips}</div>`
       );
     }
     if (item.stall) {
