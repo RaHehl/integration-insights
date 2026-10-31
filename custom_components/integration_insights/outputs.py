@@ -101,46 +101,74 @@ class StoreCounter:
         self._lock = threading.Lock()
         # storage key -> [writes, bytes]; swapped as a whole on drain
         self._counts_ref: list[dict[str, list[int]]] = [{}]
-        self._original: Callable[..., None] | None = None
-        self._wrapper: Callable[..., None] | None = None
+        self._original: Callable[..., Any] | None = None
+        self._wrapper: Callable[..., Any] | None = None
+        self._name = ""
         self._active = [False]
 
-    def install(self) -> None:
-        """Wrap Store._write_prepared_data, which every write goes through."""
+    def install(self) -> bool:
+        """Wrap the step every save goes through; return whether one was found.
+
+        Home Assistant 2026.11 serializes in Store._prepare_data, which
+        returns the bytes; before, Store._write_prepared_data got them.
+        Without either, saves are not counted and nothing else changes.
+        """
         if self._wrapper is not None:
-            return
-        original = Store._write_prepared_data  # noqa: SLF001
+            return True
         counts = self._counts_ref
         lock = self._lock
         active = self._active = [True]
 
-        def _write_prepared_data(store: Any, mode: str, json_data: Any) -> None:
-            # Once removed, a wrapper that something else wrapped in turn
-            # stays in the chain; it only passes calls on
-            if active[0]:
-                try:
-                    size = len(json_data)
-                    with lock:
-                        table = counts[0]
-                        if (row := table.get(store.key)) is None:
-                            row = table[store.key] = [0, 0]
-                        row[0] += 1
-                        row[1] += size
-                except Exception:  # noqa: BLE001
-                    pass  # The write must happen whatever the counting does
-            original(store, mode, json_data)
+        def note(store: Any, json_data: Any) -> None:
+            try:
+                size = len(json_data)
+                with lock:
+                    table = counts[0]
+                    if (row := table.get(store.key)) is None:
+                        row = table[store.key] = [0, 0]
+                    row[0] += 1
+                    row[1] += size
+            except Exception:  # noqa: BLE001
+                pass  # The save must happen whatever the counting does
 
+        original: Any
+        if (original := getattr(Store, "_prepare_data", None)) is not None:
+            name = "_prepare_data"
+            prepare = original
+
+            def wrapper(store: Any, data: Any) -> Any:
+                result = prepare(store, data)
+                # Once removed, a wrapper that something else wrapped in turn
+                # stays in the chain; it only passes calls on
+                if active[0]:
+                    note(store, result[1])
+                return result
+
+        elif (original := getattr(Store, "_write_prepared_data", None)) is not None:
+            name = "_write_prepared_data"
+            write = original
+
+            def wrapper(store: Any, mode: str, json_data: Any) -> Any:  # type: ignore[misc]
+                if active[0]:
+                    note(store, json_data)
+                return write(store, mode, json_data)
+
+        else:
+            active[0] = False
+            return False
+        self._name = name
         self._original = original
-        self._wrapper = _write_prepared_data
-        Store._write_prepared_data = _write_prepared_data  # type: ignore[method-assign, assignment]  # noqa: SLF001
+        self._wrapper = wrapper
+        setattr(Store, name, wrapper)
+        return True
 
     def uninstall(self) -> None:
         """Remove the wrapper if it is still in place."""
         self._active[0] = False
         if self._wrapper is None:
             return
-        if Store._write_prepared_data is self._wrapper:  # noqa: SLF001
-            Store._write_prepared_data = self._original  # type: ignore[method-assign, assignment]  # noqa: SLF001
+        if getattr(Store, self._name, None) is self._wrapper:
+            setattr(Store, self._name, self._original)
         self._wrapper = None
         self._original = None
 

@@ -1,7 +1,12 @@
 """Tests for counting log records and storage writes."""
 
 import logging
+from types import SimpleNamespace
 
+import pytest
+from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+from custom_components.integration_insights.const import DOMAIN
 from custom_components.integration_insights.outputs import (
     LogCounter,
     StoreCounter,
@@ -113,3 +118,49 @@ async def test_a_storage_wrapper_left_below_another_passes_through(
     finally:
         Store._write_prepared_data = original  # type: ignore[method-assign]  # noqa: SLF001
     assert counter.drain(lambda key: "chatty") == []
+
+
+def test_newer_store_is_counted_where_it_serializes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Home Assistant 2026.11 serializes in _prepare_data and writes through an I/O object."""
+
+    def prepare(store: Store, data: dict) -> tuple[str, str]:
+        return "w", '{"value": 1}'
+
+    monkeypatch.delattr(Store, "_write_prepared_data")
+    monkeypatch.setattr(Store, "_prepare_data", prepare, raising=False)
+    counter = StoreCounter()
+    assert counter.install()
+    store = SimpleNamespace(key="chatty.cache")
+    try:
+        assert Store._prepare_data(store, {}) == ("w", '{"value": 1}')  # type: ignore[attr-defined]  # noqa: SLF001
+        assert Store._prepare_data(store, {}) == ("w", '{"value": 1}')  # type: ignore[attr-defined]  # noqa: SLF001
+    finally:
+        counter.uninstall()
+    assert Store._prepare_data is prepare  # type: ignore[attr-defined]  # noqa: SLF001
+    (row,) = counter.drain(lambda key: "chatty")
+    assert (row.writes, row.size) == (2, 2 * len('{"value": 1}'))
+
+
+def test_a_store_without_a_known_step_is_left_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a step to wrap, saves are not counted and nothing else breaks."""
+    monkeypatch.delattr(Store, "_write_prepared_data")
+    counter = StoreCounter()
+    assert not counter.install()
+    counter.uninstall()
+    assert counter.drain(lambda key: "core") == []
+
+
+async def test_measuring_starts_on_a_store_it_cannot_count(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unknown storage helper must not stop everything else from being measured."""
+    monkeypatch.delattr(Store, "_write_prepared_data")
+    entry = MockConfigEntry(domain=DOMAIN)
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    assert entry.runtime_data.sampler.installed
+    assert await hass.config_entries.async_unload(entry.entry_id)

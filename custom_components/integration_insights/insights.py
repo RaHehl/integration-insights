@@ -169,7 +169,8 @@ class Insights:
             self.sampler.select_wrapper = self.loop_wait.wrapper_code
         self.loop_timing.start()
         self.logs.install()
-        self.stores.install()
+        if not self.stores.install():
+            _LOGGER.debug("This Home Assistant saves files in a way not counted here")
         self.sampler.skip_codes = frozenset(
             {self.loop_timing.wrapper_code, *self.background.wrapper_codes}
         )
