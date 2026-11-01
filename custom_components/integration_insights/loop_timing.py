@@ -172,8 +172,9 @@ class LoopTiming:
         # so the id stays its own until the next drain
         self._method_rows: dict[tuple[Any, int, str | None], tuple[Any, _Row]] = {}
         self._blocks: deque[BlockRecord] = deque(maxlen=MAX_BLOCKS)
-        # Start of the callback running now, and who the watchdog saw in it
-        self._running = [0]
+        # Start and row of the callback running now; the watchdog reads the
+        # start, a drain keeps the row of the callback that drains
+        self._running: list[Any] = [0, None]
         self._seen: dict[int, tuple[str, str] | None] = {}
         self._active = [False]
         self._overhead = [0]
@@ -413,13 +414,15 @@ class LoopTiming:
                         "Could not attribute a callback of the event loop",
                         exc_info=True,
                     )
-            outer = running[0]
+            outer, outer_row = running
+            running[1] = row
             start = running[0] = perf()
             try:
                 original(handle)
             finally:
                 end = perf()
                 running[0] = outer
+                running[1] = outer_row
                 elapsed = end - start
                 if row is not None:
                     row.count += 1
@@ -504,7 +507,9 @@ class LoopTiming:
         the objects those entries hold.
         """
         rows = self._rows
-        idle = {id(row) for row in rows.values() if not row.count}
+        # The callback that drains has not counted itself yet
+        busy = self._running[1]
+        idle = {id(row) for row in rows.values() if not row.count and row is not busy}
         if idle:
             coro_rows = self._coro_rows
             for coro in [c for c, row in coro_rows.items() if id(row) in idle]:

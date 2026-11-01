@@ -410,3 +410,28 @@ def test_a_full_table_counts_the_rest_under_other_callbacks(
     finally:
         timing.stop()
         loop.close()
+
+
+def drain_and_work(timing: LoopTiming, seen: list[Any]) -> None:
+    """A callback that drains, as the panel's requests do, then works."""
+    seen.extend(timing.drain())
+    time.sleep(0.02)
+
+
+def test_a_callback_that_drains_keeps_its_own_time() -> None:
+    """The drain runs before the callback has counted itself; its row stays."""
+    loop = asyncio.new_event_loop()
+    timing = LoopTiming(loop)
+    seen: list[Any] = []
+    try:
+        timing.start()
+        for _ in range(3):
+            loop.call_soon(drain_and_work, timing, seen)
+            loop.run_until_complete(asyncio.sleep(0))
+        records = timing.drain()
+        mine = [r for r in [*seen, *records] if r.label.endswith("drain_and_work")]
+        assert sum(r.calls for r in mine) == 3
+        assert sum(r.total_ns for r in mine) >= 3 * 0.02 * 1e9 * 0.9
+    finally:
+        timing.stop()
+        loop.close()

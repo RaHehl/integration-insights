@@ -7,7 +7,6 @@ mapped to integrations on the loop.
 
 from collections import Counter
 from collections.abc import Callable, Mapping
-from contextlib import suppress
 import functools
 import logging
 import os
@@ -55,9 +54,12 @@ class LogCounter(logging.Handler):
         """Count without the handler lock: emit takes its own, shorter one."""
         if not (result := self.filter(record)):
             return False
-        # Never break the logging call, and never log about it
-        with suppress(Exception):
+        # Never break the logging call, and never log about it. A plain try:
+        # suppress() costs a context manager on every record.
+        try:  # noqa: SIM105
             self.emit(result if isinstance(result, logging.LogRecord) else record)
+        except Exception:  # noqa: BLE001
+            pass
         return True
 
     def emit(self, record: logging.LogRecord) -> None:
