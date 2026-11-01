@@ -241,6 +241,7 @@ async def websocket_findings(
         msg["id"],
         {
             "verdict": verdict(findings),
+            "minutes": insights.findings_minutes,
             "findings": [_render(hass, finding, translations) for finding in findings],
         },
     )

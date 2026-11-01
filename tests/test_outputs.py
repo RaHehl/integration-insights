@@ -1,7 +1,10 @@
 """Tests for counting log records and storage writes."""
 
+import json
 import logging
+import threading
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -16,6 +19,20 @@ from custom_components.integration_insights.outputs import (
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
+
+# The step every save goes through on the Home Assistant under test. The
+# test harness replaces the write behind async_save, so tests call it.
+SAVE_STEP = (
+    "_prepare_data" if hasattr(Store, "_prepare_data") else "_write_prepared_data"
+)
+
+
+async def _save(hass: HomeAssistant, store: Store, data: dict[str, Any]) -> None:
+    step = getattr(store, SAVE_STEP)
+    if SAVE_STEP == "_prepare_data":
+        await hass.async_add_executor_job(step, {"data": data})
+    else:
+        await hass.async_add_executor_job(step, "w", json.dumps({"data": data}))
 
 
 def test_recorder_warnings_about_attributes_count_for_the_entity() -> None:
@@ -95,23 +112,17 @@ def test_log_records_are_counted_by_level_and_logger() -> None:
 
 
 async def test_storage_writes_are_counted_by_key(hass: HomeAssistant) -> None:
-    """Every write through Store counts, with its size, for the integration of its key."""
+    """Every save through Store counts, with its size, for the integration of its key."""
+    step = SAVE_STEP
+    original = getattr(Store, step)
     counter = StoreCounter()
     counter.install()
     try:
         store: Store[dict[str, int]] = Store(hass, 1, "chatty.cache")
         other: Store[dict[str, int]] = Store(hass, 1, "core.restore_state")
         for value in range(3):
-            await hass.async_add_executor_job(
-                store._write_prepared_data,  # noqa: SLF001
-                "w",
-                f'{{"value": {value}}}',
-            )
-        await hass.async_add_executor_job(
-            other._write_prepared_data,  # noqa: SLF001
-            "w",
-            "{}",
-        )
+            await _save(hass, store, {"value": value})
+        await _save(hass, other, {})
     finally:
         counter.uninstall()
     rows = {
@@ -119,37 +130,55 @@ async def test_storage_writes_are_counted_by_key(hass: HomeAssistant) -> None:
         for row in counter.drain(lambda key: store_domain(key, {"chatty"}))
     }
     assert rows["chatty"].writes == 3
-    assert rows["chatty"].size == 3 * len('{"value": 0}')
+    assert rows["chatty"].size > 3 * len('{"value": 0}')
     assert rows["chatty"].keys == {"chatty.cache": 3}
     assert rows["core"].writes == 1
-    assert Store._write_prepared_data.__qualname__ == "Store._write_prepared_data"  # noqa: SLF001
+    assert getattr(Store, step) is original
 
 
 async def test_a_storage_wrapper_left_below_another_passes_through(
     hass: HomeAssistant,
 ) -> None:
-    """Uninstalled under someone else's wrapper, writes go through uncounted."""
+    """Uninstalled under someone else's wrapper, saves go through uncounted."""
+    step = SAVE_STEP
     counter = StoreCounter()
-    original = Store._write_prepared_data  # noqa: SLF001
+    original = getattr(Store, step)
     counter.install()
-    ours = Store._write_prepared_data  # noqa: SLF001
+    ours = getattr(Store, step)
 
-    def other(store: Store, mode: str, json_data: str) -> None:
-        ours(store, mode, json_data)
+    def other(*args: Any, **kwargs: Any) -> Any:
+        return ours(*args, **kwargs)
 
     try:
-        Store._write_prepared_data = other  # type: ignore[method-assign, assignment]  # noqa: SLF001
+        setattr(Store, step, other)
         counter.uninstall()
-        assert Store._write_prepared_data is other  # noqa: SLF001
+        assert getattr(Store, step) is other
         store: Store[dict[str, int]] = Store(hass, 1, "chatty.cache")
-        await hass.async_add_executor_job(
-            store._write_prepared_data,  # noqa: SLF001
-            "w",
-            "{}",
-        )
+        await _save(hass, store, {})
     finally:
-        Store._write_prepared_data = original  # type: ignore[method-assign]  # noqa: SLF001
+        setattr(Store, step, original)
     assert counter.drain(lambda key: "chatty") == []
+
+
+async def test_a_new_argument_in_core_keeps_saving(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wrapper passes on whatever core passes, and still counts."""
+
+    def prepare(store: Store, data: dict, *, extra: bool = False) -> tuple[str, str]:
+        return "w", '{"extra": true}' if extra else "{}"
+
+    monkeypatch.delattr(Store, "_write_prepared_data", raising=False)
+    monkeypatch.setattr(Store, "_prepare_data", prepare, raising=False)
+    counter = StoreCounter()
+    assert counter.install()
+    store = SimpleNamespace(key="chatty.cache")
+    try:
+        assert Store._prepare_data(store, {}, extra=True) == ("w", '{"extra": true}')  # type: ignore[attr-defined]  # noqa: SLF001
+    finally:
+        counter.uninstall()
+    (row,) = counter.drain(lambda key: "chatty")
+    assert row.size == len('{"extra": true}')
 
 
 def test_newer_store_is_counted_where_it_serializes(
@@ -160,7 +189,7 @@ def test_newer_store_is_counted_where_it_serializes(
     def prepare(store: Store, data: dict) -> tuple[str, str]:
         return "w", '{"value": 1}'
 
-    monkeypatch.delattr(Store, "_write_prepared_data")
+    monkeypatch.delattr(Store, "_write_prepared_data", raising=False)
     monkeypatch.setattr(Store, "_prepare_data", prepare, raising=False)
     counter = StoreCounter()
     assert counter.install()
@@ -194,7 +223,10 @@ def test_a_store_without_a_known_step_is_left_alone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Without a step to wrap, saves are not counted and nothing else breaks."""
-    monkeypatch.delattr(Store, "_write_prepared_data")
+    # A storage helper with neither step; the real one stays, core needs it
+    monkeypatch.setattr(
+        "custom_components.integration_insights.outputs.Store", type("Store", (), {})
+    )
     counter = StoreCounter()
     assert not counter.install()
     assert not counter.installed
@@ -206,7 +238,10 @@ async def test_measuring_starts_on_a_store_it_cannot_count(
     hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An unknown storage helper must not stop everything else from being measured."""
-    monkeypatch.delattr(Store, "_write_prepared_data")
+    # A storage helper with neither step; the real one stays, core needs it
+    monkeypatch.setattr(
+        "custom_components.integration_insights.outputs.Store", type("Store", (), {})
+    )
     entry = MockConfigEntry(domain=DOMAIN)
     entry.add_to_hass(hass)
     assert await hass.config_entries.async_setup(entry.entry_id)
@@ -232,3 +267,22 @@ def test_counting_never_breaks_a_logging_call(monkeypatch: pytest.MonkeyPatch) -
         logger.error("still logged")
     finally:
         counter.uninstall()
+
+
+def test_a_record_logged_while_counting_does_not_deadlock() -> None:
+    """A finalizer that logs can run inside emit on the same thread."""
+    counter = LogCounter()
+    record = logging.LogRecord(
+        "custom_components.chatty", logging.ERROR, "f", 1, "x", None, None
+    )
+
+    def nested() -> None:
+        with counter._lock:  # noqa: SLF001
+            counter.emit(record)
+
+    thread = threading.Thread(target=nested, daemon=True)
+    thread.start()
+    thread.join(2)
+    assert not thread.is_alive()
+    (row,) = counter.drain(lambda name: "chatty")
+    assert row.error == 1

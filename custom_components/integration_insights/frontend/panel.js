@@ -369,6 +369,7 @@ const STYLE = `
     font-size: 14px;
     cursor: pointer;
   }
+  .finding .text { overflow-wrap: anywhere; }
   .finding details { margin-top: 10px; font-size: 13px; }
   .finding details ul { margin: 6px 0 0; padding-left: 20px; font-family: var(--ii-mono); word-break: break-word; }
   .footer { margin-top: 12px; font-size: 13px; color: var(--secondary-text-color); }
@@ -378,6 +379,7 @@ const STYLE = `
     .card-head.mem, .row.mem { grid-template-columns: 1fr 64px 64px 56px; }
     .card-head.states, .row.states { grid-template-columns: 1fr 56px 56px 56px; }
     .sort .long { display: none; }
+    .badge { display: none; }
     .sort .short { display: inline; }
     .card-head.files, .row.files { grid-template-columns: 1fr 56px 56px; }
     .col-wide { display: none; }
@@ -847,7 +849,8 @@ class IntegrationInsightsPanel extends HTMLElement {
 
   _render() {
     const root = this.shadowRoot;
-    const focused = root.activeElement?.closest?.("[data-action], summary");
+    const focused = root.activeElement?.closest?.("[data-action], summary, a");
+    const links = [...root.querySelectorAll("a")];
     let selector;
     if (focused?.dataset.action) {
       const { action, value } = focused.dataset;
@@ -855,8 +858,10 @@ class IntegrationInsightsPanel extends HTMLElement {
     } else if (focused?.parentElement?.dataset.stack) {
       selector = `details[data-stack="${CSS.escape(focused.parentElement.dataset.stack)}"] > summary`;
     }
+    const link = focused?.tagName === "A" ? links.indexOf(focused) : -1;
     root.innerHTML = `<style>${STYLE}</style>${this._renderHeader()}<main>${this._renderBody()}</main>`;
     if (selector) root.querySelector(selector)?.focus();
+    else if (link >= 0) root.querySelectorAll("a")[link]?.focus();
   }
 
   _renderHeader() {
@@ -975,7 +980,7 @@ class IntegrationInsightsPanel extends HTMLElement {
 
     const updated = this._updated ? this._updated.toLocaleTimeString() : "";
     return `${tiles}<div class="card">
-        <div class="card-head"><div>Integration</div>${this._sortHeader("loop_cpu_ms_per_min", "Loop ms/min")}${this._sortHeader("background_cpu_ms_per_min", "Background")}${this._sortHeader("cpu_ms_per_min", "of a core")}${this._sortHeader("samples", "Samples", "col-samples")}</div>
+        <div class="card-head"><div>Integration</div>${this._sortHeader("loop_cpu_ms_per_min", "Loop ms/min|Loop")}${this._sortHeader("background_cpu_ms_per_min", "Background|Bg.")}${this._sortHeader("cpu_ms_per_min", "of a core|Core")}${this._sortHeader("samples", "Samples", "col-samples")}</div>
         ${rows}
       </div>
       <div class="footer">CPU time on the event loop, sampled every ${sampler.interval_ms} ms of loop CPU. Callbacks, executor jobs and threads are measured exactly. Updated ${updated}${this._error ? ` · <span class="error">${escapeHtml(this._error)}</span>` : ""}</div>`;
@@ -1195,7 +1200,7 @@ class IntegrationInsightsPanel extends HTMLElement {
   _sortHeader(key, label, extra = "") {
     const active = this._sort === key;
     const arrow = active ? (this._sortAscending ? " ▲" : " ▼") : "";
-    return `<button class="num sort${active ? " active" : ""} ${extra}" data-action="sort" data-value="${key}" aria-sort="${active ? (this._sortAscending ? "ascending" : "descending") : "none"}">${label}${arrow}</button>`;
+    return `<button class="num sort${active ? " active" : ""} ${extra}" data-action="sort" data-value="${key}" aria-sort="${active ? (this._sortAscending ? "ascending" : "descending") : "none"}">${sortLabel(label)}${arrow}</button>`;
   }
 
   _ownerName(owner) {
@@ -1218,15 +1223,19 @@ class IntegrationInsightsPanel extends HTMLElement {
     const head = findings.some((f) => f.key === "measuring")
       ? "Still measuring"
       : verdict === "ok"
-        ? `Nothing unusual in the last ${FINDINGS_MINUTES} minutes`
+        ? `Nothing unusual in the last ${this._findings.minutes || FINDINGS_MINUTES} minutes`
         : verdict === "problem"
         ? `${worthALook} ${worthALook === 1 ? "problem" : "problems"} found`
         : `${worthALook} ${worthALook === 1 ? "thing" : "things"} worth a look`;
+    const parts = ["time on the event loop", "background threads and jobs", "state writes", "logs"];
+    if (this._data?.report?.sampler?.stores_counted !== false) parts.push("saved files");
+    if (this._memory?.memory?.latest) parts.push("memory snapshots");
+    const checked = `${parts.slice(0, -1).join(", ")} and ${parts.at(-1)}`;
     const mark = verdict === "ok" ? "✓" : verdict === "problem" ? "✕" : "!";
     const banner = `<div class="verdict ${verdict}" role="status">
         <div class="mark" aria-hidden="true">${mark}</div>
         <div><div class="head">${escapeHtml(head)}</div>
-        <div class="sub">Checked: time on the event loop, background threads and jobs, state writes, logs${this._data?.report?.sampler?.stores_counted === false ? "" : " and saved files"}${this._memory?.memory?.latest ? ", memory snapshots" : ""}.</div></div>
+        <div class="sub">Checked: ${checked}.</div></div>
       </div>`;
     const cards = findings
       .map((finding, index) => {

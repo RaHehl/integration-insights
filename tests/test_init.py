@@ -498,3 +498,34 @@ async def test_state_filters_survive_odd_events_and_threads(
     assert sw["changes_per_min"] > 0
     assert "attribute_entities" not in sw
     assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_attribute_size_is_what_the_recorder_serializes(
+    hass: HomeAssistant,
+) -> None:
+    """Attributes the integration leaves out and entities the recorder skips do not count."""
+    entry = MockConfigEntry(domain=DOMAIN)
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    insights = entry.runtime_data
+    registry = er.async_get(hass)
+    kept = registry.async_get_or_create("sensor", "solar", "kept").entity_id
+    skipped = registry.async_get_or_create("sensor", "solar", "skipped").entity_id
+    hass.data["recorder_instance"] = SimpleNamespace(
+        entity_filter=lambda entity_id: entity_id != skipped
+    )
+    try:
+        hass.states.async_set(
+            kept,
+            "1",
+            {"forecast": "x" * 1000, "unit_of_measurement": "W"},
+            state_info={"unrecorded_attributes": frozenset({"forecast"})},
+        )
+        hass.states.async_set(skipped, "1", {"forecast": "x" * 1000})
+        insights.drain()
+    finally:
+        del hass.data["recorder_instance"]
+    solar = insights.collector._buckets[-1].domains["solar"]  # noqa: SLF001
+    assert solar.attribute_bytes == len(b'{"unit_of_measurement":"W"}')
+    assert list(solar.attribute_entities) == [kept]
+    assert await hass.config_entries.async_unload(entry.entry_id)

@@ -29,7 +29,9 @@ class LogCounter(logging.Handler):
     def __init__(self) -> None:
         """Initialize; install() attaches the handler."""
         super().__init__(logging.NOTSET)
-        self._lock = threading.Lock()
+        # Reentrant: a finalizer that logs can run inside emit on the same
+        # thread, during garbage collection or a signal handler
+        self._lock = threading.RLock()
         # logger name -> [debug, info, warning, error and up]
         self._counts: dict[str, list[int]] = {}
         # entity_id -> recorder warnings about its attributes
@@ -141,7 +143,7 @@ class StoreCounter:
 
     def __init__(self) -> None:
         """Initialize; install() wraps the write."""
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         # storage key -> [writes, bytes]; swapped as a whole on drain
         self._counts_ref: list[dict[str, list[int]]] = [{}]
         self._original: Callable[..., Any] | None = None
@@ -180,8 +182,9 @@ class StoreCounter:
             name = "_prepare_data"
             prepare = original
 
-            def wrapper(store: Any, data: Any) -> Any:
-                result = prepare(store, data)
+            # Any arguments pass through, so a new one in core keeps saving
+            def wrapper(store: Any, *args: Any, **kwargs: Any) -> Any:
+                result = prepare(store, *args, **kwargs)
                 # Once removed, a wrapper that something else wrapped in turn
                 # stays in the chain; it only passes calls on
                 if active[0]:
@@ -192,10 +195,13 @@ class StoreCounter:
             name = "_write_prepared_data"
             write = original
 
-            def wrapper(store: Any, mode: str, json_data: Any) -> Any:  # type: ignore[misc]
+            def wrapper(store: Any, *args: Any, **kwargs: Any) -> Any:
                 if active[0]:
-                    note(store, (mode, json_data))
-                return write(store, mode, json_data)
+                    note(
+                        store,
+                        args if len(args) > 1 else (None, kwargs.get("json_data")),
+                    )
+                return write(store, *args, **kwargs)
 
         else:
             active[0] = False

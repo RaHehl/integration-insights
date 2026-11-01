@@ -16,12 +16,14 @@ from homeassistant.const import (
     EVENT_HOMEASSISTANT_STOP,
     EVENT_STATE_CHANGED,
     EVENT_STATE_REPORTED,
+    MATCH_ALL,
 )
 from homeassistant.core import CALLBACK_TYPE, CoreState, Event, HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity import entity_sources
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.json import json_bytes
+from homeassistant.helpers.recorder import DATA_INSTANCE as RECORDER
 from homeassistant.loader import IntegrationNotLoaded, async_get_loaded_integration
 from homeassistant.util import dt as dt_util
 
@@ -66,6 +68,10 @@ DRAIN_INTERVAL = timedelta(seconds=10)
 TOP_ENTITIES = 20
 # States set by hand under made-up entity ids must not grow the cache forever
 MAX_CACHED_ENTITIES = 50_000
+# What the recorder keeps of an entity that leaves all its attributes out
+RECORDED_WITH_MATCH_ALL = frozenset(
+    {"device_class", "friendly_name", "state_class", "unit_of_measurement"}
+)
 KEPT_SNAPSHOTS = 10
 # Left out of findings after a start.
 STARTUP_MINUTES = 5
@@ -102,6 +108,8 @@ class Insights:
         # Findings of the last call and when, see findings.HOLD
         self._shown: Shown = {}
         self._shown_at = 0.0
+        # The window the last findings were judged on, in minutes
+        self.findings_minutes = 0
         self._lost_seen = 0
         self._errors_seen = 0
         self._rearm_failed = False
@@ -111,7 +119,7 @@ class Insights:
         self._unsub_stop: CALLBACK_TYPE | None = None
         self._unsub_started: CALLBACK_TYPE | None = None
         self._unsub_states: list[CALLBACK_TYPE] = []
-        # Attributes to measure: integration, entity_id, attributes
+        # States whose attributes to measure: integration, entity_id, state
         self._pending_attributes: list[tuple[str, str, Any]] = []
         # domain -> [changes, reports, entities], filled by the event filters
         self._state_writes: dict[str, list[Any]] = {}
@@ -282,7 +290,7 @@ class Insights:
                 ):
                     if not pending:
                         loop.call_soon(measure)
-                    pending.append((platform, entity_id, new.attributes))
+                    pending.append((platform, entity_id, new))
             except Exception:  # noqa: BLE001
                 pass
             return False
@@ -340,8 +348,25 @@ class Insights:
             return
         batch = pending[:]
         pending.clear()
-        for platform, entity_id, attributes in batch:
+        recorder = self.hass.data.get(RECORDER)
+        included = getattr(recorder, "entity_filter", None)
+        for platform, entity_id, state in batch:
             try:
+                # What the recorder serializes: nothing of an entity it
+                # excludes, and no attribute the integration leaves out.
+                # Without a recorder everything counts.
+                if included is not None and not included(entity_id):
+                    continue
+                attributes = state.attributes
+                if (info := state.state_info) and (
+                    unrecorded := info["unrecorded_attributes"]
+                ):
+                    keep = RECORDED_WITH_MATCH_ALL if MATCH_ALL in unrecorded else None
+                    attributes = {
+                        key: value
+                        for key, value in attributes.items()
+                        if (key in keep if keep is not None else key not in unrecorded)
+                    }
                 size = len(json_bytes(attributes))
             except Exception:  # noqa: BLE001
                 continue
@@ -691,6 +716,7 @@ class Insights:
         # minutes ago, so it must be a minute shorter than the settled time
         # to leave the start out.
         if settled < MIN_MINUTES + 1:
+            self.findings_minutes = 0
             return [
                 Finding(
                     "measuring",
@@ -698,7 +724,7 @@ class Insights:
                     values={"minutes": f"{math.ceil(MIN_MINUTES + 1 - settled)}"},
                 )
             ]
-        window = min(minutes, math.floor(settled) - 1)
+        window = self.findings_minutes = min(minutes, math.floor(settled) - 1)
         if now - self._shown_at > SHOWN_SECONDS:
             self._shown = {}
         findings = find(
