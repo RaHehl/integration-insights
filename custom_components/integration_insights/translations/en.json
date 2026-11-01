@@ -105,11 +105,11 @@
     },
     "growing_resources": {
       "title": "{name} may be leaking",
-      "description": "Between the last two memory snapshots {name} added {what} and did not release them. If this keeps growing over hours, memory use rises until Home Assistant restarts.\n\nWhat you can do:\n- Take another snapshot later. If the numbers keep growing, report it at [the issue tracker]({issues_url}) with the report from this page.\n- Check whether an update of {name} is available."
+      "description": "Between the last two memory snapshots {name} added {what} and did not release them. If this keeps growing over hours, memory use rises until Home Assistant restarts.\n\nWhat you can do:\n- Take another snapshot later.\n- If the numbers keep growing, report it at [the issue tracker]({issues_url}) with the report from this page.\n- Check whether an update of {name} is available."
     },
     "growing_resources_built_in": {
       "title": "{name} may be leaking",
-      "description": "Between the last two memory snapshots {name} added {what} and did not release them. If this keeps growing over hours, memory use rises until Home Assistant restarts.\n\nWhat you can do:\n- Take another snapshot later. If the numbers keep growing, report it at [the Home Assistant issue tracker]({issues_url}) with the report from this page.\n- {name} is part of Home Assistant and updates with it. Check whether a newer Home Assistant fixes it."
+      "description": "Between the last two memory snapshots {name} added {what} and did not release them. If this keeps growing over hours, memory use rises until Home Assistant restarts.\n\nWhat you can do:\n- Take another snapshot later.\n- If the numbers keep growing, report it at [the Home Assistant issue tracker]({issues_url}) with the report from this page.\n- {name} is part of Home Assistant and updates with it. Check whether a newer Home Assistant fixes it."
     },
     "growing_resources_configured": {
       "title": "{name} may be leaking",

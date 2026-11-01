@@ -452,9 +452,11 @@ def _memory_findings(memory: dict[str, Any]) -> list[Finding]:
                     NOTICE,
                     row["owner"],
                     {
-                        "what": ", ".join(
-                            f"{count} {RESOURCE_NAMES.get(name, name)}"
-                            for name, count in grown.items()
+                        "what": _listed(
+                            [
+                                f"{count} {RESOURCE_NAMES.get(name, name)}"
+                                for name, count in grown.items()
+                            ]
                         )
                     },
                     [
@@ -464,6 +466,11 @@ def _memory_findings(memory: dict[str, Any]) -> list[Finding]:
                 )
             )
     return findings
+
+
+def _listed(items: list[str]) -> str:
+    """Join items as a sentence does: "a, b and c"."""
+    return " and ".join([", ".join(items[:-1]), items[-1]] if len(items) > 1 else items)
 
 
 def _number(value: float) -> str:

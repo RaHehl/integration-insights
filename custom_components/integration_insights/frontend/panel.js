@@ -45,6 +45,7 @@ const renderText = (text) =>
 const plainText = (text) => String(text).replace(/\[([^\]]+)\]\(([^)]+)\)/g, "$1 ($2)");
 // Findings answer one question and get one window: long enough to hold, short enough to be today's.
 const FINDINGS_MINUTES = 15;
+const FOCUSABLE = "a, button, summary, [tabindex]";
 const localTime = (epoch) => (epoch ? new Date(epoch * 1000).toLocaleTimeString() : "");
 const isoTime = (epoch) => (epoch ? new Date(epoch * 1000).toISOString() : "");
 
@@ -341,6 +342,7 @@ const STYLE = `
   .verdict .head { font-size: 18px; }
   .verdict .sub { margin-top: 2px; font-size: 13px; color: var(--secondary-text-color); }
   .verdict.ok .mark { color: var(--success-color, #43a047); }
+  .verdict.info .mark { color: var(--secondary-text-color); }
   .verdict.notice .mark { color: var(--warning-color, #ffa600); }
   .verdict.problem .mark { color: var(--error-color, #db4437); }
   .finding {
@@ -370,6 +372,8 @@ const STYLE = `
     cursor: pointer;
   }
   .finding .text { overflow-wrap: anywhere; }
+  .card-head > div { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .rough { display: none; margin-right: 2px; color: var(--secondary-text-color); }
   .finding details { margin-top: 10px; font-size: 13px; }
   .finding details ul { margin: 6px 0 0; padding-left: 20px; font-family: var(--ii-mono); word-break: break-word; }
   .footer { margin-top: 12px; font-size: 13px; color: var(--secondary-text-color); }
@@ -380,6 +384,7 @@ const STYLE = `
     .card-head.states, .row.states { grid-template-columns: 1fr 56px 56px 56px; }
     .sort .long { display: none; }
     .badge { display: none; }
+    .rough { display: inline; }
     .sort .short { display: inline; }
     .card-head.files, .row.files { grid-template-columns: 1fr 56px 56px; }
     .col-wide { display: none; }
@@ -391,6 +396,10 @@ const STYLE = `
     header h1 { display: none; }
     .segmented { display: flex; flex: 1 1 100%; }
     .segmented button { flex: 1; padding: 8px 4px; }
+  }
+  @media (max-width: 360px) {
+    .card-head.cpu, .row.cpu { grid-template-columns: 1fr 64px 56px; }
+    .col-bg { display: none; }
   }
 `;
 
@@ -628,8 +637,9 @@ class IntegrationInsightsPanel extends HTMLElement {
         this._memExpanded.add(value);
         if (!this._memory) this._loadMemory(false);
       } else {
-        if (this._minutes !== FINDINGS_MINUTES) {
-          this._minutes = FINDINGS_MINUTES;
+        const minutes = this._findings?.minutes || FINDINGS_MINUTES;
+        if (this._minutes !== minutes) {
+          this._minutes = minutes;
           this._unsubscribe();
           this._details.clear();
         }
@@ -849,7 +859,12 @@ class IntegrationInsightsPanel extends HTMLElement {
 
   _render() {
     const root = this.shadowRoot;
-    const focused = root.activeElement?.closest?.("[data-action], summary, a");
+    const active = root.activeElement;
+    // Finding cards repeat actions and links, so focus is kept by card
+    const card = active?.closest?.("[data-finding]");
+    const cardKey = card?.dataset.finding;
+    const cardIndex = card ? [...card.querySelectorAll(FOCUSABLE)].indexOf(active) : -1;
+    const focused = card ? null : active?.closest?.("[data-action], summary, a");
     const links = [...root.querySelectorAll("a")];
     let selector;
     if (focused?.dataset.action) {
@@ -860,7 +875,12 @@ class IntegrationInsightsPanel extends HTMLElement {
     }
     const link = focused?.tagName === "A" ? links.indexOf(focused) : -1;
     root.innerHTML = `<style>${STYLE}</style>${this._renderHeader()}<main>${this._renderBody()}</main>`;
-    if (selector) root.querySelector(selector)?.focus();
+    if (cardIndex >= 0) {
+      root
+        .querySelector(`[data-finding="${CSS.escape(cardKey)}"]`)
+        ?.querySelectorAll(FOCUSABLE)
+        [cardIndex]?.focus();
+    } else if (selector) root.querySelector(selector)?.focus();
     else if (link >= 0) root.querySelectorAll("a")[link]?.focus();
   }
 
@@ -963,15 +983,16 @@ class IntegrationInsightsPanel extends HTMLElement {
         const badge = item.low_confidence
           ? `<span class="badge" title="Fewer than 20 samples: the number is rough">few samples</span>`
           : "";
-        return `<div class="row" data-action="toggle" data-value="${escapeHtml(item.domain)}" role="button" tabindex="0" aria-expanded="${expanded}">
+        const rough = item.low_confidence ? `<span class="rough" title="Fewer than 20 samples: the number is rough">~</span>` : "";
+        return `<div class="row cpu" data-action="toggle" data-value="${escapeHtml(item.domain)}" role="button" tabindex="0" aria-expanded="${expanded}">
             <div class="name">
               <div class="title"><svg class="chev" viewBox="0 0 24 24"><path fill="currentColor" d="M8.59,16.58L13.17,12L8.59,7.41L10,6L16,12L10,18L8.59,16.58Z"></path></svg>
                 <span>${escapeHtml(name)}</span>${badge}</div>
               <div class="domain">${escapeHtml(item.domain)}</div>
               <div class="bar" style="width:${width.toFixed(1)}%"></div>
             </div>
-            <div class="num">${ms(item.loop_cpu_ms_per_min)}</div>
-            <div class="num">${ms(item.background_cpu_ms_per_min)}</div>
+            <div class="num">${rough}${ms(item.loop_cpu_ms_per_min)}</div>
+            <div class="num col-bg">${ms(item.background_cpu_ms_per_min)}</div>
             <div class="num">${corePercent(item.cpu_ms_per_min)}</div>
             <div class="num col-samples">${item.samples}</div>
           </div>${expanded ? this._renderDetail(item) : ""}`;
@@ -980,7 +1001,7 @@ class IntegrationInsightsPanel extends HTMLElement {
 
     const updated = this._updated ? this._updated.toLocaleTimeString() : "";
     return `${tiles}<div class="card">
-        <div class="card-head"><div>Integration</div>${this._sortHeader("loop_cpu_ms_per_min", "Loop ms/min|Loop")}${this._sortHeader("background_cpu_ms_per_min", "Background|Bg.")}${this._sortHeader("cpu_ms_per_min", "of a core|Core")}${this._sortHeader("samples", "Samples", "col-samples")}</div>
+        <div class="card-head cpu"><div>Integration</div>${this._sortHeader("loop_cpu_ms_per_min", "Loop ms/min|Loop")}${this._sortHeader("background_cpu_ms_per_min", "Background|Bg.", "col-bg")}${this._sortHeader("cpu_ms_per_min", "of a core|Core")}${this._sortHeader("samples", "Samples", "col-samples")}</div>
         ${rows}
       </div>
       <div class="footer">CPU time on the event loop, sampled every ${sampler.interval_ms} ms of loop CPU. Callbacks, executor jobs and threads are measured exactly. Updated ${updated}${this._error ? ` · <span class="error">${escapeHtml(this._error)}</span>` : ""}</div>`;
@@ -1220,7 +1241,8 @@ class IntegrationInsightsPanel extends HTMLElement {
     }
     const { verdict, findings } = this._findings;
     const worthALook = findings.filter((f) => f.severity !== "info").length;
-    const head = findings.some((f) => f.key === "measuring")
+    const measuring = findings.some((f) => f.key === "measuring");
+    const head = measuring
       ? "Still measuring"
       : verdict === "ok"
         ? `Nothing unusual in the last ${this._findings.minutes || FINDINGS_MINUTES} minutes`
@@ -1229,13 +1251,14 @@ class IntegrationInsightsPanel extends HTMLElement {
         : `${worthALook} ${worthALook === 1 ? "thing" : "things"} worth a look`;
     const parts = ["time on the event loop", "background threads and jobs", "state writes", "logs"];
     if (this._data?.report?.sampler?.stores_counted !== false) parts.push("saved files");
-    if (this._memory?.memory?.latest) parts.push("memory snapshots");
+    if (this._memory?.memory?.latest?.previous_taken) parts.push("memory snapshots");
     const checked = `${parts.slice(0, -1).join(", ")} and ${parts.at(-1)}`;
-    const mark = verdict === "ok" ? "✓" : verdict === "problem" ? "✕" : "!";
-    const banner = `<div class="verdict ${verdict}" role="status">
+    const state = measuring ? "info" : verdict;
+    const mark = measuring ? "…" : verdict === "ok" ? "✓" : verdict === "problem" ? "✕" : "!";
+    const banner = `<div class="verdict ${state}" role="status">
         <div class="mark" aria-hidden="true">${mark}</div>
         <div><div class="head">${escapeHtml(head)}</div>
-        <div class="sub">Checked: ${checked}.</div></div>
+        ${measuring ? "" : `<div class="sub">Checked: ${checked}.</div>`}</div>
       </div>`;
     const cards = findings
       .map((finding, index) => {
@@ -1251,7 +1274,7 @@ class IntegrationInsightsPanel extends HTMLElement {
               <button data-action="show" data-view="${FINDING_VIEWS[finding.key]?.[0] || "cpu"}" data-value="${escapeHtml(`${FINDING_VIEWS[finding.key]?.[1] || ""}${finding.domain}`)}">Show details</button>
             </div>`
           : "";
-        return `<section class="finding ${escapeHtml(finding.severity)}">
+        return `<section class="finding ${escapeHtml(finding.severity)}" data-finding="${escapeHtml(`${finding.key}:${finding.domain || ""}`)}">
             <h2>${escapeHtml(finding.title)}</h2>
             <div class="text">${renderText(finding.description)}</div>
             ${actions}${evidence}
@@ -1260,7 +1283,7 @@ class IntegrationInsightsPanel extends HTMLElement {
       .join("");
     const error = this._error ? `<div class="message error">${escapeHtml(this._error)}</div>` : "";
     return `${error}${banner}${cards}
-      <div class="footer">Findings use the same numbers as the other views. A snapshot under Memory adds checks for leaks.</div>`;
+      <div class="footer">Findings use the same numbers as the other views. Two snapshots under Memory add a check for leaks.</div>`;
   }
 
   _renderMemory() {

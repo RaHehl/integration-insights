@@ -205,6 +205,14 @@ def test_growing_resources_need_two_snapshots() -> None:
     findings = find(_summary([]), lambda _: None, {"latest": latest})
     assert _keys(findings) == [("growing_resources", NOTICE, "mqtt")]
     assert findings[0].values == {"what": "46 listeners"}
+    many = row("mqtt", "integration", 46)
+    many["change"].update(dispatcher=30, tasks=25)
+    findings = find(
+        _summary([]), lambda _: None, {"latest": {**latest, "owners": [many]}}
+    )
+    assert findings[0].values == {
+        "what": "46 listeners, 30 dispatcher connections and 25 tasks"
+    }
     assert (
         find(_summary([]), lambda _: None, {"latest": {"owners": latest["owners"]}})
         == []
@@ -300,13 +308,14 @@ async def test_findings_are_rendered_with_where_to_act(
     assert "your own configuration of Automation" in item["description"]
     assert "newer Home Assistant" not in item["description"]
 
-    # Without an issue tracker or documentation the link text stays, no link
+    # Without an issue tracker the advice to go there is left out, and the
+    # documentation is not passed off as one
     nowhere = SimpleNamespace(
         name="Foo",
         is_built_in=False,
         version="1",
         issue_tracker=None,
-        documentation=None,
+        documentation="https://example.com/docs",
     )
     with (
         patch(
@@ -322,8 +331,9 @@ async def test_findings_are_rendered_with_where_to_act(
     ):
         await client.send_json_auto_id({"type": f"{DOMAIN}/findings", "language": "en"})
         (item,) = (await client.receive_json())["result"]["findings"]
-    assert "]()" not in item["description"]
-    assert "at the issue tracker" in item["description"]
+    assert "issue tracker" not in item["description"]
+    assert "example.com" not in item["description"]
+    assert "update of Foo" in item["description"]
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 

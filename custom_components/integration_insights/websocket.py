@@ -277,11 +277,18 @@ def _render(
         elif about["built_in"] and f"{_prefix(key)}_built_in.title" in translations:
             key = f"{key}_built_in"
     for part in ("title", "description"):
+        template = translations.get(f"{_prefix(key)}.{part}", "")
+        # Without an issue tracker, advice to go there has nowhere to point
+        if not values.get("issues_url"):
+            template = "\n".join(
+                line
+                for line in template.split("\n")
+                if not (line.startswith("- ") and "{issues_url}" in line)
+            )
         text = _PLACEHOLDER.sub(
             lambda match: values.get(match.group(1), match.group(0)),
-            translations.get(f"{_prefix(key)}.{part}", ""),
+            template,
         )
-        # An integration without an issue tracker leaves a link to nowhere
         item[part] = _EMPTY_LINK.sub(r"\1", text)
     return item
 
@@ -302,7 +309,7 @@ def _about(hass: HomeAssistant, domain: str) -> dict[str, Any]:
             f"?q=is%3Aissue+is%3Aopen+label%3A%22integration%3A+{domain}%22"
         )
     else:
-        issues_url = integration.issue_tracker or integration.documentation or ""
+        issues_url = integration.issue_tracker or ""
     return {
         "name": integration.name,
         "built_in": integration.is_built_in,
