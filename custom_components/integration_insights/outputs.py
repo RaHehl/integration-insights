@@ -167,14 +167,9 @@ def _subject(msg: Any, args: tuple[Any, ...]) -> tuple[str | None, str | None]:
     if msg.startswith(UNSERIALIZABLE_STATE):
         entity_id = getattr(first, "entity_id", None)
         return (entity_id, None) if isinstance(entity_id, str) else (None, None)
-    if (
-        msg.startswith(NAMES_DOMAIN)
-        and isinstance(first, str)
-        and first not in NOT_A_SUBJECT
-    ):
-        return None, first
-    # The error a failed call or automation raised names its integration,
-    # also for a platform service such as light.turn_on
+    # The error a failed call or automation raised names the integration it
+    # came from, also behind a platform service such as light.turn_on or a
+    # script, so it goes before the domain the message names
     domain: str | None
     for arg in args:
         if isinstance(arg, ServiceNotFound):
@@ -185,6 +180,12 @@ def _subject(msg: Any, args: tuple[Any, ...]) -> tuple[str | None, str | None]:
             continue
         if domain and domain not in NOT_A_SUBJECT:
             return None, domain
+    if (
+        msg.startswith(NAMES_DOMAIN)
+        and isinstance(first, str)
+        and first not in NOT_A_SUBJECT
+    ):
+        return None, first
     return None, None
 
 
@@ -198,8 +199,9 @@ def logger_domain(
 
     Entity platforms log through the logger of their base platform, such as
     homeassistant.components.sensor, for whichever integration provides the
-    entities. Those records cannot be told apart by name, so they count for
-    core rather than blaming the sensor platform.
+    entities, and the homeassistant integration logs for triggers and
+    scenes a user set up. Those records cannot be told apart by name, so
+    they count for core, like those of integrations that serve all others.
     """
     if (domain := cache.get(name)) is not None:
         return domain
@@ -216,8 +218,7 @@ def logger_domain(
             parts[2]
             if len(parts) > 2
             and parts[1] == "components"
-            and parts[2] not in BASE_PLATFORMS
-            and parts[2] not in SERVES_OTHERS
+            and parts[2] not in NOT_A_SUBJECT
             else "core"
         )
     elif parts[0] == "custom_components" and len(parts) > 1:

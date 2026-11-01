@@ -129,15 +129,15 @@
     },
     "noisy_logs": {
       "title": "{name} logs many warnings",
-      "description": "Over the last {minutes} minutes, {name} logged {per_min} warnings and errors a minute, {errors} of them errors. Each one is formatted and written to the log, and a steady stream hides the messages that matter.\n\nWhat you can do:\n- Open the log and look at what it reports. Often it is a device that cannot be reached or a setting that needs attention.\n- Check whether an update of {name} is available.\n- Look for a report, or open one, at [the issue tracker]({issues_url}), and add the report from this page."
+      "description": "Over the last {minutes} minutes, {per_min} warnings and errors a minute were logged by or about {name}, {errors} of them errors. Each one is formatted and written to the log, and a steady stream hides the messages that matter.\n\nWhat you can do:\n- Open the log and look at what it reports. Often it is a device that cannot be reached or a setting that needs attention.\n- Check whether an update of {name} is available.\n- Look for a report, or open one, at [the issue tracker]({issues_url}), and add the report from this page."
     },
     "noisy_logs_built_in": {
       "title": "{name} logs many warnings",
-      "description": "Over the last {minutes} minutes, {name} logged {per_min} warnings and errors a minute, {errors} of them errors. Each one is formatted and written to the log, and a steady stream hides the messages that matter.\n\nWhat you can do:\n- Open the log and look at what it reports. Often it is a device that cannot be reached or a setting that needs attention.\n- {name} is part of Home Assistant and updates with it. Check whether a newer Home Assistant fixes it.\n- Look for a report, or open one, at [the Home Assistant issue tracker]({issues_url}), and add the report from this page."
+      "description": "Over the last {minutes} minutes, {per_min} warnings and errors a minute were logged by or about {name}, {errors} of them errors. Each one is formatted and written to the log, and a steady stream hides the messages that matter.\n\nWhat you can do:\n- Open the log and look at what it reports. Often it is a device that cannot be reached or a setting that needs attention.\n- {name} is part of Home Assistant and updates with it. Check whether a newer Home Assistant fixes it.\n- Look for a report, or open one, at [the Home Assistant issue tracker]({issues_url}), and add the report from this page."
     },
     "noisy_logs_configured": {
       "title": "{name} logs many warnings",
-      "description": "Over the last {minutes} minutes, {name} logged {per_min} warnings and errors a minute, {errors} of them errors. Each one is formatted and written to the log, and a steady stream hides the messages that matter.\n\nWhat you can do:\n- The messages come from your own configuration of {name}. Open the log to see which part, then fix it or turn it off."
+      "description": "Over the last {minutes} minutes, {per_min} warnings and errors a minute were logged by or about {name}, {errors} of them errors. Each one is formatted and written to the log, and a steady stream hides the messages that matter.\n\nWhat you can do:\n- The messages come from your own configuration of {name}. Open the log to see which part, then fix it or turn it off."
     },
     "debug_logging": {
       "title": "Debug logging for {name} is on",

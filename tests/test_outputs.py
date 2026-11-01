@@ -426,3 +426,31 @@ def test_a_rejected_subject_leaves_the_record_with_its_logger() -> None:
     assert rows["automation"].error == 2
     assert rows["acme"].error == 1
     assert "core" not in rows
+
+
+def test_a_script_call_counts_for_the_integration_its_error_names() -> None:
+    """The error goes before the domain the message names, and homeassistant is core."""
+    counter = LogCounter()
+    counter.install()
+    websocket = logging.getLogger(
+        "homeassistant.components.websocket_api.http.connection"
+    )
+    try:
+        websocket.error(
+            "[7] Error during service call to %s.%s: %s",
+            "script",
+            "wake_up",
+            HomeAssistantError("bridge offline", translation_domain="acme"),
+        )
+        logging.getLogger(
+            "homeassistant.components.homeassistant.triggers.numeric_state"
+        ).error("Error in '%s' trigger: %s", "x", "not a number")
+    finally:
+        counter.uninstall()
+    rows = {
+        row.domain: row
+        for row in counter.drain(lambda name: logger_domain(name, {}, {}, {"acme"}))
+    }
+    assert rows["acme"].error == 1
+    assert rows["core"].error == 1
+    assert set(rows) == {"acme", "core"}
