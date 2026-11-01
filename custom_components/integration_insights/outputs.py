@@ -31,7 +31,6 @@ def _renew_store_locks() -> None:
 
 
 os.register_at_fork(after_in_child=_renew_store_locks)
-RECORDER_SCHEMA_LOGGER = "homeassistant.components.recorder.db_schema"
 # The recorder warns about attributes it will not store, naming the state:
 # the entity's integration wrote them, so the warnings count for it
 OVERSIZED_ATTRIBUTES = "State attributes for %s exceed"
@@ -43,8 +42,8 @@ NAMES_DOMAIN = ("Error during service call to %s.%s", "Error with %s describe ev
 # unless a record names the integration it is about
 SERVES_OTHERS = frozenset({"api", "http", "recorder", "websocket_api"})
 # Integrations whose warnings often name the integration they are about:
-# a failed service call, an automation or script step that failed in one
-NAMES_SUBJECT = SERVES_OTHERS | {"automation", "logbook", "script"}
+# a failed service call, a failed automation, a logbook describe error
+NAMES_SUBJECT = SERVES_OTHERS | {"automation", "logbook"}
 # Never the subject of a record: these run on behalf of others
 NOT_A_SUBJECT = SERVES_OTHERS | frozenset(BASE_PLATFORMS) | {"homeassistant"}
 _COMPONENTS = "homeassistant.components."
@@ -168,14 +167,24 @@ def _subject(msg: Any, args: tuple[Any, ...]) -> tuple[str | None, str | None]:
     if msg.startswith(UNSERIALIZABLE_STATE):
         entity_id = getattr(first, "entity_id", None)
         return (entity_id, None) if isinstance(entity_id, str) else (None, None)
-    if msg.startswith(NAMES_DOMAIN) and isinstance(first, str):
+    if (
+        msg.startswith(NAMES_DOMAIN)
+        and isinstance(first, str)
+        and first not in NOT_A_SUBJECT
+    ):
         return None, first
-    # An automation or script step that failed in an integration's service
+    # The error a failed call or automation raised names its integration,
+    # also for a platform service such as light.turn_on
+    domain: str | None
     for arg in args:
         if isinstance(arg, ServiceNotFound):
-            return None, arg.domain
-        if isinstance(arg, HomeAssistantError) and arg.translation_domain:
-            return None, arg.translation_domain
+            domain = arg.domain
+        elif isinstance(arg, HomeAssistantError):
+            domain = arg.translation_domain
+        else:
+            continue
+        if domain and domain not in NOT_A_SUBJECT:
+            return None, domain
     return None, None
 
 
@@ -196,11 +205,12 @@ def logger_domain(
         return domain
     parts = name.split(".")
     if name.endswith("]") and " [" in name:
-        # A record that names the integration it is about, unless that is
-        # one that runs for others or one that is not loaded
-        domain = name[name.rindex(" [") + 2 : -1]
-        if domain in NOT_A_SUBJECT or (known is not None and domain not in known):
-            domain = "core"
+        # A record that names the integration it is about; one that is not
+        # loaded counts for the logger, as if nothing were named
+        cut = name.rindex(" [")
+        domain = name[cut + 2 : -1]
+        if known is not None and domain not in known:
+            domain = logger_domain(name[:cut], library_map, cache, known)
     elif parts[0] == "homeassistant":
         domain = (
             parts[2]

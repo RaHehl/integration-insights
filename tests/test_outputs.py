@@ -12,14 +12,16 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.integration_insights import outputs
 from custom_components.integration_insights.const import DOMAIN
 from custom_components.integration_insights.outputs import (
-    RECORDER_SCHEMA_LOGGER,
     LogCounter,
     StoreCounter,
     logger_domain,
     store_domain,
 )
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.storage import Store
+
+RECORDER_SCHEMA_LOGGER = "homeassistant.components.recorder.db_schema"
 
 # The step every save goes through on the Home Assistant under test. The
 # test harness replaces the write behind async_save, so tests call it.
@@ -387,3 +389,40 @@ def test_records_about_another_integration_count_for_it() -> None:
     assert rows["core"].error == 2
     assert "websocket_api" not in rows
     assert "recorder" not in rows
+
+
+def test_a_rejected_subject_leaves_the_record_with_its_logger() -> None:
+    """A platform's or an unloaded domain's name does not move a record to core."""
+    counter = LogCounter()
+    counter.install()
+    automation = logging.getLogger("homeassistant.components.automation.wake_up")
+    websocket = logging.getLogger(
+        "homeassistant.components.websocket_api.http.connection"
+    )
+    try:
+        automation.error(
+            "Error while executing automation %s: %s",
+            "automation.wake_up",
+            HomeAssistantError("gone", translation_domain="notloaded"),
+        )
+        automation.error(
+            "Error while executing automation %s: %s",
+            "automation.wake_up",
+            HomeAssistantError("unsupported", translation_domain="homeassistant"),
+        )
+        # A platform service: the error names the integration behind it
+        websocket.error(
+            "[7] Error during service call to %s.%s: %s",
+            "light",
+            "turn_on",
+            HomeAssistantError("bridge offline", translation_domain="acme"),
+        )
+    finally:
+        counter.uninstall()
+    rows = {
+        row.domain: row
+        for row in counter.drain(lambda name: logger_domain(name, {}, {}, {"acme"}))
+    }
+    assert rows["automation"].error == 2
+    assert rows["acme"].error == 1
+    assert "core" not in rows
