@@ -8,6 +8,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.integration_insights.const import DOMAIN
 from custom_components.integration_insights.outputs import (
+    RECORDER_SCHEMA_LOGGER,
     LogCounter,
     StoreCounter,
     logger_domain,
@@ -15,6 +16,37 @@ from custom_components.integration_insights.outputs import (
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
+
+
+def test_recorder_warnings_about_attributes_count_for_the_entity() -> None:
+    """The integration that wrote the attributes gets the recorder's warning."""
+    counter = LogCounter()
+    counter.install()
+    recorder = logging.getLogger(RECORDER_SCHEMA_LOGGER)
+    try:
+        for entity_id in ("sensor.big", "sensor.big", "sensor.unknown"):
+            recorder.warning(
+                "State attributes for %s exceed maximum size of %s bytes. "
+                "This can cause database performance issues; Attributes "
+                "will not be stored",
+                entity_id,
+                16384,
+            )
+        recorder.warning("Something else")
+    finally:
+        counter.uninstall()
+    rows = {
+        row.domain: row
+        for row in counter.drain(
+            lambda name: logger_domain(name, {}, {}),
+            lambda entity_id: "solar" if entity_id == "sensor.big" else None,
+        )
+    }
+    assert rows["solar"].warning == 2
+    assert rows["solar"].loggers == {RECORDER_SCHEMA_LOGGER: 2}
+    # Without an integration for the entity it stays with the recorder
+    assert rows["recorder"].warning == 2
+    assert rows["recorder"].loggers == {RECORDER_SCHEMA_LOGGER: 2}
 
 
 def test_loggers_belong_to_their_integration() -> None:
@@ -34,7 +66,7 @@ def test_loggers_belong_to_their_integration() -> None:
 
 
 def test_log_records_are_counted_by_level_and_logger() -> None:
-    """Debug and info, warnings and errors are counted apart; loggers name the warnings."""
+    """Debug, info, warnings and errors are counted apart; loggers name the warnings."""
     counter = LogCounter()
     counter.install()
     logger = logging.getLogger("custom_components.chatty.api")
@@ -56,7 +88,7 @@ def test_log_records_are_counted_by_level_and_logger() -> None:
         for row in counter.drain(lambda name: logger_domain(name, {}, {}))
     }
     chatty = rows["chatty"]
-    assert (chatty.debug, chatty.warning, chatty.error) == (2, 1, 2)
+    assert (chatty.debug, chatty.info, chatty.warning, chatty.error) == (1, 1, 1, 2)
     assert chatty.loggers == {"custom_components.chatty.api": 3}
     assert rows["core"].warning == 1
     assert counter.drain(lambda name: "core") == []
@@ -143,6 +175,21 @@ def test_newer_store_is_counted_where_it_serializes(
     assert (row.writes, row.size) == (2, 2 * len('{"value": 1}'))
 
 
+def test_a_foreign_prepare_result_does_not_stop_the_save(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Something else under the wrapper returns an odd value: it passes through."""
+    odd = object()
+    monkeypatch.setattr(Store, "_prepare_data", lambda store, data: odd, raising=False)
+    counter = StoreCounter()
+    assert counter.install()
+    try:
+        assert Store._prepare_data(SimpleNamespace(key="x"), {}) is odd  # type: ignore[attr-defined]  # noqa: SLF001
+    finally:
+        counter.uninstall()
+    assert counter.drain(lambda key: "core") == []
+
+
 def test_a_store_without_a_known_step_is_left_alone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -150,6 +197,7 @@ def test_a_store_without_a_known_step_is_left_alone(
     monkeypatch.delattr(Store, "_write_prepared_data")
     counter = StoreCounter()
     assert not counter.install()
+    assert not counter.installed
     counter.uninstall()
     assert counter.drain(lambda key: "core") == []
 
@@ -163,4 +211,5 @@ async def test_measuring_starts_on_a_store_it_cannot_count(
     entry.add_to_hass(hass)
     assert await hass.config_entries.async_setup(entry.entry_id)
     assert entry.runtime_data.sampler.installed
+    assert entry.runtime_data.summary()["sampler"]["stores_counted"] is False
     assert await hass.config_entries.async_unload(entry.entry_id)

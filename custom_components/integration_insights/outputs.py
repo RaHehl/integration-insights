@@ -15,7 +15,11 @@ from homeassistant.helpers.storage import Store
 
 from .collector import LogCounts, StoreWrites
 
-DEBUG, WARNING, ERROR = 0, 1, 2
+DEBUG, INFO, WARNING, ERROR = 0, 1, 2, 3
+# The recorder warns for every state whose attributes it will not store; the
+# entity's integration wrote them, so the warning counts for it
+RECORDER_SCHEMA_LOGGER = "homeassistant.components.recorder.db_schema"
+OVERSIZED_ATTRIBUTES = "State attributes for %s exceed"
 
 
 class LogCounter(logging.Handler):
@@ -25,8 +29,10 @@ class LogCounter(logging.Handler):
         """Initialize; install() attaches the handler."""
         super().__init__(logging.NOTSET)
         self._lock = threading.Lock()
-        # logger name -> [debug and info, warning, error and up]
+        # logger name -> [debug, info, warning, error and up]
         self._counts: dict[str, list[int]] = {}
+        # entity_id -> recorder warnings about its attributes
+        self._oversized: dict[str, int] = {}
         self._installed = False
 
     def emit(self, record: logging.LogRecord) -> None:
@@ -37,11 +43,24 @@ class LogCounter(logging.Handler):
             if level >= logging.ERROR
             else WARNING
             if level >= logging.WARNING
+            else INFO
+            if level >= logging.INFO
             else DEBUG
         )
+        if (
+            record.name == RECORDER_SCHEMA_LOGGER
+            and isinstance(record.msg, str)
+            and record.msg.startswith(OVERSIZED_ATTRIBUTES)
+            and isinstance(record.args, tuple)
+            and record.args
+            and isinstance(entity_id := record.args[0], str)
+        ):
+            with self._lock:
+                self._oversized[entity_id] = self._oversized.get(entity_id, 0) + 1
+            return
         with self._lock:
             if (row := self._counts.get(record.name)) is None:
-                row = self._counts[record.name] = [0, 0, 0]
+                row = self._counts[record.name] = [0, 0, 0, 0]
             row[slot] += 1
 
     def handleError(self, record: logging.LogRecord) -> None:
@@ -59,20 +78,37 @@ class LogCounter(logging.Handler):
             logging.getLogger().removeHandler(self)
             self._installed = False
 
-    def drain(self, owner_of: Callable[[str], str]) -> list[LogCounts]:
-        """Return the counts since the last drain, by integration."""
+    def drain(
+        self,
+        owner_of: Callable[[str], str],
+        entity_owner: Callable[[str], str | None] = lambda _entity_id: None,
+    ) -> list[LogCounts]:
+        """Return the counts since the last drain, by integration.
+
+        Recorder warnings about an entity's attributes count for the
+        integration of the entity, if it has one.
+        """
         with self._lock:
             counts, self._counts = self._counts, {}
+            oversized, self._oversized = self._oversized, {}
         rows: dict[str, list[Any]] = {}
-        for name, (debug, warning, error) in counts.items():
-            domain = owner_of(name)
+
+        def add(domain: str, name: str, levels: list[int]) -> None:
             if (row := rows.get(domain)) is None:
-                row = rows[domain] = [0, 0, 0, Counter()]
-            row[0] += debug
-            row[1] += warning
-            row[2] += error
-            if warning or error:
-                row[3][name] += warning + error
+                row = rows[domain] = [0, 0, 0, 0, Counter()]
+            for slot, count in enumerate(levels):
+                row[slot] += count
+            if noted := levels[WARNING] + levels[ERROR]:
+                row[4][name] += noted
+
+        for name, levels in counts.items():
+            add(owner_of(name), name, levels)
+        for entity_id, warnings in oversized.items():
+            add(
+                entity_owner(entity_id) or owner_of(RECORDER_SCHEMA_LOGGER),
+                RECORDER_SCHEMA_LOGGER,
+                [0, 0, warnings, 0],
+            )
         return [LogCounts(domain, *row) for domain, row in rows.items()]
 
 
@@ -119,9 +155,10 @@ class StoreCounter:
         lock = self._lock
         active = self._active = [True]
 
-        def note(store: Any, json_data: Any) -> None:
+        def note(store: Any, prepared: Any) -> None:
             try:
-                size = len(json_data)
+                # Characters of a str: json.dumps escapes everything else
+                size = len(prepared[1])
                 with lock:
                     table = counts[0]
                     if (row := table.get(store.key)) is None:
@@ -141,7 +178,7 @@ class StoreCounter:
                 # Once removed, a wrapper that something else wrapped in turn
                 # stays in the chain; it only passes calls on
                 if active[0]:
-                    note(store, result[1])
+                    note(store, result)
                 return result
 
         elif (original := getattr(Store, "_write_prepared_data", None)) is not None:
@@ -150,7 +187,7 @@ class StoreCounter:
 
             def wrapper(store: Any, mode: str, json_data: Any) -> Any:  # type: ignore[misc]
                 if active[0]:
-                    note(store, json_data)
+                    note(store, (mode, json_data))
                 return write(store, mode, json_data)
 
         else:
@@ -161,6 +198,11 @@ class StoreCounter:
         self._wrapper = wrapper
         setattr(Store, name, wrapper)
         return True
+
+    @property
+    def installed(self) -> bool:
+        """Return whether saves are being counted."""
+        return self._wrapper is not None
 
     def uninstall(self) -> None:
         """Remove the wrapper if it is still in place."""

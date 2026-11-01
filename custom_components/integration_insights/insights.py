@@ -225,10 +225,18 @@ class Insights:
         """
         entities = er.async_get(self.hass).entities
         writes = self._state_writes
+        loop = self.hass.loop
         # entity_id -> integration; the registry lookup is slow for a hot path
         platforms: dict[str, str | None] = {}
+        # Attributes to measure, by integration and entity
+        pending: list[tuple[str, str, Any]] = []
 
-        def count(entity_id: str, slot: int, size: int = 0) -> bool:
+        def row_of(platform: str) -> list[Any]:
+            if (row := writes.get(platform)) is None:
+                row = writes[platform] = [0, 0, 0, Counter(), 0, Counter()]
+            return row
+
+        def count(entity_id: str, slot: int) -> str | None:
             if entity_id in platforms:
                 platform = platforms[entity_id]
             else:
@@ -237,17 +245,27 @@ class Insights:
                     entry.platform if entry is not None else None
                 )
             if platform is None:
-                return False
-            if (row := writes.get(platform)) is None:
-                row = writes[platform] = [0, 0, 0, Counter(), 0, Counter()]
+                return None
+            row = row_of(platform)
             row[slot] += 1
             if slot != 1:
                 # Busiest entities by what reaches listeners and the recorder
                 row[3][entity_id] += 1
-            if size:
+            return platform
+
+        def measure() -> None:
+            # A callback of its own, so serializing is the measuring cost and
+            # not part of the callback that wrote the state
+            batch = pending[:]
+            pending.clear()
+            for platform, entity_id, attributes in batch:
+                try:
+                    size = len(json_bytes(attributes))
+                except Exception:  # noqa: BLE001
+                    continue
+                row = row_of(platform)
                 row[4] += size
                 row[5][entity_id] += size
-            return False
 
         @callback
         def changed(data: Any) -> bool:
@@ -255,21 +273,24 @@ class Insights:
             # listener and the recorder like a change
             old, new = data["old_state"], data["new_state"]
             same = old is not None and new is not None and old.state == new.state
-            size = 0
+            entity_id = data["entity_id"]
+            platform = count(entity_id, 2 if same else 0)
             # Core keeps the old attributes object when nothing in it changed,
-            # so only new attributes are measured: what the recorder stores
-            if new is not None and (
-                old is None or new.attributes is not old.attributes
+            # so only new attributes are measured
+            if (
+                platform is not None
+                and new is not None
+                and (old is None or new.attributes is not old.attributes)
             ):
-                try:
-                    size = len(json_bytes(new.attributes))
-                except Exception:  # noqa: BLE001
-                    size = 0
-            return count(data["entity_id"], 2 if same else 0, size)
+                if not pending:
+                    loop.call_soon(measure)
+                pending.append((platform, entity_id, new.attributes))
+            return False
 
         @callback
         def reported(data: Any) -> bool:
-            return count(data["entity_id"], 1)
+            count(data["entity_id"], 1)
+            return False
 
         @callback
         def never(_event: Any) -> None:
@@ -372,9 +393,16 @@ class Insights:
         if library_map is not self._logger_map or len(logger_domains) > 5_000:
             logger_domains.clear()
             self._logger_map = library_map
+        entities = er.async_get(self.hass).entities
+
+        def entity_owner(entity_id: str) -> str | None:
+            entry = entities.get(entity_id)
+            return entry.platform if entry is not None else None
+
         self.collector.add_logs(
             self.logs.drain(
-                lambda name: logger_domain(name, library_map, logger_domains)
+                lambda name: logger_domain(name, library_map, logger_domains),
+                entity_owner,
             ),
             now,
         )
@@ -559,6 +587,7 @@ class Insights:
             )
             if self.sampler.installed
             else 0,
+            "stores_counted": self.stores.installed,
             "timing_errors": self.loop_timing.errors,
             "timing_overflowed": self.loop_timing.overflowed,
             "timing_resolves_per_min": round(

@@ -273,6 +273,32 @@ async def test_findings_are_rendered_with_where_to_act(
     assert "label%3A%22integration%3A+recorder%22" in item["description"]
     # A value is not scanned for placeholders again
     assert "Over the last {name} minutes" in item["description"]
+
+    # A built-in integration that runs the user's configuration points there
+    configured = Finding(
+        "noisy_logs",
+        NOTICE,
+        "automation",
+        {"per_min": "12", "errors": "4.0", "minutes": "15"},
+    )
+    automation = SimpleNamespace(
+        name="Automation", is_built_in=True, version=None, issue_tracker=None
+    )
+    with (
+        patch(
+            "custom_components.integration_insights.insights.Insights.findings",
+            return_value=[configured],
+        ),
+        patch(
+            "custom_components.integration_insights.websocket.async_get_loaded_integration",
+            return_value=automation,
+        ),
+    ):
+        await client.send_json_auto_id({"type": f"{DOMAIN}/findings", "language": "en"})
+        (item,) = (await client.receive_json())["result"]["findings"]
+    assert item["title"] == "Automation logs many warnings"
+    assert "what you configured in Automation" in item["description"]
+    assert "newer Home Assistant" not in item["description"]
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 
@@ -555,13 +581,34 @@ def test_noisy_logs_and_debug_logging_are_found() -> None:
     noisy = next(f for f in findings if f.key == "noisy_logs")
     assert noisy.values == {"per_min": "12", "errors": "4.0", "minutes": "15"}
     assert noisy.evidence == ["custom_components.foo.api: 12/min"]
+    rare = _detail(logs={"loggers": {"custom_components.foo.api": 12, "x": 0.02}})
+    noisy = next(
+        f for f in find(_summary([item]), lambda _: rare, {}) if f.key == "noisy_logs"
+    )
+    assert noisy.evidence[1] == "x: <0.1/min"
     quiet = {
         **item,
         "log_warnings_per_min": 5,
         "log_errors_per_min": 4,
         "log_debug_per_min": 299,
+        # Home Assistant logs info by default, so it is no sign of debug logging
+        "log_info_per_min": 5_000,
     }
     assert find(_summary([quiet]), lambda _: detail, {}) == []
+
+
+def test_configured_integrations_have_no_built_in_allowance() -> None:
+    """Attributes a template sets are the user's, so built-in leniency does not apply."""
+    item = {**_item("template"), "attribute_kib_per_min": 150}
+    detail = _detail(state_writes={"attribute_entities": {"sensor.t": 150}})
+    built_in = lambda _d: True  # noqa: E731
+    assert _keys(find(_summary([item]), lambda _: detail, {}, built_in)) == [
+        ("big_attributes", NOTICE, "template")
+    ]
+    assert (
+        find(_summary([{**item, "domain": "recorder"}]), lambda _: detail, {}, built_in)
+        == []
+    )
 
 
 def test_frequent_storage_writes_are_found() -> None:

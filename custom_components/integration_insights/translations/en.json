@@ -85,11 +85,15 @@
     },
     "big_attributes": {
       "title": "{name} writes large attributes",
-      "description": "Over the last {minutes} minutes, the attributes of entities of {name} changed by {kib} KiB a minute. For every change the recorder stores the attributes again, and the dashboard receives them, so the database grows by about this much.\n\nWhat you can do:\n- Exclude the entities from the recorder if you do not need their history.\n- Check whether an update of {name} is available.\n- Look for a report, or open one, at [the issue tracker]({issues_url}), and add the report from this page."
+      "description": "Over the last {minutes} minutes, the attributes of entities of {name} changed by {kib} KiB a minute. Each change is serialized for the recorder and sent to open dashboards. The recorder does not store attributes over 16 KiB and logs a warning for every such change instead.\n\nWhat you can do:\n- Exclude the entities from the recorder if you do not need their history.\n- Check whether an update of {name} is available.\n- Look for a report, or open one, at [the issue tracker]({issues_url}), and add the report from this page."
     },
     "big_attributes_built_in": {
       "title": "{name} writes large attributes",
-      "description": "Over the last {minutes} minutes, the attributes of entities of {name} changed by {kib} KiB a minute. For every change the recorder stores the attributes again, and the dashboard receives them, so the database grows by about this much.\n\nWhat you can do:\n- Exclude the entities from the recorder if you do not need their history.\n- {name} is part of Home Assistant and updates with it. Check whether a newer Home Assistant fixes it.\n- Look for a report, or open one, at [the Home Assistant issue tracker]({issues_url}), and add the report from this page."
+      "description": "Over the last {minutes} minutes, the attributes of entities of {name} changed by {kib} KiB a minute. Each change is serialized for the recorder and sent to open dashboards. The recorder does not store attributes over 16 KiB and logs a warning for every such change instead.\n\nWhat you can do:\n- Exclude the entities from the recorder if you do not need their history.\n- {name} is part of Home Assistant and updates with it. Check whether a newer Home Assistant fixes it.\n- Look for a report, or open one, at [the Home Assistant issue tracker]({issues_url}), and add the report from this page."
+    },
+    "big_attributes_configured": {
+      "title": "{name} writes large attributes",
+      "description": "Over the last {minutes} minutes, the attributes of entities of {name} changed by {kib} KiB a minute. Each change is serialized for the recorder and sent to open dashboards. The recorder does not store attributes over 16 KiB and logs a warning for every such change instead.\n\nWhat you can do:\n- Exclude the entities from the recorder if you do not need their history.\n- These entities come from your own configuration of {name}. Check which attributes it sets, and whether they need to change this often."
     },
     "noisy_logs": {
       "title": "{name} logs many warnings",
@@ -99,13 +103,17 @@
       "title": "{name} logs many warnings",
       "description": "Over the last {minutes} minutes, {name} logged {per_min} warnings and errors a minute, {errors} of them errors. Each one is formatted and written to the log file, and a steady stream hides the messages that matter.\n\nWhat you can do:\n- Open the log and look at what it reports. Often it is a device that cannot be reached or a setting that needs attention.\n- {name} is part of Home Assistant and updates with it. Check whether a newer Home Assistant fixes it.\n- Look for a report, or open one, at [the Home Assistant issue tracker]({issues_url}), and add the report from this page."
     },
+    "noisy_logs_configured": {
+      "title": "{name} logs many warnings",
+      "description": "Over the last {minutes} minutes, {name} logged {per_min} warnings and errors a minute, {errors} of them errors. Each one is formatted and written to the log file, and a steady stream hides the messages that matter.\n\nWhat you can do:\n- The messages come from what you configured in {name}, such as an automation, a script or a template. Open the log to see which one, then fix it or turn it off."
+    },
     "debug_logging": {
       "title": "Debug logging for {name} is on",
-      "description": "Over the last {minutes} minutes, {name} logged {per_min} debug and info lines a minute. That usually means debug logging was turned on and left on. Each line is formatted and written to the log file.\n\nWhat you can do:\n- When you have what you need, [open {name}]({config_url}) and turn debug logging off.\n- Check the `logger` section of your configuration for a debug level you no longer need."
+      "description": "Over the last {minutes} minutes, {name} logged {per_min} debug lines a minute. Debug logging was turned on and left on, and each line is formatted and written to the log file.\n\nWhat you can do:\n- When you have what you need, [open {name}]({config_url}) and turn debug logging off.\n- Check the `logger` section of your configuration for a debug level you no longer need."
     },
     "debug_logging_built_in": {
       "title": "Debug logging for {name} is on",
-      "description": "Over the last {minutes} minutes, {name} logged {per_min} debug and info lines a minute. That usually means debug logging was turned on and left on. Each line is formatted and written to the log file.\n\nWhat you can do:\n- When you have what you need, [open {name}]({config_url}) and turn debug logging off.\n- Check the `logger` section of your configuration for a debug level you no longer need."
+      "description": "Over the last {minutes} minutes, {name} logged {per_min} debug lines a minute. Debug logging was turned on and left on, and each line is formatted and written to the log file.\n\nWhat you can do:\n- When you have what you need, [open {name}]({config_url}) and turn debug logging off.\n- Check the `logger` section of your configuration for a debug level you no longer need."
     },
     "busy_storage": {
       "title": "{name} writes files often",

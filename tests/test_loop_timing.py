@@ -363,6 +363,33 @@ def test_an_unattributable_callback_still_counts(
         loop.close()
 
 
+def test_the_warning_does_not_wait_for_the_first_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An error the watchdog counted first does not swallow the warning."""
+
+    class Prickly:
+        def __getattr__(self, name: str) -> Any:
+            if name == "__qualname__":
+                raise RuntimeError("do not look at me")
+            raise AttributeError(name)
+
+        def __call__(self) -> None:
+            pass
+
+    loop = asyncio.new_event_loop()
+    timing = LoopTiming(loop)
+    try:
+        timing.start()
+        timing.errors = 1
+        loop.call_soon(Prickly())
+        loop.run_until_complete(asyncio.sleep(0))
+        assert caplog.text.count("Could not attribute a callback") == 1
+    finally:
+        timing.stop()
+        loop.close()
+
+
 def test_a_full_table_counts_the_rest_under_other_callbacks(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

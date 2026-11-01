@@ -40,15 +40,17 @@ LOOP_BLOCK_PROBLEM_MS = 10_000
 # not count.
 STATE_WRITES_NOTICE_PER_MIN = 600
 STATE_WRITES_PROBLEM_PER_MIN = 3_000
-# Attributes that changed, in KiB per minute. The recorder stores a new row
-# for each, so this is roughly what the database grows by.
+# Attributes that changed, in KiB per minute. Each change is serialized for
+# the recorder and sent to open dashboards. The recorder skips attributes over
+# 16 KiB and logs a warning for each instead.
 ATTRIBUTES_NOTICE_KIB = 100
 ATTRIBUTES_PROBLEM_KIB = 1_000
 # Warnings and errors per minute. Each one is formatted and written to the log
 # file, and a steady stream hides the messages that matter.
 LOG_NOTICE_PER_MIN = 10
 LOG_PROBLEM_PER_MIN = 100
-# Debug and info lines per minute: debug logging that was left on.
+# Debug lines per minute: debug logging that was left on. Info lines do not
+# count, Home Assistant logs them by default.
 DEBUG_NOTICE_PER_MIN = 300
 # Files written through the storage helper per minute. Each write replaces a
 # whole file, which wears out the SD card of a Raspberry Pi.
@@ -64,6 +66,11 @@ RESOURCES = ("listeners", "dispatcher", "timers", "tasks")
 # Built-in integrations run reviewed background work by design, such as the
 # recorder writing to its database, so only a lot of it is worth a word.
 BUILT_IN_BACKGROUND_FACTOR = 5
+# Built-in integrations that run what a user configured: their attributes and
+# log messages come from that configuration, not from the integration.
+USER_CONFIGURED = frozenset(
+    {"automation", "command_line", "rest", "scrape", "script", "sql", "template"}
+)
 # A finding that is shown stays until its number falls this far below the
 # threshold, so a value close to it does not make the finding come and go.
 # The same goes for its severity.
@@ -174,6 +181,7 @@ def _cpu_findings(
     minutes: str,
 ) -> list[Finding]:
     domain = item["domain"]
+    output_factor = 1 if domain in USER_CONFIGURED else factor
     loop = item["loop_cpu_ms_per_min"]
     background = item["background_cpu_ms_per_min"]
     background_notice = BACKGROUND_NOTICE_MS * factor
@@ -194,10 +202,10 @@ def _cpu_findings(
         and item.get("jobs_per_min", 0) < JOBS_NOTICE_PER_MIN * factor * HOLD
         and blocked < LOOP_BLOCK_NOTICE_MS * HOLD
         and writes < STATE_WRITES_NOTICE_PER_MIN * factor * HOLD
-        and attribute_kib < ATTRIBUTES_NOTICE_KIB * factor * HOLD
+        and attribute_kib < ATTRIBUTES_NOTICE_KIB * output_factor * HOLD
         and log_warnings < LOG_NOTICE_PER_MIN * HOLD
         and log_debug < DEBUG_NOTICE_PER_MIN * HOLD
-        and store_writes < STORE_NOTICE_PER_MIN * factor * HOLD
+        and store_writes < STORE_NOTICE_PER_MIN * output_factor * HOLD
     ):
         return []
     if (info := detail(domain)) is None:
@@ -229,7 +237,14 @@ def _cpu_findings(
         )
     findings.extend(
         _output_findings(
-            item, info, factor, hold, minutes, attribute_kib, log_warnings, log_debug
+            item,
+            info,
+            output_factor,
+            hold,
+            minutes,
+            attribute_kib,
+            log_warnings,
+            log_debug,
         )
     )
     if blocked >= LOOP_BLOCK_NOTICE_MS * hold("loop_blocked", domain):
@@ -453,4 +468,6 @@ def _utc(timestamp: float) -> str:
 
 def _rate(value: float) -> str:
     """Format a rate; small ones keep a decimal so 2 in 6 minutes is not 0."""
+    if 0 < value < 0.1:
+        return "<0.1"
     return f"{value:.1f}" if value < 10 else _number(value)

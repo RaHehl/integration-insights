@@ -16,7 +16,7 @@ Finds the integration that slows Home Assistant down, keeps the CPU busy, or lea
 - Integrations that hand a lot of work to the executor, usually polling more often than needed.
 - The event loop standing still for seconds, named by the integration and function that ran at that moment, the first time it happens.
 - An integration that changes the state or attributes of its entities many times a second. Each change is recorded and reaches the dashboard and every automation that watches the entity.
-- Entities whose attributes change by a lot of data. The recorder stores them again each time, so the database grows.
+- Entities whose attributes change by a lot of data. Each change is serialized for the recorder and sent to the dashboard. Above 16 KiB the recorder does not store them and logs a warning for every change instead.
 - An integration that logs many warnings or errors, or has debug logging left on.
 - An integration that saves its files every few seconds, which wears out the SD card of a Raspberry Pi.
 - An event loop that often waits, usually on a blocking call.
@@ -55,7 +55,7 @@ The CPU view lists every integration with its time on the event loop and in the 
 
 "Copy as text" gives all of it in one block for an issue or a profiler session. The diagnostics download has the same numbers as JSON.
 
-The Logs view lists warnings, errors and debug lines per integration, with the loggers behind them, and the files each integration saves.
+The Logs view lists warnings, errors and debug lines per integration, with the loggers behind them, and the files each integration saves through Home Assistant's storage helper.
 
 The Memory view walks the Python heap on request and splits it by integration, library and Home Assistant itself, with listeners, dispatcher connections, timers and tasks per integration. A second snapshot shows what changed.
 
@@ -67,8 +67,8 @@ The Memory view walks the Python heap on request and splits it by integration, l
 - A sample goes to the integration whose code runs. Code in an entity platform base class goes to the integration that owns the entity. A library that only one loaded integration requires goes to that integration. Core and shared library code with no integration on the stack, such as aiohttp parsing a response, goes to the config entry whose context it runs in, which Home Assistant sets while an entry is set up and every task and connection started from there inherits.
 - A finalizer running inside the garbage collector is charged to the owner of the object being destroyed, not to whoever allocated enough to trigger the collection.
 - State writes are counted per integration in the bus event filters, at the cost of one dictionary update per write. A write is a change, a change of attributes only, or a repeat that changes nothing. Repeats are cheap: Home Assistant only moves the last reported time.
-- The size of attributes is measured only when they change. Home Assistant keeps the old attributes object when nothing in it changed, so unchanged writes cost nothing.
-- Log records are counted by a handler on the root logger, by logger and level. They are not formatted or written a second time.
+- The size of attributes is measured only when they change. Home Assistant keeps the old attributes object when nothing in it changed, so unchanged writes cost nothing. The measuring runs in a callback of its own, so it counts as measuring cost and not as the integration's.
+- Log records are counted by a handler on the root logger, by logger and level. They are not formatted or written a second time. The recorder's warning about attributes too large to store counts for the integration of the entity.
 - Files saved through Home Assistant's storage helper are counted with their size, by storage key.
 - Executor jobs are timed exactly with the worker thread's CPU clock. A job goes to the integration whose callable it runs, else to the one that submitted it. Other threads are read from `/proc` every 10 seconds. A pool thread is charged to what it runs, and for anyio to the task waiting for it.
 

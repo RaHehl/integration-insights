@@ -51,8 +51,14 @@ const isoTime = (epoch) => (epoch ? new Date(epoch * 1000).toISOString() : "");
 const ms = (value) =>
   value >= 10 ? Math.round(value).toLocaleString() : value.toFixed(1);
 
+// Less than one in ten minutes still shows as more than nothing
+const amount = (value) => (value > 0 && value < 0.1 ? "<0.1" : ms(value));
+
 // A rate that may be missing: an empty cell is clearer than a zero
-const rate = (value) => (value ? ms(value) : "");
+const rate = (value) => (value ? amount(value) : "");
+
+// The Logs view keeps its rows open apart from the other views: "logs:hue"
+const detailDomain = (key) => key.slice(key.indexOf(":") + 1);
 
 // ms of CPU per minute as percent of one core
 const corePercent = (value) => {
@@ -450,7 +456,9 @@ class IntegrationInsightsPanel extends HTMLElement {
     this._data = message;
     this._error = undefined;
     this._updated = new Date();
-    for (const domain of this._expanded) this._loadDetail(domain);
+    for (const domain of new Set([...this._expanded].map(detailDomain))) {
+      this._loadDetail(domain);
+    }
     if (this._view === "overview") this._loadFindings();
     this._render();
   }
@@ -499,7 +507,9 @@ class IntegrationInsightsPanel extends HTMLElement {
         minutes,
       });
       if (minutes !== this._minutes) return;
-      if (this._expanded.has(domain)) this._details.set(domain, detail);
+      if ([...this._expanded].some((key) => detailDomain(key) === domain)) {
+        this._details.set(domain, detail);
+      }
     } catch (err) {
       this._error = err && err.message ? err.message : String(err);
     }
@@ -521,12 +531,15 @@ class IntegrationInsightsPanel extends HTMLElement {
       this._render();
       this._subscribe();
     } else if (action === "toggle") {
+      const domain = detailDomain(value);
       if (this._expanded.has(value)) {
         this._expanded.delete(value);
-        this._details.delete(value);
+        if (![...this._expanded].some((key) => detailDomain(key) === domain)) {
+          this._details.delete(domain);
+        }
       } else {
         this._expanded.add(value);
-        this._loadDetail(value);
+        this._loadDetail(domain);
       }
       this._render();
     } else if (action === "view") {
@@ -703,7 +716,7 @@ class IntegrationInsightsPanel extends HTMLElement {
     if (item.logs) {
       const lg = item.logs;
       lines.push(
-        `Log records: ${lg.warnings_per_min} warnings and ${lg.errors_per_min} errors per min, ${lg.debug_per_min} debug and info`
+        `Log records: ${lg.warnings_per_min} warnings and ${lg.errors_per_min} errors per min, ${lg.debug_per_min} debug and ${lg.info_per_min} info`
       );
       for (const [name, value] of Object.entries(lg.loggers)) {
         lines.push(`- ${name}: ${value} per min`);
@@ -945,7 +958,7 @@ class IntegrationInsightsPanel extends HTMLElement {
         <div class="sub">nothing changed. Cheap, only the last reported time moves</div></div>
       <div class="tile"><div class="label">Changed attributes</div>
         <div class="value">${ms(attributeKib)} KiB per min</div>
-        <div class="sub">stored again by the recorder each time they change</div></div>
+        <div class="sub">serialized for the recorder and sent to dashboards on each change</div></div>
       <div class="tile"><div class="label">Busiest</div>
         <div class="value">${busiest ? escapeHtml(this._data.names[busiest.domain] || busiest.domain) : "none"}</div>
         <div class="sub">${busiest ? `${ms(busiest.state_writes_per_min)} writes per min` : "no state writes yet"}</div></div>
@@ -956,7 +969,7 @@ class IntegrationInsightsPanel extends HTMLElement {
     if (!integrations.length) {
       return `${tiles}<div class="card"><div class="message">No state writes in this window yet.</div></div>`;
     }
-    const top = Math.max(...integrations.map((item) => item[key] || 0), 1);
+    const top = Math.max(...integrations.map((item) => item[key] || 0)) || 1;
     const rows = integrations
       .map((item) => {
         const expanded = this._expanded.has(item.domain);
@@ -990,7 +1003,7 @@ class IntegrationInsightsPanel extends HTMLElement {
     const sw = item && item.state_writes;
     if (!sw) return `<div class="detail"><p class="note">No state writes in this window.</p></div>`;
     const names = detail.entity_names || {};
-    const chips = Object.entries(sw.entities)
+    const chips = Object.entries(sw.entities || {})
       .map(
         ([entityId, value]) =>
           `<span class="chip" title="${escapeHtml(entityId)}">${escapeHtml(names[entityId] || entityId)} · ${value}/min</span>`
@@ -1020,6 +1033,7 @@ class IntegrationInsightsPanel extends HTMLElement {
     const logged = all.filter(
       (item) => item.log_warnings_per_min || item.log_errors_per_min || item.log_debug_per_min
     );
+    const storesCounted = report.sampler?.stores_counted !== false;
     const saving = all.filter((item) => item.store_writes_per_min);
     const sorted = (items, key, ascending) =>
       [...items].sort(
@@ -1027,32 +1041,33 @@ class IntegrationInsightsPanel extends HTMLElement {
       );
     const tiles = `<div class="summary">
       <div class="tile"><div class="label">Warnings</div>
-        <div class="value">${ms(sum(logged, "log_warnings_per_min"))} per min</div>
+        <div class="value">${amount(sum(all, "log_warnings_per_min"))} per min</div>
         <div class="sub">a steady stream hides the messages that matter</div></div>
       <div class="tile"><div class="label">Errors</div>
-        <div class="value">${ms(sum(logged, "log_errors_per_min"))} per min</div>
+        <div class="value">${amount(sum(all, "log_errors_per_min"))} per min</div>
         <div class="sub">errors and critical messages</div></div>
-      <div class="tile"><div class="label">Debug and info</div>
-        <div class="value">${ms(sum(logged, "log_debug_per_min"))} per min</div>
-        <div class="sub">a lot of them usually means debug logging was left on</div></div>
+      <div class="tile"><div class="label">Debug</div>
+        <div class="value">${amount(sum(all, "log_debug_per_min"))} per min</div>
+        <div class="sub">only logged while debug logging is on. Info: ${amount(sum(all, "log_info_per_min"))} per min</div></div>
       <div class="tile"><div class="label">Saved files</div>
-        <div class="value">${ms(sum(saving, "store_writes_per_min"))} per min</div>
-        <div class="sub">${ms(sum(saving, "store_kib_per_min"))} KiB per min, every save replaces a whole file</div></div>
+        <div class="value">${storesCounted ? `${amount(sum(saving, "store_writes_per_min"))} per min` : "not counted"}</div>
+        <div class="sub">${storesCounted ? `${amount(sum(saving, "store_kib_per_min"))} KiB per min, every save replaces a whole file` : "not on this version of Home Assistant"}</div></div>
       <div class="tile"><div class="label">Window</div>
         <div class="value">${report.window_minutes} min</div>
         <div class="sub">counted where they happen, exactly</div></div>
     </div>`;
-    const row = (item, cells) => {
-      const expanded = this._expanded.has(item.domain);
+    const row = (table, item, cells) => {
+      const key = `${table}:${item.domain}`;
+      const expanded = this._expanded.has(key);
       const name = this._data.names[item.domain] || item.domain;
-      return `<div class="row states" data-action="toggle" data-value="${escapeHtml(item.domain)}" role="button" tabindex="0" aria-expanded="${expanded}">
+      return `<div class="row states" data-action="toggle" data-value="${escapeHtml(key)}" role="button" tabindex="0" aria-expanded="${expanded}">
           <div class="name">
             <div class="title"><svg class="chev" viewBox="0 0 24 24"><path fill="currentColor" d="M8.59,16.58L13.17,12L8.59,7.41L10,6L16,12L10,18L8.59,16.58Z"></path></svg>
               <span>${escapeHtml(name)}</span></div>
             <div class="domain">${escapeHtml(item.domain)}</div>
           </div>
           ${cells.map((value) => `<div class="num">${value}</div>`).join("")}
-        </div>${expanded ? this._renderOutputDetail(item) : ""}`;
+        </div>${expanded ? this._renderOutputDetail(table, item) : ""}`;
     };
     const header = (action, sortKey, ascending, columns) =>
       columns
@@ -1064,7 +1079,7 @@ class IntegrationInsightsPanel extends HTMLElement {
         .join("");
     const logRows = sorted(logged, this._logsSort, this._logsAscending)
       .map((item) =>
-        row(item, [
+        row("logs", item, [
           rate(item.log_warnings_per_min),
           rate(item.log_errors_per_min),
           rate(item.log_debug_per_min),
@@ -1072,7 +1087,7 @@ class IntegrationInsightsPanel extends HTMLElement {
       )
       .join("");
     const fileRows = sorted(saving, this._filesSort, this._filesAscending)
-      .map((item) => row(item, [rate(item.store_writes_per_min), ms(item.store_kib_per_min || 0), ""]))
+      .map((item) => row("files", item, [rate(item.store_writes_per_min), amount(item.store_kib_per_min || 0), ""]))
       .join("");
     const logs = logged.length
       ? `<div class="card">
@@ -1088,13 +1103,17 @@ class IntegrationInsightsPanel extends HTMLElement {
           ["store_writes_per_min", "Saves"],
           ["store_kib_per_min", "KiB"],
         ])}<div></div></div>${fileRows}</div>`
-      : `<div class="card"><div class="message">No files saved in this window.</div></div>`;
+      : `<div class="card"><div class="message">${
+          storesCounted
+            ? "No files saved in this window."
+            : "Saved files are not counted on this version of Home Assistant."
+        }</div></div>`;
     const updated = this._updated ? this._updated.toLocaleTimeString() : "";
     return `${tiles}${logs}${files}
       <div class="footer">Per minute. Log records are counted by logger as they reach Home Assistant's log, files when they are saved through Home Assistant's storage helper. Updated ${updated}</div>`;
   }
 
-  _renderOutputDetail(brief) {
+  _renderOutputDetail(table, brief) {
     const detail = this._details.get(brief.domain);
     if (!detail) return `<div class="detail"><p class="note">Loading…</p></div>`;
     const item = detail.item || {};
@@ -1103,10 +1122,12 @@ class IntegrationInsightsPanel extends HTMLElement {
         .map(([name, value]) => `<span class="chip">${escapeHtml(name)} · ${value}${unit}</span>`)
         .join("");
     const parts = [];
-    if (item.logs) {
+    if (table === "logs" && item.logs) {
+      const lg = item.logs;
+      parts.push(`<p class="note">${lg.warnings_per_min} warnings, ${lg.errors_per_min} errors, ${lg.debug_per_min} debug and ${lg.info_per_min} info lines per minute.</p>`);
       parts.push(`<h3>Loggers with the most warnings and errors</h3><div class="pairs">${chips(item.logs.loggers, "/min") || "none"}</div>`);
     }
-    if (item.storage) {
+    if (table === "files" && item.storage) {
       parts.push(`<h3>Files saved most</h3><div class="pairs">${chips(item.storage.files, "/min")}</div>`);
     }
     return `<div class="detail">${parts.join("") || `<p class="note">Nothing in this window.</p>`}</div>`;
@@ -1257,12 +1278,12 @@ class IntegrationInsightsPanel extends HTMLElement {
     }
     if (item.state_writes) {
       const sw = item.state_writes;
-      const chips = Object.entries(sw.entities)
+      const chips = Object.entries(sw.entities || {})
         .map(([entityId, value]) => `<span class="chip">${escapeHtml(entityId)} · ${value}/min</span>`)
         .join("");
       const size = sw.attribute_kib_per_min ? ` Changed attributes: ${sw.attribute_kib_per_min} KiB per minute.` : "";
       parts.push(
-        `<h3>State writes</h3><p class="note">${sw.per_min} writes per minute: ${sw.changes_per_min} changes, ${sw.attributes_only_per_min} changed only attributes, ${sw.repeated_per_min} repeated.${size} Most changes:</p><div class="pairs">${chips}</div>`
+        `<h3>State writes</h3><p class="note">${sw.per_min || 0} writes per minute: ${sw.changes_per_min} changes, ${sw.attributes_only_per_min} changed only attributes, ${sw.repeated_per_min} repeated.${size} Most changes:</p><div class="pairs">${chips}</div>`
       );
     }
     if (item.logs) {
@@ -1271,7 +1292,7 @@ class IntegrationInsightsPanel extends HTMLElement {
         .map(([name, value]) => `<span class="chip">${escapeHtml(name)} · ${value}/min</span>`)
         .join("");
       parts.push(
-        `<h3>Log</h3><p class="note">${lg.warnings_per_min} warnings and ${lg.errors_per_min} errors per minute, ${lg.debug_per_min} debug and info lines.</p><div class="pairs">${chips}</div>`
+        `<h3>Log</h3><p class="note">${lg.warnings_per_min} warnings and ${lg.errors_per_min} errors per minute, ${lg.debug_per_min} debug and ${lg.info_per_min} info lines.</p><div class="pairs">${chips}</div>`
       );
     }
     if (item.storage) {

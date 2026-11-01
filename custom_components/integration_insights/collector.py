@@ -50,7 +50,8 @@ class LogCounts(NamedTuple):
     """Log records of one integration since the last drain."""
 
     domain: str
-    debug: int  # debug and info
+    debug: int
+    info: int
     warning: int
     error: int  # error and critical
     loggers: Counter[str]  # warnings and errors by logger
@@ -130,6 +131,7 @@ class _Domain:
     attribute_entities: Counter[str] = field(default_factory=Counter)
     # Log records that reached the handlers
     log_debug: int = 0
+    log_info: int = 0
     log_warning: int = 0
     log_error: int = 0
     log_loggers: Counter[str] = field(default_factory=Counter)
@@ -178,6 +180,7 @@ class _Domain:
         self.attribute_bytes += other.attribute_bytes
         self.attribute_entities.update(other.attribute_entities)
         self.log_debug += other.log_debug
+        self.log_info += other.log_info
         self.log_warning += other.log_warning
         self.log_error += other.log_error
         self.log_loggers.update(other.log_loggers)
@@ -206,6 +209,7 @@ class _Domain:
         self.state_attributes_only += sign * other.state_attributes_only
         self.attribute_bytes += sign * other.attribute_bytes
         self.log_debug += sign * other.log_debug
+        self.log_info += sign * other.log_info
         self.log_warning += sign * other.log_warning
         self.log_error += sign * other.log_error
         self.store_writes += sign * other.store_writes
@@ -229,6 +233,7 @@ class _Domain:
             or self.block_ns
             or self.attribute_bytes
             or self.log_debug
+            or self.log_info
             or self.log_warning
             or self.log_error
             or self.store_writes
@@ -394,6 +399,7 @@ class Collector:
             if (stats := bucket.domains.get(record.domain)) is None:
                 stats = bucket.domains[record.domain] = _Domain()
             stats.log_debug += record.debug
+            stats.log_info += record.info
             stats.log_warning += record.warning
             stats.log_error += record.error
             stats.log_loggers = _capped(stats.log_loggers, record.loggers)
@@ -591,7 +597,7 @@ class Collector:
         sums: dict[str, list[int]] = {}
         for part in parts:
             for domain, stats in part.domains.items():
-                row = sums.setdefault(domain, [0] * 16)
+                row = sums.setdefault(domain, [0] * 17)
                 row[0] += stats.cpu_ns
                 row[1] += stats.executor_cpu_ns + stats.thread_cpu_ns
                 row[2] += stats.samples
@@ -608,7 +614,8 @@ class Collector:
                 row[13] += stats.log_error
                 row[14] += stats.store_writes
                 row[15] += stats.store_bytes
-        idle = sums.pop("idle", [0] * 16)
+                row[16] += stats.log_info
+        idle = sums.pop("idle", [0] * 17)
         longest = self._longest(now, minutes)
         integrations = []
         for domain, (
@@ -628,6 +635,7 @@ class Collector:
             log_error,
             store_writes,
             store_bytes,
+            log_info,
         ) in sorted(
             sums.items(), key=lambda item: (-(item[1][0] + item[1][1]), item[0])
         ):
@@ -654,13 +662,15 @@ class Collector:
                 item["state_repeated_per_min"] = round(reports / span, 1)
             if attribute_bytes:
                 item["attribute_kib_per_min"] = round(attribute_bytes / 1024 / span, 1)
-            if log_debug or log_warning or log_error:
-                item["log_debug_per_min"] = round(log_debug / span, 1)
-                item["log_warnings_per_min"] = round(log_warning / span, 1)
-                item["log_errors_per_min"] = round(log_error / span, 1)
+            # Two decimals: once an hour is still more than nothing
+            if log_debug or log_info or log_warning or log_error:
+                item["log_debug_per_min"] = round(log_debug / span, 2)
+                item["log_info_per_min"] = round(log_info / span, 2)
+                item["log_warnings_per_min"] = round(log_warning / span, 2)
+                item["log_errors_per_min"] = round(log_error / span, 2)
             if store_writes:
-                item["store_writes_per_min"] = round(store_writes / span, 1)
-                item["store_kib_per_min"] = round(store_bytes / 1024 / span, 1)
+                item["store_writes_per_min"] = round(store_writes / span, 2)
+                item["store_kib_per_min"] = round(store_bytes / 1024 / span, 2)
             if (block := longest.get(domain)) is not None:
                 if block[0]:
                     item["longest_ms"] = round(block[0] / 1e6, 1)
@@ -854,22 +864,23 @@ def _item(domain: str, stats: _Domain, span: float) -> dict[str, Any]:
             entity_id: round(size / 1024 / span, 1)
             for entity_id, size in _ranked(stats.attribute_entities, TOP_STATE_ENTITIES)
         }
-    if stats.log_debug or stats.log_warning or stats.log_error:
+    if stats.log_debug or stats.log_info or stats.log_warning or stats.log_error:
         item["logs"] = {
-            "debug_per_min": round(stats.log_debug / span, 1),
-            "warnings_per_min": round(stats.log_warning / span, 1),
-            "errors_per_min": round(stats.log_error / span, 1),
+            "debug_per_min": round(stats.log_debug / span, 2),
+            "info_per_min": round(stats.log_info / span, 2),
+            "warnings_per_min": round(stats.log_warning / span, 2),
+            "errors_per_min": round(stats.log_error / span, 2),
             "loggers": {
-                name: round(count / span, 1)
+                name: round(count / span, 2)
                 for name, count in _ranked(stats.log_loggers, TOP_LOGGERS)
             },
         }
     if stats.store_writes:
         item["storage"] = {
-            "writes_per_min": round(stats.store_writes / span, 1),
-            "kib_per_min": round(stats.store_bytes / 1024 / span, 1),
+            "writes_per_min": round(stats.store_writes / span, 2),
+            "kib_per_min": round(stats.store_bytes / 1024 / span, 2),
             "files": {
-                key: round(count / span, 1)
+                key: round(count / span, 2)
                 for key, count in _ranked(stats.store_keys, TOP_STORE_KEYS)
             },
         }

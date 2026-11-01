@@ -185,6 +185,8 @@ class LoopTiming:
         # For the sampler: frames of the wrapper are not an integration's
         self.wrapper_code: Any = None
         self.errors = 0
+        # The watchdog thread counts errors too, so the warning has its own flag
+        self._warned = False
         # Callbacks counted under "other callbacks" because the table was full
         self.overflowed = 0
         self.started_at = 0.0
@@ -405,7 +407,8 @@ class LoopTiming:
                 # The time still counts, under the row for everything else
                 self.errors += 1
                 row = other_row()
-                if self.errors == 1:
+                if not self._warned:
+                    self._warned = True
                     _LOGGER.warning(
                         "Could not attribute a callback of the event loop",
                         exc_info=True,

@@ -336,9 +336,16 @@ def test_cgroup_limits_apply_up_to_the_root(
 
 
 async def test_snapshot_commands(
-    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+    hass: HomeAssistant,
+    hass_ws_client: WebSocketGenerator,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Snapshots are taken on request and compared with the one before."""
+    # The test machine's free memory is not what this test is about
+    monkeypatch.setattr(
+        "custom_components.integration_insights.memory._available_mib",
+        lambda: 100_000.0,
+    )
     entry = MockConfigEntry(domain=DOMAIN)
     entry.add_to_hass(hass)
     assert await hass.config_entries.async_setup(entry.entry_id)

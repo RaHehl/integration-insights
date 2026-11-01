@@ -329,7 +329,11 @@ async def test_callbacks_are_timed_and_charged_to_their_entry(
     # The same value with another attribute: a write that keeps the state
     hass.states.async_set(entity_id, "2", {"voltage": 230})
     hass.states.async_set("sensor.unregistered", "x")
+    # Measured in a callback of its own, not in the one that wrote the state
+    assert insights._state_writes["blocker"][4] == 0  # noqa: SLF001
     await hass.async_block_till_done()
+    # The first write brought empty attributes, the last one the voltage
+    assert insights._state_writes["blocker"][4] == len(b"{}") + len(b'{"voltage":230}')  # noqa: SLF001
     report = insights.report()
     row = next(item for item in report["integrations"] if item["domain"] == "blocker")
     assert set(row["state_writes"]) == {

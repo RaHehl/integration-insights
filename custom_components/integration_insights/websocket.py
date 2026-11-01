@@ -14,7 +14,7 @@ from homeassistant.loader import IntegrationNotLoaded, async_get_loaded_integrat
 
 from .collector import WINDOW_MINUTES
 from .const import DOMAIN
-from .findings import Finding, verdict
+from .findings import USER_CONFIGURED, Finding, verdict
 from .insights import Insights
 from .memory import SnapshotRefused
 
@@ -265,8 +265,14 @@ def _render(
             config_url=f"/config/integrations/integration/{finding.domain}",
         )
         # Advice for a built-in integration differs: it updates with Home
-        # Assistant and its reports go to the core issue tracker.
-        if about["built_in"] and f"{_prefix(key)}_built_in.title" in translations:
+        # Assistant and its reports go to the core issue tracker. One that
+        # runs a user's configuration points to that configuration.
+        if (
+            finding.domain in USER_CONFIGURED
+            and f"{_prefix(key)}_configured.title" in translations
+        ):
+            key = f"{key}_configured"
+        elif about["built_in"] and f"{_prefix(key)}_built_in.title" in translations:
             key = f"{key}_built_in"
     for part in ("title", "description"):
         item[part] = _PLACEHOLDER.sub(
