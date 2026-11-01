@@ -25,7 +25,7 @@ const renderText = (text) =>
     .map((block) => {
       const lines = block.split("\n");
       const inline = (line) =>
-        escapeHtml(line).replace(/\[([^\]]+)\]\(((?:https?:\/\/|\/)[^)\s]*)\)/g, (_m, label, href) =>
+        escapeHtml(line).replace(/\[([^\]]+)\]\(((?:https?:\/\/|\/(?!\/))[^)\s]*)\)/g, (_m, label, href) =>
           href.startsWith("/")
             ? `<a href="${href}" data-action="navigate" data-value="${href}">${label}</a>`
             : `<a href="${href}" target="_blank" rel="noreferrer">${label}</a>`
@@ -390,6 +390,7 @@ const STYLE = `
     .card-head, .row { grid-template-columns: 1fr 64px 76px 56px; gap: 8px; }
     .card-head.mem, .row.mem { grid-template-columns: 1fr 64px 64px 56px; }
     .card-head.states, .row.states { grid-template-columns: 1fr 56px 56px 56px; }
+    .row.states .num, .row.files .num { font-size: 14px; }
     .sort .long { display: none; }
     .badge { display: none; }
     .rough { display: inline; }
@@ -1093,19 +1094,19 @@ class IntegrationInsightsPanel extends HTMLElement {
     const chips = Object.entries(sw.entities || {})
       .map(
         ([entityId, value]) =>
-          `<span class="chip" title="${escapeHtml(entityId)}">${escapeHtml(names[entityId] || entityId)} · ${value}/min</span>`
+          `<span class="chip" title="${escapeHtml(entityId)}">${escapeHtml(names[entityId] || entityId)} · ${amount(value)}/min</span>`
       )
       .join("");
     const sizes = Object.entries(sw.attribute_entities || {})
       .map(
         ([entityId, value]) =>
-          `<span class="chip" title="${escapeHtml(entityId)}">${escapeHtml(names[entityId] || entityId)} · ${value} KiB/min</span>`
+          `<span class="chip" title="${escapeHtml(entityId)}">${escapeHtml(names[entityId] || entityId)} · ${amount(value)} KiB/min</span>`
       )
       .join("");
     const attributes = sw.attribute_kib_per_min
       ? `<h3>Changed attributes, ${sw.attribute_kib_per_min} KiB per minute</h3><div class="pairs">${sizes}</div>`
       : "";
-    return `<div class="detail"><p class="note">${sw.per_min} writes per minute: ${sw.changes_per_min} changes, ${sw.attributes_only_per_min} changed only attributes, ${sw.repeated_per_min} repeated.</p><h3>Most changes</h3><div class="pairs">${chips}</div>${attributes}</div>`;
+    return `<div class="detail"><p class="note">${amount(sw.per_min)} writes per minute: ${amount(sw.changes_per_min)} changes, ${amount(sw.attributes_only_per_min)} changed only attributes, ${amount(sw.repeated_per_min)} repeated.</p><h3>Most changes</h3><div class="pairs">${chips}</div>${attributes}</div>`;
   }
 
   _renderLogs() {
@@ -1341,16 +1342,16 @@ class IntegrationInsightsPanel extends HTMLElement {
         const expanded = this._memExpanded.has(row.owner);
         const c = row.change || {};
         const detail = expanded
-          ? `<div class="detail"><p class="note">Data ${row.data_kib.toLocaleString()} KiB · code ${row.code_kib.toLocaleString()} KiB · not reached from a root ${row.unreached_kib.toLocaleString()} KiB · dispatcher connections ${row.dispatcher}${delta(c.dispatcher)}</p></div>`
+          ? `<div class="detail"><p class="note">Data ${row.data_kib.toLocaleString()} KiB · code ${row.code_kib.toLocaleString()} KiB · not reached from a root ${row.unreached_kib.toLocaleString()} KiB · dispatcher connections ${row.dispatcher.toLocaleString()}${delta(c.dispatcher)}</p></div>`
           : "";
         return `<div class="row mem" data-action="memtoggle" data-value="${escapeHtml(row.owner)}" role="button" tabindex="0" aria-expanded="${expanded}">
             <div class="name"><div class="title"><svg class="chev" viewBox="0 0 24 24"><path fill="currentColor" d="M8.59,16.58L13.17,12L8.59,7.41L10,6L16,12L10,18L8.59,16.58Z"></path></svg>
               <span>${escapeHtml(this._ownerName(row.owner))}</span></div><div class="domain">${escapeHtml(row.owner)}</div></div>
-            <div class="num">${row.kib.toLocaleString()}${delta(c.kib)}</div>
-            <div class="num">${row.data_kib.toLocaleString()}</div>
-            <div class="num">${row.listeners}${delta(c.listeners)}</div>
-            <div class="num col-wide">${row.timers}${delta(c.timers)}</div>
-            <div class="num col-wide">${row.tasks}${delta(c.tasks)}</div>
+            <div class="num">${Math.round(row.kib).toLocaleString()}${delta(c.kib && Math.round(c.kib))}</div>
+            <div class="num">${Math.round(row.data_kib).toLocaleString()}</div>
+            <div class="num">${row.listeners.toLocaleString()}${delta(c.listeners)}</div>
+            <div class="num col-wide">${row.timers.toLocaleString()}${delta(c.timers)}</div>
+            <div class="num col-wide">${row.tasks.toLocaleString()}${delta(c.tasks)}</div>
           </div>${detail}`;
       })
       .join("");
@@ -1385,7 +1386,7 @@ class IntegrationInsightsPanel extends HTMLElement {
         .join("");
       const size = sw.attribute_kib_per_min ? ` Changed attributes: ${sw.attribute_kib_per_min} KiB per minute.` : "";
       parts.push(
-        `<h3>State writes</h3><p class="note">${sw.per_min || 0} writes per minute: ${sw.changes_per_min} changes, ${sw.attributes_only_per_min} changed only attributes, ${sw.repeated_per_min} repeated.${size} Most changes:</p><div class="pairs">${chips}</div>`
+        `<h3>State writes</h3><p class="note">${amount(sw.per_min)} writes per minute: ${amount(sw.changes_per_min)} changes, ${amount(sw.attributes_only_per_min)} changed only attributes, ${amount(sw.repeated_per_min)} repeated.${size} Most changes:</p><div class="pairs">${chips}</div>`
       );
     }
     if (item.logs) {
@@ -1403,7 +1404,7 @@ class IntegrationInsightsPanel extends HTMLElement {
         .map(([key, value]) => `<span class="chip">${escapeHtml(key)} · ${value}/min</span>`)
         .join("");
       parts.push(
-        `<h3>Saved files</h3><p class="note">${st.writes_per_min} saves per minute, ${st.kib_per_min} KiB per minute.</p><div class="pairs">${chips}</div>`
+        `<h3>Saved files</h3><p class="note">${amount(st.writes_per_min)} saves per minute, ${amount(st.kib_per_min)} KiB per minute.</p><div class="pairs">${chips}</div>`
       );
     }
     if (item.stall) {
@@ -1417,11 +1418,11 @@ class IntegrationInsightsPanel extends HTMLElement {
         .map(
           (row) => `<div class="spot"><div class="code">${escapeHtml(row.function)}</div>
             <div class="num">${ms(row.wall_ms_per_min)} ms/min</div>
-            <div class="lines"><span class="chip">${row.per_min} per min</span></div></div>`
+            <div class="lines"><span class="chip">${amount(row.per_min)} per min</span></div></div>`
         )
         .join("");
       parts.push(
-        `<h3>Event loop callbacks</h3><p class="note">${ms(cb.wall_ms_per_min)} ms/min of wall time on the event loop, measured exactly, ${cb.per_min} callbacks per minute. Longest: ${ms(cb.longest_ms)} ms at ${escapeHtml(localTime(cb.longest_at))} in <span class="code">${escapeHtml(cb.longest_function)}</span>.</p>${rows}`
+        `<h3>Event loop callbacks</h3><p class="note">${ms(cb.wall_ms_per_min)} ms/min of wall time on the event loop, measured exactly, ${amount(cb.per_min)} callbacks per minute. Longest: ${ms(cb.longest_ms)} ms at ${escapeHtml(localTime(cb.longest_at))} in <span class="code">${escapeHtml(cb.longest_function)}</span>.</p>${rows}`
       );
     }
     if (item.executor) {
@@ -1430,11 +1431,11 @@ class IntegrationInsightsPanel extends HTMLElement {
         .map(
           (job) => `<div class="spot"><div class="code">${escapeHtml(job.function)}</div>
             <div class="num">${ms(job.cpu_ms_per_min)} ms/min</div>
-            <div class="lines"><span class="chip">${job.per_min} per min</span></div></div>`
+            <div class="lines"><span class="chip">${amount(job.per_min)} per min</span></div></div>`
         )
         .join("");
       parts.push(
-        `<h3>Executor jobs</h3><p class="note">${ms(ex.cpu_ms_per_min)} ms/min CPU, ${ms(ex.wall_ms_per_min)} ms/min of worker time, ${ex.jobs_per_min} jobs per minute.</p>${jobs}`
+        `<h3>Executor jobs</h3><p class="note">${ms(ex.cpu_ms_per_min)} ms/min CPU, ${ms(ex.wall_ms_per_min)} ms/min of worker time, ${amount(ex.jobs_per_min)} jobs per minute.</p>${jobs}`
       );
     }
     if (item.threads) {
