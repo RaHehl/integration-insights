@@ -34,10 +34,22 @@ os.register_at_fork(after_in_child=_renew_store_locks)
 # entity's integration wrote them, so the warning counts for it
 RECORDER_SCHEMA_LOGGER = "homeassistant.components.recorder.db_schema"
 OVERSIZED_ATTRIBUTES = "State attributes for %s exceed"
-# The recorder's warning about event data too large to store is about
-# whoever fired the event, which it does not name: it counts for core
-OVERSIZED_EVENT = "Event data for %s exceed"
-RECORDER_EVENT_DATA = f"{RECORDER_SCHEMA_LOGGER} (event data)"
+# The recorder warns about attributes it cannot serialize, for the state
+# it names: that counts for the entity's integration, like oversized ones
+UNSERIALIZABLE_STATE_LOGGER = (
+    "homeassistant.components.recorder.table_managers.state_attributes"
+)
+UNSERIALIZABLE_STATE = "State is not JSON serializable"
+# The websocket API logs a failed service call for the service's domain
+WEBSOCKET_LOGGER = "homeassistant.components.websocket_api.http.connection"
+FAILED_SERVICE_CALL = "Error during service call to %s.%s"
+# Integrations that serve all others: what their loggers report is about
+# other integrations or about Home Assistant itself, so it counts for core
+# unless a record names the integration it is about
+SERVES_OTHERS = frozenset({"api", "http", "recorder", "websocket_api"})
+_ABOUT_OTHERS = frozenset(
+    {RECORDER_SCHEMA_LOGGER, UNSERIALIZABLE_STATE_LOGGER, WEBSOCKET_LOGGER}
+)
 
 
 class LogCounter(logging.Handler):
@@ -79,24 +91,27 @@ class LogCounter(logging.Handler):
             if level >= logging.INFO
             else DEBUG
         )
-        if (
-            record.name == RECORDER_SCHEMA_LOGGER
-            and isinstance(record.msg, str)
-            and record.msg.startswith(OVERSIZED_ATTRIBUTES)
-            and isinstance(record.args, tuple)
-            and record.args
-            and isinstance(entity_id := record.args[0], str)
-        ):
-            with self._lock:
-                self._oversized[entity_id] = self._oversized.get(entity_id, 0) + 1
-            return
         name = record.name
+        msg = record.msg
+        args = record.args
         if (
-            name == RECORDER_SCHEMA_LOGGER
-            and isinstance(record.msg, str)
-            and record.msg.startswith(OVERSIZED_EVENT)
+            name in _ABOUT_OTHERS
+            and isinstance(msg, str)
+            and isinstance(args, tuple)
+            and args
         ):
-            name = RECORDER_EVENT_DATA
+            # The recorder's warnings about an entity it cannot store
+            entity_id = None
+            if msg.startswith(OVERSIZED_ATTRIBUTES):
+                entity_id = args[0]
+            elif msg.startswith(UNSERIALIZABLE_STATE):
+                entity_id = getattr(args[0], "entity_id", None)
+            elif msg.startswith(FAILED_SERVICE_CALL) and isinstance(args[0], str):
+                name = f"{name} [{args[0]}]"
+            if isinstance(entity_id, str):
+                with self._lock:
+                    self._oversized[entity_id] = self._oversized.get(entity_id, 0) + 1
+                return
         with self._lock:
             if (row := self._counts.get(name)) is None:
                 row = self._counts[name] = [0, 0, 0, 0]
@@ -148,7 +163,10 @@ class LogCounter(logging.Handler):
 
 
 def logger_domain(
-    name: str, library_map: Mapping[str, str], cache: dict[str, str]
+    name: str,
+    library_map: Mapping[str, str],
+    cache: dict[str, str],
+    known: set[str] | frozenset[str] | None = None,
 ) -> str:
     """Return the integration a logger belongs to, else core.
 
@@ -160,14 +178,18 @@ def logger_domain(
     if (domain := cache.get(name)) is not None:
         return domain
     parts = name.split(".")
-    if name == RECORDER_EVENT_DATA:
-        domain = "core"
+    if name.endswith("]") and " [" in name:
+        # A record that names the integration it is about
+        domain = name[name.rindex(" [") + 2 : -1]
+        if known is not None and domain not in known:
+            domain = "core"
     elif parts[0] == "homeassistant":
         domain = (
             parts[2]
             if len(parts) > 2
             and parts[1] == "components"
             and parts[2] not in BASE_PLATFORMS
+            and parts[2] not in SERVES_OTHERS
             else "core"
         )
     elif parts[0] == "custom_components" and len(parts) > 1:

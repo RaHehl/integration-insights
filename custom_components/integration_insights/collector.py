@@ -55,7 +55,7 @@ class LogCounts(NamedTuple):
     warning: int
     error: int  # error and critical
     loggers: Counter[str]  # warnings and errors by logger
-    # Of the warnings: the recorder's about attributes too large to store
+    # Of the warnings: the recorder's about attributes it cannot store
     oversized: int = 0
 
 

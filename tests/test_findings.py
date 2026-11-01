@@ -677,5 +677,5 @@ def test_recorder_warnings_back_large_attributes_not_noisy_logs() -> None:
     findings = find(_summary([item]), lambda _: detail, {})
     assert _keys(findings) == [("big_attributes", NOTICE, "foo")]
     assert findings[0].evidence[-1] == (
-        "recorder warnings about attributes too large to store: 12/min"
+        "recorder warnings about attributes it cannot store: 12/min"
     )

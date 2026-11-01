@@ -465,6 +465,7 @@ class Insights:
             )
             writes.clear()
         library_map = self.collector.library_map
+        components = self.hass.config.top_level_components
         logger_domains = self._logger_domains
         # A new library map can own loggers that counted for core before
         if library_map is not self._logger_map or len(logger_domains) > 5_000:
@@ -472,12 +473,13 @@ class Insights:
             self._logger_map = library_map
         self.collector.add_logs(
             self.logs.drain(
-                lambda name: logger_domain(name, library_map, logger_domains),
+                lambda name: logger_domain(
+                    name, library_map, logger_domains, components
+                ),
                 self._entity_owner,
             ),
             now,
         )
-        components = self.hass.config.top_level_components
         self.collector.add_store_writes(
             self.stores.drain(lambda key: store_domain(key, components)), now
         )

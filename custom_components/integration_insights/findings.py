@@ -193,7 +193,7 @@ def _cpu_findings(
         "state_attributes_only_per_min", 0
     )
     attribute_kib = item.get("attribute_kib_per_min", 0)
-    # The recorder's warnings about attributes too large to store count
+    # The recorder's warnings about attributes it cannot store count
     # for the entity's integration, but it did not log them
     log_warnings = max(
         item.get("log_warnings_per_min", 0)
@@ -368,7 +368,7 @@ def _output_findings(
                 ]
                 + (
                     [
-                        "recorder warnings about attributes too large to store: "
+                        "recorder warnings about attributes it cannot store: "
                         f"{_rate(oversized)}/min"
                     ]
                     if (oversized := item.get("log_oversized_per_min", 0))

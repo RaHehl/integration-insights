@@ -63,9 +63,11 @@ def test_recorder_warnings_about_attributes_count_for_the_entity() -> None:
     assert rows["solar"].warning == 2
     assert rows["solar"].oversized == 2
     assert rows["solar"].loggers == {RECORDER_SCHEMA_LOGGER: 2}
-    # Without an integration for the entity it stays with the recorder
-    assert rows["recorder"].warning == 2
-    assert rows["recorder"].loggers == {RECORDER_SCHEMA_LOGGER: 2}
+    # Without an integration for the entity it counts for core, with the rest
+    # of what the recorder reports about others
+    assert rows["core"].warning == 2
+    assert rows["core"].loggers == {RECORDER_SCHEMA_LOGGER: 2}
+    assert "recorder" not in rows
 
 
 def test_loggers_belong_to_their_integration() -> None:
@@ -323,7 +325,8 @@ def test_records_that_cannot_name_their_integration_count_for_core() -> None:
         logger_domain("homeassistant.components.light.reproduce_state", {}, cache)
         == "core"
     )
-    assert logger_domain("homeassistant.components.recorder", {}, cache) == "recorder"
+    assert logger_domain("homeassistant.components.recorder", {}, cache) == "core"
+    assert logger_domain("homeassistant.components.hue.light", {}, cache) == "hue"
     counter = LogCounter()
     counter.install()
     try:
@@ -341,4 +344,43 @@ def test_records_that_cannot_name_their_integration_count_for_core() -> None:
         for row in counter.drain(lambda name: logger_domain(name, {}, {}))
     }
     assert rows["core"].warning == 1
+    assert "recorder" not in rows
+
+
+def test_records_about_another_integration_count_for_it() -> None:
+    """Unserializable attributes and failed service calls name who they are about."""
+    counter = LogCounter()
+    counter.install()
+    try:
+        logging.getLogger(
+            "homeassistant.components.recorder.table_managers.state_attributes"
+        ).warning(
+            "State is not JSON serializable: %s: %s",
+            SimpleNamespace(entity_id="sensor.raw"),
+            TypeError("bytes"),
+        )
+        websocket = logging.getLogger(
+            "homeassistant.components.websocket_api.http.connection"
+        )
+        websocket.error(
+            "Error during service call to %s.%s: %s", "solar", "refresh", "x"
+        )
+        websocket.error("Error during service call to %s.%s: %s", "typo", "x", "x")
+    finally:
+        counter.uninstall()
+    rows = {
+        row.domain: row
+        for row in counter.drain(
+            lambda name: logger_domain(name, {}, {}, {"solar"}),
+            lambda entity_id: "solar" if entity_id == "sensor.raw" else None,
+        )
+    }
+    assert (rows["solar"].warning, rows["solar"].oversized, rows["solar"].error) == (
+        1,
+        1,
+        1,
+    )
+    # A domain that is not loaded does not become an integration of its own
+    assert rows["core"].error == 1
+    assert "websocket_api" not in rows
     assert "recorder" not in rows

@@ -60,7 +60,7 @@ const logSummary = (lg) =>
   `${amount(lg.warnings_per_min)} warnings, ${amount(lg.errors_per_min)} errors, ` +
   `${amount(lg.debug_per_min)} debug and ${amount(lg.info_per_min)} info lines per min` +
   (lg.oversized_per_min
-    ? `. ${amount(lg.oversized_per_min)} of the warnings are the recorder's, about attributes too large to store`
+    ? `. ${amount(lg.oversized_per_min)} of the warnings are the recorder's, about attributes it cannot store`
     : "");
 
 // A rate that may be missing: an empty cell is clearer than a zero
