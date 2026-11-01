@@ -366,6 +366,9 @@ def test_records_about_another_integration_count_for_it() -> None:
             "Error during service call to %s.%s: %s", "solar", "refresh", "x"
         )
         websocket.error("Error during service call to %s.%s: %s", "typo", "x", "x")
+        # As the websocket adapter logs it, and for a platform, never blamed
+        websocket.error("[1] Error during service call to %s.%s: %s", "solar", "x", "x")
+        websocket.error("[1] Error during service call to %s.%s: %s", "light", "x", "x")
     finally:
         counter.uninstall()
     rows = {
@@ -378,9 +381,9 @@ def test_records_about_another_integration_count_for_it() -> None:
     assert (rows["solar"].warning, rows["solar"].oversized, rows["solar"].error) == (
         1,
         1,
-        1,
+        2,
     )
-    # A domain that is not loaded does not become an integration of its own
-    assert rows["core"].error == 1
+    # A domain that is not loaded, or a platform, counts for core
+    assert rows["core"].error == 2
     assert "websocket_api" not in rows
     assert "recorder" not in rows

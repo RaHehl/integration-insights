@@ -15,6 +15,7 @@ from typing import Any
 import weakref
 
 from homeassistant.const import BASE_PLATFORMS
+from homeassistant.exceptions import HomeAssistantError, ServiceNotFound
 from homeassistant.helpers.storage import Store
 
 from .collector import LogCounts, StoreWrites
@@ -30,26 +31,23 @@ def _renew_store_locks() -> None:
 
 
 os.register_at_fork(after_in_child=_renew_store_locks)
-# The recorder warns for every state whose attributes it will not store; the
-# entity's integration wrote them, so the warning counts for it
 RECORDER_SCHEMA_LOGGER = "homeassistant.components.recorder.db_schema"
+# The recorder warns about attributes it will not store, naming the state:
+# the entity's integration wrote them, so the warnings count for it
 OVERSIZED_ATTRIBUTES = "State attributes for %s exceed"
-# The recorder warns about attributes it cannot serialize, for the state
-# it names: that counts for the entity's integration, like oversized ones
-UNSERIALIZABLE_STATE_LOGGER = (
-    "homeassistant.components.recorder.table_managers.state_attributes"
-)
 UNSERIALIZABLE_STATE = "State is not JSON serializable"
-# The websocket API logs a failed service call for the service's domain
-WEBSOCKET_LOGGER = "homeassistant.components.websocket_api.http.connection"
-FAILED_SERVICE_CALL = "Error during service call to %s.%s"
+# Messages that name the integration they are about as their first argument
+NAMES_DOMAIN = ("Error during service call to %s.%s", "Error with %s describe event")
 # Integrations that serve all others: what their loggers report is about
 # other integrations or about Home Assistant itself, so it counts for core
 # unless a record names the integration it is about
 SERVES_OTHERS = frozenset({"api", "http", "recorder", "websocket_api"})
-_ABOUT_OTHERS = frozenset(
-    {RECORDER_SCHEMA_LOGGER, UNSERIALIZABLE_STATE_LOGGER, WEBSOCKET_LOGGER}
-)
+# Integrations whose warnings often name the integration they are about:
+# a failed service call, an automation or script step that failed in one
+NAMES_SUBJECT = SERVES_OTHERS | {"automation", "logbook", "script"}
+# Never the subject of a record: these run on behalf of others
+NOT_A_SUBJECT = SERVES_OTHERS | frozenset(BASE_PLATFORMS) | {"homeassistant"}
+_COMPONENTS = "homeassistant.components."
 
 
 class LogCounter(logging.Handler):
@@ -63,8 +61,8 @@ class LogCounter(logging.Handler):
         self._lock = self.lock or threading.RLock()
         # logger name -> [debug, info, warning, error and up]
         self._counts: dict[str, list[int]] = {}
-        # entity_id -> recorder warnings about its attributes
-        self._oversized: dict[str, int] = {}
+        # (entity_id, logger) -> recorder warnings about its attributes
+        self._oversized: dict[tuple[str, str], int] = {}
         self._installed = False
 
     def handle(self, record: logging.LogRecord) -> bool:
@@ -92,26 +90,21 @@ class LogCounter(logging.Handler):
             else DEBUG
         )
         name = record.name
-        msg = record.msg
-        args = record.args
         if (
-            name in _ABOUT_OTHERS
-            and isinstance(msg, str)
-            and isinstance(args, tuple)
-            and args
+            slot >= WARNING
+            and name.startswith(_COMPONENTS)
+            and name[len(_COMPONENTS) :].partition(".")[0] in NAMES_SUBJECT
+            and isinstance(record.args, tuple)
+            and record.args
         ):
-            # The recorder's warnings about an entity it cannot store
-            entity_id = None
-            if msg.startswith(OVERSIZED_ATTRIBUTES):
-                entity_id = args[0]
-            elif msg.startswith(UNSERIALIZABLE_STATE):
-                entity_id = getattr(args[0], "entity_id", None)
-            elif msg.startswith(FAILED_SERVICE_CALL) and isinstance(args[0], str):
-                name = f"{name} [{args[0]}]"
-            if isinstance(entity_id, str):
+            entity_id, domain = _subject(record.msg, record.args)
+            if entity_id is not None:
+                key = (entity_id, name)
                 with self._lock:
-                    self._oversized[entity_id] = self._oversized.get(entity_id, 0) + 1
+                    self._oversized[key] = self._oversized.get(key, 0) + 1
                 return
+            if domain is not None:
+                name = f"{name} [{domain}]"
         with self._lock:
             if (row := self._counts.get(name)) is None:
                 row = self._counts[name] = [0, 0, 0, 0]
@@ -155,11 +148,35 @@ class LogCounter(logging.Handler):
 
         for name, levels in counts.items():
             add(owner_of(name), name, levels)
-        for entity_id, warnings in oversized.items():
-            domain = entity_owner(entity_id) or owner_of(RECORDER_SCHEMA_LOGGER)
-            add(domain, RECORDER_SCHEMA_LOGGER, [0, 0, warnings, 0])
+        for (entity_id, name), warnings in oversized.items():
+            domain = entity_owner(entity_id) or owner_of(name)
+            add(domain, name, [0, 0, warnings, 0])
             rows[domain][5] += warnings
         return [LogCounts(domain, *row) for domain, row in rows.items()]
+
+
+def _subject(msg: Any, args: tuple[Any, ...]) -> tuple[str | None, str | None]:
+    """Return the entity or the integration a record is about, if it names one."""
+    if not isinstance(msg, str):
+        return None, None
+    # The websocket API puts the connection in front: "[123] Error ..."
+    if msg.startswith("[") and (end := msg.find("] ")) > 0:
+        msg = msg[end + 2 :]
+    first = args[0]
+    if msg.startswith(OVERSIZED_ATTRIBUTES) and isinstance(first, str):
+        return first, None
+    if msg.startswith(UNSERIALIZABLE_STATE):
+        entity_id = getattr(first, "entity_id", None)
+        return (entity_id, None) if isinstance(entity_id, str) else (None, None)
+    if msg.startswith(NAMES_DOMAIN) and isinstance(first, str):
+        return None, first
+    # An automation or script step that failed in an integration's service
+    for arg in args:
+        if isinstance(arg, ServiceNotFound):
+            return None, arg.domain
+        if isinstance(arg, HomeAssistantError) and arg.translation_domain:
+            return None, arg.translation_domain
+    return None, None
 
 
 def logger_domain(
@@ -179,9 +196,10 @@ def logger_domain(
         return domain
     parts = name.split(".")
     if name.endswith("]") and " [" in name:
-        # A record that names the integration it is about
+        # A record that names the integration it is about, unless that is
+        # one that runs for others or one that is not loaded
         domain = name[name.rindex(" [") + 2 : -1]
-        if known is not None and domain not in known:
+        if domain in NOT_A_SUBJECT or (known is not None and domain not in known):
             domain = "core"
     elif parts[0] == "homeassistant":
         domain = (

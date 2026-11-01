@@ -27,7 +27,8 @@ from custom_components.integration_insights.const import DOMAIN
 from custom_components.integration_insights.sampler import is_supported
 from homeassistant.config_entries import ConfigEntryState, current_entry
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED, EVENT_HOMEASSISTANT_STOP
-from homeassistant.core import CoreState, HomeAssistant
+from homeassistant.core import CoreState, HomeAssistant, ServiceCall
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.setup import async_setup_component
@@ -559,4 +560,53 @@ async def test_a_block_without_code_names_its_callback(hass: HomeAssistant) -> N
         insights.drain()
     row = next(i for i in insights.summary()["integrations"] if i["domain"] == "foo")
     assert row["blocked_function"] == "custom_components.foo.api.poll"
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_failed_service_calls_count_for_the_service(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
+    """Through the real websocket adapter and a real automation."""
+    entry = MockConfigEntry(domain=DOMAIN)
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    insights = entry.runtime_data
+    hass.config.components.add("acme")
+
+    async def ping(call: ServiceCall) -> None:
+        raise HomeAssistantError("unreachable", translation_domain="acme")
+
+    hass.services.async_register("acme", "ping", ping)
+    client = await hass_ws_client(hass)
+    await client.send_json_auto_id(
+        {"type": "call_service", "domain": "acme", "service": "ping"}
+    )
+    assert not (await client.receive_json())["success"]
+    assert await async_setup_component(
+        hass,
+        "automation",
+        {
+            "automation": {
+                "id": "ping_acme",
+                "trigger": {"platform": "event", "event_type": "go"},
+                "action": {"action": "acme.ping"},
+            }
+        },
+    )
+    hass.bus.async_fire("go")
+    await hass.async_block_till_done()
+    insights.drain()
+    domains = {item["domain"]: item for item in insights.summary()["integrations"]}
+    assert (
+        domains["acme"]["log_errors_per_min"]
+        + domains["acme"].get("log_warnings_per_min", 0)
+        > 0
+    )
+    # The websocket API's record and the automation's, which carries the
+    # error, count for acme. The script step logs only the error's text,
+    # so that one stays with the automation.
+    assert not domains.get("websocket_api", {}).get("log_errors_per_min")
+    assert domains["acme"]["log_errors_per_min"] == (
+        2 * domains["automation"]["log_errors_per_min"]
+    )
     assert await hass.config_entries.async_unload(entry.entry_id)
