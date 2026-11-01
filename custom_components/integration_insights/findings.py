@@ -45,8 +45,8 @@ STATE_WRITES_PROBLEM_PER_MIN = 3_000
 # 16 KiB and logs a warning for each instead.
 ATTRIBUTES_NOTICE_KIB = 100
 ATTRIBUTES_PROBLEM_KIB = 1_000
-# Warnings and errors per minute. Each one is formatted and written to the log
-# file, and a steady stream hides the messages that matter.
+# Warnings and errors per minute. Each one is formatted and written to the
+# log, and a steady stream hides the messages that matter.
 LOG_NOTICE_PER_MIN = 10
 LOG_PROBLEM_PER_MIN = 100
 # Debug lines per minute: debug logging that was left on. Info lines do not
@@ -64,6 +64,7 @@ LOST_SHARE = 0.01
 # Resources an owner may gain between two snapshots before it looks like a leak.
 RESOURCE_GROWTH = 20
 RESOURCES = ("listeners", "dispatcher", "timers", "tasks")
+RESOURCE_NAMES = {"dispatcher": "dispatcher connections"}
 # Built-in integrations run reviewed background work by design, such as the
 # recorder writing to its database, so only a lot of it is worth a word.
 BUILT_IN_BACKGROUND_FACTOR = 5
@@ -452,7 +453,8 @@ def _memory_findings(memory: dict[str, Any]) -> list[Finding]:
                     row["owner"],
                     {
                         "what": ", ".join(
-                            f"{count} {name}" for name, count in grown.items()
+                            f"{count} {RESOURCE_NAMES.get(name, name)}"
+                            for name, count in grown.items()
                         )
                     },
                     [
@@ -474,6 +476,8 @@ def _utc(timestamp: float) -> str:
 
 def _rate(value: float) -> str:
     """Format a rate; small ones keep a decimal so 2 in 6 minutes is not 0."""
+    if value == 0:
+        return "0"
     if 0 < value < 0.1:
         return "<0.1"
     return f"{value:.1f}" if value < 10 else _number(value)

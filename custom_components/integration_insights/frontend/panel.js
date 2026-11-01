@@ -60,6 +60,12 @@ const rate = (value) => (value ? amount(value) : "");
 // The Logs view keeps its rows open apart from the other views: "logs:hue"
 const detailDomain = (key) => key.slice(key.indexOf(":") + 1);
 
+// A column label with a short form for phones: "Attributes|Attr."
+const sortLabel = (label) => {
+  const [long, short] = label.split("|");
+  return short ? `<span class="long">${long}</span><span class="short">${short}</span>` : long;
+};
+
 // Where "Show details" of a finding leads: the view and the row key prefix
 const FINDING_VIEWS = {
   busy_states: ["states", ""],
@@ -67,6 +73,7 @@ const FINDING_VIEWS = {
   noisy_logs: ["logs", "logs:"],
   debug_logging: ["logs", "logs:"],
   busy_storage: ["logs", "files:"],
+  growing_resources: ["memory", ""],
 };
 
 // ms of CPU per minute as percent of one core
@@ -201,6 +208,7 @@ const STYLE = `
   button.sort {
     background: none; border: 0; padding: 0; margin: 0; font: inherit; color: inherit;
     text-transform: inherit; letter-spacing: inherit; cursor: pointer; text-align: right;
+    white-space: nowrap;
   }
   button.sort.active { color: var(--primary-text-color); }
   .card-head.mem, .row.mem { grid-template-columns: 1fr 100px 100px 84px 70px 60px; }
@@ -229,6 +237,7 @@ const STYLE = `
     overflow: hidden;
     text-overflow: ellipsis;
   }
+  .name .title > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
   .name .domain {
     font-size: 12px;
     color: var(--secondary-text-color);
@@ -285,7 +294,9 @@ const STYLE = `
     font-size: 12px;
     background: rgba(var(--rgb-primary-text-color, 0, 0, 0), 0.06);
   }
+  .chip { overflow-wrap: anywhere; max-width: 100%; }
   .pairs { display: flex; flex-wrap: wrap; gap: 6px; }
+  .sort .short { display: none; }
   details { border-top: 1px solid var(--divider-color); }
   details:first-of-type { border-top: none; }
   summary { padding: 6px 0; cursor: pointer; font-size: 14px; }
@@ -365,7 +376,9 @@ const STYLE = `
     main { padding: 12px; }
     .card-head, .row { grid-template-columns: 1fr 64px 76px 56px; gap: 8px; }
     .card-head.mem, .row.mem { grid-template-columns: 1fr 64px 64px 56px; }
-    .card-head.states, .row.states { grid-template-columns: 1fr 56px 56px 48px; }
+    .card-head.states, .row.states { grid-template-columns: 1fr 56px 56px 56px; }
+    .sort .long { display: none; }
+    .sort .short { display: inline; }
     .card-head.files, .row.files { grid-template-columns: 1fr 56px 56px; }
     .col-wide { display: none; }
     .col-samples { display: none; }
@@ -606,11 +619,26 @@ class IntegrationInsightsPanel extends HTMLElement {
     } else if (action === "copyfinding") {
       this._copyFinding(Number(value), target);
     } else if (action === "show") {
+      // The numbers behind a finding are those of its window
       this._view = target.dataset.view || "cpu";
-      this._subscribe();
-      this._expanded.add(value);
-      this._loadDetail(detailDomain(value));
+      if (this._view === "memory") {
+        this._unsubscribe();
+        this._memExpanded.add(value);
+        if (!this._memory) this._loadMemory(false);
+      } else {
+        if (this._minutes !== FINDINGS_MINUTES) {
+          this._minutes = FINDINGS_MINUTES;
+          this._unsubscribe();
+          this._details.clear();
+        }
+        this._subscribe();
+        this._expanded.add(value);
+        this._loadDetail(detailDomain(value));
+      }
       this._render();
+      const row = this.shadowRoot.querySelector(`.row[data-value="${CSS.escape(value)}"]`);
+      row?.focus();
+      row?.scrollIntoView({ block: "nearest" });
     } else if (action === "navigate") {
       ev.preventDefault();
       history.pushState(null, "", value);
@@ -677,7 +705,7 @@ class IntegrationInsightsPanel extends HTMLElement {
         `Integration: ${finding.name} (${finding.domain})${finding.version ? `, version ${finding.version}` : ""}`
       );
     }
-    lines.push(`Home Assistant ${config.version || "?"}, measured over the last ${FINDINGS_MINUTES} minutes`, "");
+    lines.push(`Home Assistant ${config.version || "?"}`, "");
     lines.push(plainText(finding.description.split("\n\n")[0]));
     if (finding.evidence.length) {
       lines.push("", "Details:", ...finding.evidence.map((line) => `- ${line}`));
@@ -819,15 +847,16 @@ class IntegrationInsightsPanel extends HTMLElement {
 
   _render() {
     const root = this.shadowRoot;
-    const focused = root.activeElement?.closest?.('.row, button[data-action^="sort"]');
-    root.innerHTML = `<style>${STYLE}</style>${this._renderHeader()}<main>${this._renderBody()}</main>`;
-    if (focused) {
+    const focused = root.activeElement?.closest?.("[data-action], summary");
+    let selector;
+    if (focused?.dataset.action) {
       const { action, value } = focused.dataset;
-      const selector = focused.classList.contains("row")
-        ? `.row[data-value="${CSS.escape(value)}"]`
-        : `button[data-action="${CSS.escape(action)}"][data-value="${CSS.escape(value)}"]`;
-      root.querySelector(selector)?.focus();
+      selector = `[data-action="${CSS.escape(action)}"]${value === undefined ? "" : `[data-value="${CSS.escape(value)}"]`}`;
+    } else if (focused?.parentElement?.dataset.stack) {
+      selector = `details[data-stack="${CSS.escape(focused.parentElement.dataset.stack)}"] > summary`;
     }
+    root.innerHTML = `<style>${STYLE}</style>${this._renderHeader()}<main>${this._renderBody()}</main>`;
+    if (selector) root.querySelector(selector)?.focus();
   }
 
   _renderHeader() {
@@ -1014,7 +1043,7 @@ class IntegrationInsightsPanel extends HTMLElement {
       .join("");
     const updated = this._updated ? this._updated.toLocaleTimeString() : "";
     return `${tiles}<div class="card">
-        <div class="card-head states"><div>Integration</div>${this._statesHeader("state_changes_per_min", "Changes")}${this._statesHeader("state_attributes_only_per_min", "Attributes")}${this._statesHeader("state_repeated_per_min", "Repeated")}</div>
+        <div class="card-head states"><div>Integration</div>${this._statesHeader("state_changes_per_min", "Changes|Chg.")}${this._statesHeader("state_attributes_only_per_min", "Attributes|Attr.")}${this._statesHeader("state_repeated_per_min", "Repeated|Rep.")}</div>
         ${rows}
       </div>
       <div class="footer">State writes per minute, counted exactly at the event bus. Changes and attribute-only changes reach the recorder, the dashboard and every automation that watches the entity. Repeated writes do not. Updated ${updated}</div>`;
@@ -1098,7 +1127,7 @@ class IntegrationInsightsPanel extends HTMLElement {
         .map(([key, label]) => {
           const active = sortKey === key;
           const arrow = active ? (ascending ? " ▲" : " ▼") : "";
-          return `<button class="num sort${active ? " active" : ""}" data-action="${action}" data-value="${key}" aria-sort="${active ? (ascending ? "ascending" : "descending") : "none"}">${label}${arrow}</button>`;
+          return `<button class="num sort${active ? " active" : ""}" data-action="${action}" data-value="${key}" aria-sort="${active ? (ascending ? "ascending" : "descending") : "none"}">${sortLabel(label)}${arrow}</button>`;
         })
         .join("");
     const logRows = sorted(logged, this._logsSort, this._logsAscending)
@@ -1116,11 +1145,11 @@ class IntegrationInsightsPanel extends HTMLElement {
     const logs = logged.length
       ? `<div class="card">
         <div class="card-head states"><div>Log</div>${header("sort-logs", this._logsSort, this._logsAscending, [
-          ["log_warnings_per_min", "Warnings"],
-          ["log_errors_per_min", "Errors"],
+          ["log_warnings_per_min", "Warnings|Warn."],
+          ["log_errors_per_min", "Errors|Err."],
           ["log_debug_per_min", "Debug"],
         ])}</div>${logRows}</div>`
-      : `<div class="card"><div class="message">Nothing logged in this window.</div></div>`;
+      : `<div class="card"><div class="message">No warnings, errors or debug lines in this window.</div></div>`;
     const files = saving.length
       ? `<div class="card">
         <div class="card-head files"><div>Saved files</div>${header("sort-files", this._filesSort, this._filesAscending, [
@@ -1160,7 +1189,7 @@ class IntegrationInsightsPanel extends HTMLElement {
   _statesHeader(key, label) {
     const active = this._statesSort === key;
     const arrow = active ? (this._statesAscending ? " ▲" : " ▼") : "";
-    return `<button class="num sort${active ? " active" : ""}" data-action="sort-states" data-value="${key}" aria-sort="${active ? (this._statesAscending ? "ascending" : "descending") : "none"}">${label}${arrow}</button>`;
+    return `<button class="num sort${active ? " active" : ""}" data-action="sort-states" data-value="${key}" aria-sort="${active ? (this._statesAscending ? "ascending" : "descending") : "none"}">${sortLabel(label)}${arrow}</button>`;
   }
 
   _sortHeader(key, label, extra = "") {
@@ -1186,8 +1215,9 @@ class IntegrationInsightsPanel extends HTMLElement {
     }
     const { verdict, findings } = this._findings;
     const worthALook = findings.filter((f) => f.severity !== "info").length;
-    const head =
-      verdict === "ok"
+    const head = findings.some((f) => f.key === "measuring")
+      ? "Still measuring"
+      : verdict === "ok"
         ? `Nothing unusual in the last ${FINDINGS_MINUTES} minutes`
         : verdict === "problem"
         ? `${worthALook} ${worthALook === 1 ? "problem" : "problems"} found`
@@ -1196,12 +1226,13 @@ class IntegrationInsightsPanel extends HTMLElement {
     const banner = `<div class="verdict ${verdict}" role="status">
         <div class="mark" aria-hidden="true">${mark}</div>
         <div><div class="head">${escapeHtml(head)}</div>
-        <div class="sub">Checked: time on the event loop, background threads and jobs, state writes, logs and saved files${this._memory?.memory?.latest ? ", memory snapshots" : ""}.</div></div>
+        <div class="sub">Checked: time on the event loop, background threads and jobs, state writes, logs${this._data?.report?.sampler?.stores_counted === false ? "" : " and saved files"}${this._memory?.memory?.latest ? ", memory snapshots" : ""}.</div></div>
       </div>`;
     const cards = findings
       .map((finding, index) => {
+        const stack = `finding:${finding.key}:${finding.domain || ""}`;
         const evidence = finding.evidence.length
-          ? `<details><summary>Details for developers</summary><ul>${finding.evidence
+          ? `<details data-stack="${escapeHtml(stack)}" ${this._openStacks.has(stack) ? "open" : ""}><summary>Details for developers</summary><ul>${finding.evidence
               .map((line) => `<li>${escapeHtml(line)}</li>`)
               .join("")}</ul></details>`
           : "";

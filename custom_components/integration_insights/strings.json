@@ -2,7 +2,7 @@
   "config": {
     "step": {
       "user": {
-        "description": "Measure how much CPU time, event loop time, memory and state writes each integration uses."
+        "description": "Measure how much CPU time, event loop time, memory, state writes, log records and file saves each integration uses."
       }
     },
     "abort": {
@@ -35,6 +35,10 @@
       "title": "{name} keeps Home Assistant busy",
       "description": "Over the last {minutes} minutes, {name} used the event loop for {ms} ms a minute, {share}% of all CPU time on the event loop. While it runs, everything else waits: automations, the dashboard and other integrations.\n\nWhat you can do:\n- {name} is part of Home Assistant and updates with it. Check whether a newer Home Assistant fixes it.\n- Look for a report, or open one, at [the Home Assistant issue tracker]({issues_url}), and add the report from this page.\n- If {name} is set up on the integrations page, [disable it]({config_url}) for a while and compare."
     },
+    "busy_loop_configured": {
+      "title": "{name} keeps Home Assistant busy",
+      "description": "Over the last {minutes} minutes, {name} used the event loop for {ms} ms a minute, {share}% of all CPU time on the event loop. While it runs, everything else waits: automations, the dashboard and other integrations.\n\nWhat you can do:\n- This work comes from your own configuration of {name}. Check which of its entries runs this often or this long, such as a template, a query or a command."
+    },
     "loop_blocked": {
       "title": "Home Assistant stood still for {ms} ms in {name}",
       "description": "Over the last {minutes} minutes, the event loop stood still for {ms} ms at a stretch. The code running at that moment belonged to {name}, in {function}. While the loop stands still, nothing else in Home Assistant moves: no automation, no dashboard update, no other integration. A stop this long is usually a call that waits on the network or a file without yielding.\n\nWhat you can do:\n- Check whether an update of {name} is available.\n- Look for a report, or open one, at [the issue tracker]({issues_url}), and add the report from this page.\n- If {name} is set up on the integrations page, [disable it]({config_url}) for a while and compare."
@@ -43,17 +47,21 @@
       "title": "Home Assistant stood still for {ms} ms in {name}",
       "description": "Over the last {minutes} minutes, the event loop stood still for {ms} ms at a stretch. The code running at that moment belonged to {name}, in {function}. While the loop stands still, nothing else in Home Assistant moves: no automation, no dashboard update, no other integration. A stop this long is usually a call that waits on the network or a file without yielding.\n\nWhat you can do:\n- {name} is part of Home Assistant and updates with it. Check whether a newer Home Assistant fixes it.\n- Look for a report, or open one, at [the Home Assistant issue tracker]({issues_url}), and add the report from this page.\n- If {name} is set up on the integrations page, [disable it]({config_url}) for a while and compare."
     },
+    "loop_blocked_configured": {
+      "title": "Home Assistant stood still for {ms} ms in {name}",
+      "description": "Over the last {minutes} minutes, the event loop stood still for {ms} ms at a stretch. The code running at that moment belonged to {name}, in {function}. While the loop stands still, nothing else in Home Assistant moves: no automation, no dashboard update, no other integration. A stop this long is usually a call that waits on the network or a file without yielding.\n\nWhat you can do:\n- This work comes from your own configuration of {name}. Check which of its entries runs this often or this long, such as a template, a query or a command."
+    },
     "busy_states": {
       "title": "{name} changes state too often",
       "description": "Over the last {minutes} minutes, {name} changed the state of its entities {per_min} times a minute, {attributes_only} of them only in their attributes. Each change reaches the recorder, which stores a new row, the dashboard and every automation that watches the entity. Devices rarely change that often. This usually means the integration passes on every reading, including attributes such as timestamps or signal strength. Writes that change nothing are cheap and not counted here.\n\nWhat you can do:\n- Check the options of {name} for an update interval.\n- Check whether an update of {name} is available.\n- Look for a report, or open one, at [the issue tracker]({issues_url}), and add the report from this page."
     },
     "busy_states_built_in": {
       "title": "{name} changes state too often",
-      "description": "Over the last {minutes} minutes, {name} changed the state of its entities {per_min} times a minute, {attributes_only} of them only in their attributes. Each change reaches the recorder, which stores a new row, the dashboard and every automation that watches the entity. Devices rarely change that often. This usually means the integration passes on every reading, including attributes such as timestamps or signal strength. Writes that change nothing are cheap and not counted here.\n\nWhat you can do:\n- Check the options of {name} for an update interval.\n- {name} is part of Home Assistant and updates with it. Check whether a newer Home Assistant fixes it.\n- Look for a report, or open one, at [the Home Assistant issue tracker]({issues_url}), and add the report from this page."
+      "description": "Over the last {minutes} minutes, {name} changed the state of its entities {per_min} times a minute, {attributes_only} of them only in their attributes. Each change reaches the recorder, which stores a new row, the dashboard and every automation that watches the entity. Devices rarely change that often. This usually means the integration passes on every reading, including attributes such as timestamps or signal strength. Writes that change nothing are cheap and not counted here.\n\nWhat you can do:\n- If {name} polls, polling can be turned off in its system options. Its entities then update only when an automation asks for it.\n- {name} is part of Home Assistant and updates with it. Check whether a newer Home Assistant fixes it.\n- Look for a report, or open one, at [the Home Assistant issue tracker]({issues_url}), and add the report from this page."
     },
     "busy_states_configured": {
       "title": "{name} changes state too often",
-      "description": "Over the last {minutes} minutes, {name} changed the state of its entities {per_min} times a minute, {attributes_only} of them only in their attributes. Each change reaches the recorder, which stores a new row, the dashboard and every automation that watches the entity. Writes that change nothing are cheap and not counted here.\n\nWhat you can do:\n- These entities come from your own configuration of {name}. Check which states and attributes it sets, and whether they need to change this often."
+      "description": "Over the last {minutes} minutes, {name} changed the state of its entities {per_min} times a minute, {attributes_only} of them only in their attributes. Each change reaches the recorder, which stores a new row, the dashboard and every automation that watches the entity. Writes that change nothing are cheap and not counted here.\n\nWhat you can do:\n- These entities come from your own configuration of {name}. Check what triggers or updates them, and whether they need to change this often."
     },
     "busy_thread": {
       "title": "{name} keeps background threads busy",
@@ -63,13 +71,21 @@
       "title": "{name} keeps background threads busy",
       "description": "Over the last {minutes} minutes, threads of {name} used {ms} ms of CPU a minute. They run beside the event loop, but they cost CPU and power, and that adds up on small hardware.\n\nWhat you can do:\n- {name} is part of Home Assistant and updates with it. Check whether a newer Home Assistant fixes it.\n- Look for a report, or open one, at [the Home Assistant issue tracker]({issues_url}), and add the report from this page."
     },
+    "busy_thread_configured": {
+      "title": "{name} keeps background threads busy",
+      "description": "Over the last {minutes} minutes, threads of {name} used {ms} ms of CPU a minute. They run beside the event loop, but they cost CPU and power, and that adds up on small hardware.\n\nWhat you can do:\n- This work comes from your own configuration of {name}. Check which of its entries runs this often or this long, such as a template, a query or a command."
+    },
     "busy_executor": {
       "title": "{name} keeps handing off work",
       "description": "Over the last {minutes} minutes, {name} ran {jobs} jobs a minute in the background, using {ms} ms of CPU a minute. That many jobs can mean it polls or reads files more often than it needs to.\n\nWhat you can do:\n- Check the options of {name} for an update interval.\n- Check whether an update of {name} is available.\n- Look for a report, or open one, at [the issue tracker]({issues_url}), and add the report from this page."
     },
     "busy_executor_built_in": {
       "title": "{name} keeps handing off work",
-      "description": "Over the last {minutes} minutes, {name} ran {jobs} jobs a minute in the background, using {ms} ms of CPU a minute. That many jobs can mean it polls or reads files more often than it needs to.\n\nWhat you can do:\n- Check the options of {name} for an update interval.\n- {name} is part of Home Assistant and updates with it. Check whether a newer Home Assistant fixes it.\n- Look for a report, or open one, at [the Home Assistant issue tracker]({issues_url}), and add the report from this page."
+      "description": "Over the last {minutes} minutes, {name} ran {jobs} jobs a minute in the background, using {ms} ms of CPU a minute. That many jobs can mean it polls or reads files more often than it needs to.\n\nWhat you can do:\n- If {name} polls, polling can be turned off in its system options. Its entities then update only when an automation asks for it.\n- {name} is part of Home Assistant and updates with it. Check whether a newer Home Assistant fixes it.\n- Look for a report, or open one, at [the Home Assistant issue tracker]({issues_url}), and add the report from this page."
+    },
+    "busy_executor_configured": {
+      "title": "{name} keeps handing off work",
+      "description": "Over the last {minutes} minutes, {name} ran {jobs} jobs a minute in the background, using {ms} ms of CPU a minute. That many jobs can mean it polls or reads files more often than it needs to.\n\nWhat you can do:\n- This work comes from your own configuration of {name}. Check which of its entries runs this often or this long, such as a template, a query or a command."
     },
     "heavy_executor": {
       "title": "{name} does heavy work in the background",
@@ -77,11 +93,15 @@
     },
     "heavy_executor_built_in": {
       "title": "{name} does heavy work in the background",
-      "description": "Over the last {minutes} minutes, background jobs of {name} used {ms} ms of CPU a minute, in {jobs} jobs a minute. They run beside the event loop, but they cost CPU and power, and they take turns with the event loop for Python's interpreter lock.\n\nWhat you can do:\n- Check the options of {name} for an update interval.\n- {name} is part of Home Assistant and updates with it. Check whether a newer Home Assistant fixes it.\n- Look for a report, or open one, at [the Home Assistant issue tracker]({issues_url}), and add the report from this page."
+      "description": "Over the last {minutes} minutes, background jobs of {name} used {ms} ms of CPU a minute, in {jobs} jobs a minute. They run beside the event loop, but they cost CPU and power, and they take turns with the event loop for Python's interpreter lock.\n\nWhat you can do:\n- If {name} polls, polling can be turned off in its system options. Its entities then update only when an automation asks for it.\n- {name} is part of Home Assistant and updates with it. Check whether a newer Home Assistant fixes it.\n- Look for a report, or open one, at [the Home Assistant issue tracker]({issues_url}), and add the report from this page."
+    },
+    "heavy_executor_configured": {
+      "title": "{name} does heavy work in the background",
+      "description": "Over the last {minutes} minutes, background jobs of {name} used {ms} ms of CPU a minute, in {jobs} jobs a minute. They run beside the event loop, but they cost CPU and power, and they take turns with the event loop for Python's interpreter lock.\n\nWhat you can do:\n- This work comes from your own configuration of {name}. Check which of its entries runs this often or this long, such as a template, a query or a command."
     },
     "loop_waits": {
       "title": "The event loop often waits",
-      "description": "Over the last {minutes} minutes, the event loop was busy {ms} ms a minute longer than it used the CPU. It was waiting: on a blocking call such as reading a file or the network, on a busy thread that held Python's interpreter lock, or for a free CPU core. Home Assistant does nothing else while it waits.\n\nWhat you can do:\n- Look in the log for \"Detected blocking call\", which names the integration.\n- In the CPU view, open the integrations at the top. Event loop wall time far above their loop CPU time points to the one that waits."
+      "description": "Over the last {minutes} minutes, the event loop was busy {ms} ms a minute longer than it used the CPU. It was waiting: on a blocking call such as reading a file or the network, on a busy thread that held Python's interpreter lock, or for a free CPU core. Home Assistant does nothing else while it waits.\n\nWhat you can do:\n- Look in the log for \"Detected blocking call\", which names the integration.\n- In the CPU view, open the integrations at the top. Wall time under \"Event loop callbacks\" far above their \"Loop ms/min\" points to the one that waits."
     },
     "growing_resources": {
       "title": "{name} may be leaking",
@@ -117,11 +137,11 @@
     },
     "debug_logging": {
       "title": "Debug logging for {name} is on",
-      "description": "Over the last {minutes} minutes, {name} logged {per_min} debug lines a minute. Debug logging was turned on and left on, and each line is formatted and written to the log.\n\nWhat you can do:\n- When you have what you need, [open {name}]({config_url}) and turn debug logging off.\n- Check the `logger` section of your configuration for a debug level you no longer need."
+      "description": "Over the last {minutes} minutes, {name} logged {per_min} debug lines a minute. Debug logging was turned on and left on, and each line is formatted and written to the log.\n\nWhat you can do:\n- When you have what you need, [open {name}]({config_url}) and turn debug logging off.\n- Check the logger section of your configuration.yaml for a debug level you no longer need."
     },
     "debug_logging_built_in": {
       "title": "Debug logging for {name} is on",
-      "description": "Over the last {minutes} minutes, {name} logged {per_min} debug lines a minute. Debug logging was turned on and left on, and each line is formatted and written to the log.\n\nWhat you can do:\n- When you have what you need, [open {name}]({config_url}) and turn debug logging off.\n- Check the `logger` section of your configuration for a debug level you no longer need."
+      "description": "Over the last {minutes} minutes, {name} logged {per_min} debug lines a minute. Debug logging was turned on and left on, and each line is formatted and written to the log.\n\nWhat you can do:\n- When you have what you need, [open {name}]({config_url}) and turn debug logging off.\n- Check the logger section of your configuration.yaml for a debug level you no longer need."
     },
     "busy_storage": {
       "title": "{name} writes files often",
