@@ -213,7 +213,7 @@ const STYLE = `
     color: var(--secondary-text-color);
     border-bottom: 1px solid var(--divider-color);
   }
-  .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
   button.sort {
     background: none; border: 0; padding: 0; margin: 0; font: inherit; color: inherit;
     text-transform: inherit; letter-spacing: inherit; cursor: pointer; text-align: right;
@@ -409,6 +409,7 @@ const STYLE = `
     .card-head.cpu, .row.cpu { grid-template-columns: 1fr 64px 56px; }
     .card-head.states, .row.states { grid-template-columns: 1fr 48px 48px 48px; gap: 6px; }
     .card-head.files, .row.files { grid-template-columns: 1fr 52px 52px; gap: 6px; }
+    .row.states .num, .row.files .num { font-size: 12px; }
     .col-bg { display: none; }
   }
 `;
@@ -969,8 +970,8 @@ class IntegrationInsightsPanel extends HTMLElement {
         <div class="value">${ms(samplerCost + timingCost + ownWork)} ms/min</div>
         <div class="sub">sampling ${ms(samplerCost)} · timing ${ms(timingCost)} · own work ${ms(ownWork)}</div></div>
       <div class="tile${problems ? " warn" : ""}"><div class="label">Sampler</div>
-        <div class="value">${problems ? `${problems} problems` : "OK"}</div>
-        <div class="sub">lost ${sampler.samples_lost} · errors ${sampler.handler_errors + (sampler.timing_errors || 0)} · slowdowns ${sampler.backoffs}</div></div>
+        <div class="value">${problems ? `${problems.toLocaleString()} problems` : "OK"}</div>
+        <div class="sub">lost ${sampler.samples_lost.toLocaleString()} · errors ${(sampler.handler_errors + (sampler.timing_errors || 0)).toLocaleString()} · slowdowns ${sampler.backoffs.toLocaleString()}</div></div>
     </div>`;
 
     if (!integrations.length) {
@@ -1253,15 +1254,16 @@ class IntegrationInsightsPanel extends HTMLElement {
         : `<div class="message">Loading…</div>`;
     }
     const { verdict, findings } = this._findings;
-    const worthALook = findings.filter((f) => f.severity !== "info").length;
+    const problems = findings.filter((f) => f.severity === "problem").length;
+    const notices = findings.filter((f) => f.severity === "notice").length;
     const measuring = findings.some((f) => f.key === "measuring");
     const head = measuring
       ? "Still measuring"
       : verdict === "ok"
         ? `Nothing unusual in the last ${this._findings.minutes || FINDINGS_MINUTES} minutes`
         : verdict === "problem"
-        ? `${worthALook} ${worthALook === 1 ? "problem" : "problems"} found`
-        : `${worthALook} ${worthALook === 1 ? "thing" : "things"} worth a look`;
+        ? `${problems} ${problems === 1 ? "problem" : "problems"} found${notices ? `, ${notices} more worth a look` : ""}`
+        : `${notices} ${notices === 1 ? "thing" : "things"} worth a look`;
     const parts = ["time on the event loop", "background threads and jobs", "state writes", "logs"];
     if (this._data?.report?.sampler?.stores_counted !== false) parts.push("saved files");
     if (this._memory?.memory?.latest?.previous_taken) parts.push("memory snapshots");

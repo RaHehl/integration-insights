@@ -313,3 +313,32 @@ def test_the_store_wrapper_looks_like_the_original() -> None:
         assert wrapper.__code__ is counter.wrapper_code
     finally:
         counter.uninstall()
+
+
+def test_records_that_cannot_name_their_integration_count_for_core() -> None:
+    """Base platform loggers speak for many integrations, event data for anyone."""
+    cache: dict[str, str] = {}
+    assert logger_domain("homeassistant.components.sensor", {}, cache) == "core"
+    assert (
+        logger_domain("homeassistant.components.light.reproduce_state", {}, cache)
+        == "core"
+    )
+    assert logger_domain("homeassistant.components.recorder", {}, cache) == "recorder"
+    counter = LogCounter()
+    counter.install()
+    try:
+        logging.getLogger(RECORDER_SCHEMA_LOGGER).warning(
+            "Event data for %s exceed maximum size of %s bytes. "
+            "This can cause database performance issues; Event data "
+            "will not be stored",
+            "big_event",
+            32768,
+        )
+    finally:
+        counter.uninstall()
+    rows = {
+        row.domain: row
+        for row in counter.drain(lambda name: logger_domain(name, {}, {}))
+    }
+    assert rows["core"].warning == 1
+    assert "recorder" not in rows

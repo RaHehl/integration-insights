@@ -484,7 +484,11 @@ class Insights:
         self.collector.add_blocks(
             [
                 BlockRecord(
-                    block.blocker[0], block.blocker[1], block.duration_ns, block.at
+                    block.blocker[0],
+                    # Without code on the stack, name the callback that ran
+                    block.blocker[1] or block.callback,
+                    block.duration_ns,
+                    block.at,
                 )
                 for block in self.loop_timing.drain_blocks()
                 if block.blocker is not None

@@ -14,6 +14,7 @@ import threading
 from typing import Any
 import weakref
 
+from homeassistant.const import BASE_PLATFORMS
 from homeassistant.helpers.storage import Store
 
 from .collector import LogCounts, StoreWrites
@@ -33,6 +34,10 @@ os.register_at_fork(after_in_child=_renew_store_locks)
 # entity's integration wrote them, so the warning counts for it
 RECORDER_SCHEMA_LOGGER = "homeassistant.components.recorder.db_schema"
 OVERSIZED_ATTRIBUTES = "State attributes for %s exceed"
+# The recorder's warning about event data too large to store is about
+# whoever fired the event, which it does not name: it counts for core
+OVERSIZED_EVENT = "Event data for %s exceed"
+RECORDER_EVENT_DATA = f"{RECORDER_SCHEMA_LOGGER} (event data)"
 
 
 class LogCounter(logging.Handler):
@@ -85,9 +90,16 @@ class LogCounter(logging.Handler):
             with self._lock:
                 self._oversized[entity_id] = self._oversized.get(entity_id, 0) + 1
             return
+        name = record.name
+        if (
+            name == RECORDER_SCHEMA_LOGGER
+            and isinstance(record.msg, str)
+            and record.msg.startswith(OVERSIZED_EVENT)
+        ):
+            name = RECORDER_EVENT_DATA
         with self._lock:
-            if (row := self._counts.get(record.name)) is None:
-                row = self._counts[record.name] = [0, 0, 0, 0]
+            if (row := self._counts.get(name)) is None:
+                row = self._counts[name] = [0, 0, 0, 0]
             row[slot] += 1
 
     def install(self) -> None:
@@ -138,12 +150,26 @@ class LogCounter(logging.Handler):
 def logger_domain(
     name: str, library_map: Mapping[str, str], cache: dict[str, str]
 ) -> str:
-    """Return the integration a logger belongs to, else core."""
+    """Return the integration a logger belongs to, else core.
+
+    Entity platforms log through the logger of their base platform, such as
+    homeassistant.components.sensor, for whichever integration provides the
+    entities. Those records cannot be told apart by name, so they count for
+    core rather than blaming the sensor platform.
+    """
     if (domain := cache.get(name)) is not None:
         return domain
     parts = name.split(".")
-    if parts[0] == "homeassistant":
-        domain = parts[2] if len(parts) > 2 and parts[1] == "components" else "core"
+    if name == RECORDER_EVENT_DATA:
+        domain = "core"
+    elif parts[0] == "homeassistant":
+        domain = (
+            parts[2]
+            if len(parts) > 2
+            and parts[1] == "components"
+            and parts[2] not in BASE_PLATFORMS
+            else "core"
+        )
     elif parts[0] == "custom_components" and len(parts) > 1:
         domain = parts[1]
     else:

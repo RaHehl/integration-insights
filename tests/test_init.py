@@ -5,6 +5,7 @@ from datetime import timedelta
 import logging
 from pathlib import Path
 import signal
+import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -539,4 +540,23 @@ async def test_attribute_size_is_what_the_recorder_serializes(
     # Saves belong to whoever saves: the wrapper looks like the original and
     # the sampler looks through it
     assert insights.stores.wrapper_code in insights.sampler.skip_codes
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_a_block_without_code_names_its_callback(hass: HomeAssistant) -> None:
+    """When the stack held no code to name, the finding names the callback."""
+    entry = MockConfigEntry(domain=DOMAIN)
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    insights = entry.runtime_data
+    block = SimpleNamespace(
+        at=time.time(),
+        duration_ns=3_000_000_000,
+        callback="custom_components.foo.api.poll",
+        blocker=("foo", ""),
+    )
+    with patch.object(insights.loop_timing, "drain_blocks", return_value=[block]):
+        insights.drain()
+    row = next(i for i in insights.summary()["integrations"] if i["domain"] == "foo")
+    assert row["blocked_function"] == "custom_components.foo.api.poll"
     assert await hass.config_entries.async_unload(entry.entry_id)
