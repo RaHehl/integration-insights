@@ -19,6 +19,7 @@ from homeassistant.const import (
 )
 from homeassistant.core import CALLBACK_TYPE, CoreState, Event, HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.entity import entity_sources
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.json import json_bytes
 from homeassistant.loader import IntegrationNotLoaded, async_get_loaded_integration
@@ -108,6 +109,8 @@ class Insights:
         self._unsub_stop: CALLBACK_TYPE | None = None
         self._unsub_started: CALLBACK_TYPE | None = None
         self._unsub_states: list[CALLBACK_TYPE] = []
+        # Attributes to measure: integration, entity_id, attributes
+        self._pending_attributes: list[tuple[str, str, Any]] = []
         # domain -> [changes, reports, entities], filled by the event filters
         self._state_writes: dict[str, list[Any]] = {}
         self.logs = LogCounter()
@@ -223,29 +226,19 @@ class Insights:
         means no listener job is ever scheduled, so the cost stays at a dict
         update per write.
         """
-        entities = er.async_get(self.hass).entities
-        writes = self._state_writes
         loop = self.hass.loop
-        # entity_id -> integration; the registry lookup is slow for a hot path
-        platforms: dict[str, str | None] = {}
-        # Attributes to measure, by integration and entity
-        pending: list[tuple[str, str, Any]] = []
-
-        def row_of(platform: str) -> list[Any]:
-            if (row := writes.get(platform)) is None:
-                row = writes[platform] = [0, 0, 0, Counter(), 0, Counter()]
-            return row
+        owner = self._entity_owner
+        # entity_id -> integration, cached for the hot path; entities not
+        # known yet are looked up again
+        platforms: dict[str, str] = {}
+        pending = self._pending_attributes
+        row_of = self._state_row
 
         def count(entity_id: str, slot: int) -> str | None:
-            if entity_id in platforms:
-                platform = platforms[entity_id]
-            else:
-                entry = entities.get(entity_id)
-                platform = platforms[entity_id] = (
-                    entry.platform if entry is not None else None
-                )
-            if platform is None:
-                return None
+            if (platform := platforms.get(entity_id)) is None:
+                if (platform := owner(entity_id)) is None:
+                    return None
+                platforms[entity_id] = platform
             row = row_of(platform)
             row[slot] += 1
             if slot != 1:
@@ -253,19 +246,7 @@ class Insights:
                 row[3][entity_id] += 1
             return platform
 
-        def measure() -> None:
-            # A callback of its own, so serializing is the measuring cost and
-            # not part of the callback that wrote the state
-            batch = pending[:]
-            pending.clear()
-            for platform, entity_id, attributes in batch:
-                try:
-                    size = len(json_bytes(attributes))
-                except Exception:  # noqa: BLE001
-                    continue
-                row = row_of(platform)
-                row[4] += size
-                row[5][entity_id] += size
+        measure = self._measure_attributes
 
         @callback
         def changed(data: Any) -> bool:
@@ -311,6 +292,39 @@ class Insights:
                 EVENT_STATE_REPORTED, never, event_filter=reported
             ),
         ]
+
+    def _state_row(self, platform: str) -> list[Any]:
+        if (row := self._state_writes.get(platform)) is None:
+            row = self._state_writes[platform] = [0, 0, 0, Counter(), 0, Counter()]
+        return row
+
+    def _entity_owner(self, entity_id: str) -> str | None:
+        """Return the integration of an entity, with or without a registry entry."""
+        if (source := entity_sources(self.hass).get(entity_id)) is not None:
+            return source["domain"]
+        entry = er.async_get(self.hass).entities.get(entity_id)
+        return entry.platform if entry is not None else None
+
+    def _measure_attributes(self) -> None:
+        """Measure the attributes queued by the state filter.
+
+        A callback of its own, so serializing is the measuring cost and not
+        part of the callback that wrote the state. A drain runs it first, so
+        sizes land in the same minute as their writes.
+        """
+        pending = self._pending_attributes
+        if not pending:
+            return
+        batch = pending[:]
+        pending.clear()
+        for platform, entity_id, attributes in batch:
+            try:
+                size = len(json_bytes(attributes))
+            except Exception:  # noqa: BLE001
+                continue
+            row = self._state_row(platform)
+            row[4] += size
+            row[5][entity_id] += size
 
     def _hook_wakeup_reads(self) -> None:
         # asyncio's selector loop hands the bytes it read from the wakeup
@@ -375,6 +389,7 @@ class Insights:
         """Move new samples, jobs and loop wall time into the collector."""
         records, self._position = self.sampler.drain(self._position)
         now = time.monotonic()
+        self._measure_attributes()
         self.collector.add(records, now)
         self.collector.add_jobs(self.background.drain_jobs(), now)
         if writes := self._state_writes:
@@ -393,16 +408,10 @@ class Insights:
         if library_map is not self._logger_map or len(logger_domains) > 5_000:
             logger_domains.clear()
             self._logger_map = library_map
-        entities = er.async_get(self.hass).entities
-
-        def entity_owner(entity_id: str) -> str | None:
-            entry = entities.get(entity_id)
-            return entry.platform if entry is not None else None
-
         self.collector.add_logs(
             self.logs.drain(
                 lambda name: logger_domain(name, library_map, logger_domains),
-                entity_owner,
+                self._entity_owner,
             ),
             now,
         )

@@ -7,6 +7,7 @@ mapped to integrations on the loop.
 
 from collections import Counter
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 import logging
 import threading
 from typing import Any
@@ -35,6 +36,15 @@ class LogCounter(logging.Handler):
         self._oversized: dict[str, int] = {}
         self._installed = False
 
+    def handle(self, record: logging.LogRecord) -> bool:
+        """Count without the handler lock: emit takes its own, shorter one."""
+        if not (result := self.filter(record)):
+            return False
+        # Never break the logging call, and never log about it
+        with suppress(Exception):
+            self.emit(result if isinstance(result, logging.LogRecord) else record)
+        return True
+
     def emit(self, record: logging.LogRecord) -> None:
         """Count the record; it is never formatted or written here."""
         level = record.levelno
@@ -62,9 +72,6 @@ class LogCounter(logging.Handler):
             if (row := self._counts.get(record.name)) is None:
                 row = self._counts[record.name] = [0, 0, 0, 0]
             row[slot] += 1
-
-    def handleError(self, record: logging.LogRecord) -> None:
-        """Never report on ourselves: that would log again."""
 
     def install(self) -> None:
         """Attach to the root logger."""

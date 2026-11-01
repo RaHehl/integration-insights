@@ -2,6 +2,7 @@
 
 from asyncio.events import Handle
 from datetime import timedelta
+import logging
 from pathlib import Path
 import signal
 from types import SimpleNamespace
@@ -411,4 +412,54 @@ async def test_library_map_waits_until_the_integrations_hold_still(
         insights._async_drain()  # noqa: SLF001
         await hass.async_block_till_done()
         assert update.call_count == 1
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_entities_without_a_registry_entry_count_for_their_integration(
+    hass: HomeAssistant,
+) -> None:
+    """A YAML template sensor has no unique ID and still belongs to template."""
+    entry = MockConfigEntry(domain=DOMAIN)
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    insights = entry.runtime_data
+    assert await async_setup_component(
+        hass,
+        "template",
+        {
+            "template": [
+                {
+                    "sensor": [
+                        {
+                            "name": "big",
+                            "state": "{{ states('input_number.n') }}",
+                            "attributes": {"blob": "{{ 'x' * 20000 }}"},
+                        }
+                    ]
+                }
+            ]
+        },
+    )
+    await hass.async_block_till_done()
+    assert er.async_get(hass).async_get("sensor.big") is None
+    hass.states.async_set("input_number.n", "1")
+    await hass.async_block_till_done()
+    hass.states.async_set("input_number.n", "2")
+    # A drain measures what is queued, so sizes land with their writes
+    insights.drain()
+    logging.getLogger("homeassistant.components.recorder.db_schema").warning(
+        "State attributes for %s exceed maximum size of %s bytes. "
+        "This can cause database performance issues; Attributes "
+        "will not be stored",
+        "sensor.big",
+        16384,
+    )
+    report = insights.report()
+    row = next(item for item in report["integrations"] if item["domain"] == "template")
+    assert row["state_writes"]["changes_per_min"] > 0
+    assert row["state_writes"]["attribute_entities"]["sensor.big"] > 0
+    assert row["logs"]["loggers"] == {
+        "homeassistant.components.recorder.db_schema": row["logs"]["warnings_per_min"]
+    }
+    assert "recorder" not in {item["domain"] for item in report["integrations"]}
     assert await hass.config_entries.async_unload(entry.entry_id)

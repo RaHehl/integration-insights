@@ -401,7 +401,7 @@ def _output_findings(
                 domain,
                 {
                     "per_min": _rate(store_writes),
-                    "kib": _number(item.get("store_kib_per_min", 0)),
+                    "kib": _rate(item.get("store_kib_per_min", 0)),
                     "minutes": minutes,
                 },
                 [

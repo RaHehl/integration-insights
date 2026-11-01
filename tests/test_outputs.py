@@ -213,3 +213,22 @@ async def test_measuring_starts_on_a_store_it_cannot_count(
     assert entry.runtime_data.sampler.installed
     assert entry.runtime_data.summary()["sampler"]["stores_counted"] is False
     assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+def test_counting_never_breaks_a_logging_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failure while counting is swallowed, the record still reaches others."""
+    counter = LogCounter()
+
+    def broken(record: logging.LogRecord) -> None:
+        raise RuntimeError("counting failed")
+
+    monkeypatch.setattr(counter, "emit", broken)
+    counter.install()
+    logger = logging.getLogger("custom_components.chatty.api")
+    try:
+        assert counter.handle(
+            logger.makeRecord(logger.name, logging.ERROR, "f", 1, "x", None, None)
+        )
+        logger.error("still logged")
+    finally:
+        counter.uninstall()
