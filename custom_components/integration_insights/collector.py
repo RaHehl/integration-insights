@@ -842,8 +842,10 @@ def _item(domain: str, stats: _Domain, span: float) -> dict[str, Any]:
             "cpu_ms_per_min": per_minute(stats.thread_cpu_ns),
             "by_name": top(stats.threads, TOP_THREADS),
         }
-    if stats.state_changes or stats.state_reports or stats.state_attributes_only:
-        writes = stats.state_changes + stats.state_reports + stats.state_attributes_only
+    writes = stats.state_changes + stats.state_reports + stats.state_attributes_only
+    # Attributes are measured after the write, so a window can hold their
+    # size without the write itself
+    if writes or stats.attribute_bytes:
         item["state_writes"] = {
             "per_min": round(writes / span, 1),
             "changes_per_min": round(stats.state_changes / span, 1),
@@ -857,7 +859,7 @@ def _item(domain: str, stats: _Domain, span: float) -> dict[str, Any]:
             },
         }
     if stats.attribute_bytes:
-        item.setdefault("state_writes", {})["attribute_kib_per_min"] = round(
+        item["state_writes"]["attribute_kib_per_min"] = round(
             stats.attribute_bytes / 1024 / span, 1
         )
         item["state_writes"]["attribute_entities"] = {

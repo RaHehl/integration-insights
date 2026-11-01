@@ -16,11 +16,11 @@ Finds the integration that slows Home Assistant down, keeps the CPU busy, or lea
 - Integrations that hand a lot of work to the executor, usually polling more often than needed.
 - The event loop standing still for seconds, named by the integration and function that ran at that moment, the first time it happens.
 - An integration that changes the state or attributes of its entities many times a second. Each change is recorded and reaches the dashboard and every automation that watches the entity.
-- Entities whose attributes change by a lot of data. Each change is serialized for the recorder and sent to the dashboard. Above 16 KiB the recorder does not store them and logs a warning for every change instead.
+- Entities whose attributes change by a lot of data. The recorder serializes them again for every change, and open dashboards receive what changed. Above 16 KiB the recorder does not store them and logs a warning for every change instead.
 - An integration that logs many warnings or errors, or has debug logging left on.
 - An integration that saves its files every few seconds, which wears out the SD card of a Raspberry Pi.
 - An event loop that often waits, usually on a blocking call.
-- Listeners, timers and tasks that pile up between two memory snapshots, a sign of a leak.
+- Listeners, dispatcher connections, timers and tasks that pile up between two memory snapshots, a sign of a leak.
 
 Each finding says what it means and what you can do: check for an update, look at the integration's issue tracker, or disable it for a while to compare. One button copies a report to paste into an issue.
 
@@ -34,13 +34,13 @@ Measuring begins once Home Assistant has started, so the set-up of integrations 
 
 A sidebar entry "Integration Insights" appears for admins.
 
-Needs Home Assistant OS or the container image on 64-bit Linux.
+Needs Home Assistant on 64-bit Linux, such as Home Assistant OS or the container image.
 
 ## Views
 
 The overview lists the findings. The other views show the numbers behind them.
 
-| CPU | Memory | State writes |
+| CPU | Memory | States |
 |---|---|---|
 | ![CPU view with one integration opened](https://raw.githubusercontent.com/RaHehl/integration-insights/main/docs/cpu.png) | ![Memory view after a snapshot](https://raw.githubusercontent.com/RaHehl/integration-insights/main/docs/memory.png) | ![State writes per integration](https://raw.githubusercontent.com/RaHehl/integration-insights/main/docs/states.png) |
 
@@ -66,7 +66,7 @@ The Memory view walks the Python heap on request and splits it by integration, l
 - A timer on the event loop thread's CPU clock samples the stack while the loop is busy, about every 10 ms of loop CPU. When the loop is idle, it does not fire. This is what names the lines inside a callback.
 - A sample goes to the integration whose code runs. Code in an entity platform base class goes to the integration that owns the entity. A library that only one loaded integration requires goes to that integration. Core and shared library code with no integration on the stack, such as aiohttp parsing a response, goes to the config entry whose context it runs in, which Home Assistant sets while an entry is set up and every task and connection started from there inherits.
 - A finalizer running inside the garbage collector is charged to the owner of the object being destroyed, not to whoever allocated enough to trigger the collection.
-- State writes are counted per integration in the bus event filters, at the cost of one dictionary update per write. A write is a change, a change of attributes only, or a repeat that changes nothing. Repeats are cheap: Home Assistant only moves the last reported time.
+- State writes are counted per integration in the bus event filters, at the cost of one dictionary update per write. A write is a change, a change of attributes only, or a repeat that changes nothing. Repeats are cheap: Home Assistant only moves the last reported time and fires `state_reported`.
 - The size of attributes is measured only when they change. Home Assistant keeps the old attributes object when nothing in it changed, so unchanged writes cost nothing. The measuring runs in a callback of its own, so it counts as measuring cost and not as the integration's.
 - Log records are counted by a handler on the root logger, by logger and level. They are not formatted or written a second time. The recorder's warning about attributes too large to store counts for the integration of the entity.
 - Files saved through Home Assistant's storage helper are counted with their size, by storage key.

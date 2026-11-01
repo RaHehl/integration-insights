@@ -20,6 +20,7 @@ from .memory import SnapshotRefused
 
 MINUTES = vol.All(int, vol.Range(min=1, max=WINDOW_MINUTES))
 _PLACEHOLDER = re.compile(r"\{(\w+)\}")
+_EMPTY_LINK = re.compile(r"\[([^\]]*)\]\(\)")
 
 
 @callback
@@ -275,10 +276,12 @@ def _render(
         elif about["built_in"] and f"{_prefix(key)}_built_in.title" in translations:
             key = f"{key}_built_in"
     for part in ("title", "description"):
-        item[part] = _PLACEHOLDER.sub(
+        text = _PLACEHOLDER.sub(
             lambda match: values.get(match.group(1), match.group(0)),
             translations.get(f"{_prefix(key)}.{part}", ""),
         )
+        # An integration without an issue tracker leaves a link to nowhere
+        item[part] = _EMPTY_LINK.sub(r"\1", text)
     return item
 
 

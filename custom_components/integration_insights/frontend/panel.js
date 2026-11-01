@@ -60,6 +60,15 @@ const rate = (value) => (value ? amount(value) : "");
 // The Logs view keeps its rows open apart from the other views: "logs:hue"
 const detailDomain = (key) => key.slice(key.indexOf(":") + 1);
 
+// Where "Show details" of a finding leads: the view and the row key prefix
+const FINDING_VIEWS = {
+  busy_states: ["states", ""],
+  big_attributes: ["states", ""],
+  noisy_logs: ["logs", "logs:"],
+  debug_logging: ["logs", "logs:"],
+  busy_storage: ["logs", "files:"],
+};
+
 // ms of CPU per minute as percent of one core
 const corePercent = (value) => {
   const percent = value / 600;
@@ -196,6 +205,7 @@ const STYLE = `
   button.sort.active { color: var(--primary-text-color); }
   .card-head.mem, .row.mem { grid-template-columns: 1fr 100px 100px 84px 70px 60px; }
   .card-head.states, .row.states { grid-template-columns: 1fr 110px 110px 90px; }
+  .card-head.files, .row.files { grid-template-columns: 1fr 110px 110px; }
   .delta { display: block; font-size: 12px; color: var(--secondary-text-color); }
   .delta.up { color: var(--error-color, #db4437); }
   .delta.down { color: var(--success-color, #43a047); }
@@ -219,7 +229,14 @@ const STYLE = `
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  .name .domain { font-size: 12px; color: var(--secondary-text-color); font-family: var(--ii-mono); }
+  .name .domain {
+    font-size: 12px;
+    color: var(--secondary-text-color);
+    font-family: var(--ii-mono);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
   .chev { flex: none; width: 16px; transition: transform 0.15s; color: var(--secondary-text-color); }
   .row[aria-expanded="true"] .chev { transform: rotate(90deg); }
   .bar {
@@ -281,6 +298,7 @@ const STYLE = `
     overflow-wrap: anywhere;
   }
   .actions { display: flex; gap: 8px; margin-top: 16px; }
+  .actions.snapshot { justify-content: center; margin: 0; padding: 0 16px 24px; }
   .action {
     padding: 6px 14px;
     border: 1px solid var(--primary-color);
@@ -347,7 +365,8 @@ const STYLE = `
     main { padding: 12px; }
     .card-head, .row { grid-template-columns: 1fr 64px 76px 56px; gap: 8px; }
     .card-head.mem, .row.mem { grid-template-columns: 1fr 64px 64px 56px; }
-    .card-head.states, .row.states { grid-template-columns: 1fr 76px 76px 56px; }
+    .card-head.states, .row.states { grid-template-columns: 1fr 56px 56px 48px; }
+    .card-head.files, .row.files { grid-template-columns: 1fr 56px 56px; }
     .col-wide { display: none; }
     .col-samples { display: none; }
     .detail { padding-left: 16px; }
@@ -587,9 +606,10 @@ class IntegrationInsightsPanel extends HTMLElement {
     } else if (action === "copyfinding") {
       this._copyFinding(Number(value), target);
     } else if (action === "show") {
-      this._view = "cpu";
+      this._view = target.dataset.view || "cpu";
+      this._subscribe();
       this._expanded.add(value);
-      this._loadDetail(value);
+      this._loadDetail(detailDomain(value));
       this._render();
     } else if (action === "navigate") {
       ev.preventDefault();
@@ -799,10 +819,14 @@ class IntegrationInsightsPanel extends HTMLElement {
 
   _render() {
     const root = this.shadowRoot;
-    const focusedRow = root.activeElement?.closest?.(".row")?.dataset.value;
+    const focused = root.activeElement?.closest?.('.row, button[data-action^="sort"]');
     root.innerHTML = `<style>${STYLE}</style>${this._renderHeader()}<main>${this._renderBody()}</main>`;
-    if (focusedRow) {
-      root.querySelector(`.row[data-value="${CSS.escape(focusedRow)}"]`)?.focus();
+    if (focused) {
+      const { action, value } = focused.dataset;
+      const selector = focused.classList.contains("row")
+        ? `.row[data-value="${CSS.escape(value)}"]`
+        : `button[data-action="${CSS.escape(action)}"][data-value="${CSS.escape(value)}"]`;
+      root.querySelector(selector)?.focus();
     }
   }
 
@@ -955,7 +979,7 @@ class IntegrationInsightsPanel extends HTMLElement {
         <div class="sub">same state, other attributes. Costs as much as a change</div></div>
       <div class="tile"><div class="label">Repeated</div>
         <div class="value">${ms(repeated)} per min</div>
-        <div class="sub">nothing changed. Cheap, only the last reported time moves</div></div>
+        <div class="sub">nothing changed. Cheap, only the last reported time moves and state_reported fires</div></div>
       <div class="tile"><div class="label">Changed attributes</div>
         <div class="value">${ms(attributeKib)} KiB per min</div>
         <div class="sub">serialized for the recorder and sent to dashboards on each change</div></div>
@@ -1060,7 +1084,7 @@ class IntegrationInsightsPanel extends HTMLElement {
       const key = `${table}:${item.domain}`;
       const expanded = this._expanded.has(key);
       const name = this._data.names[item.domain] || item.domain;
-      return `<div class="row states" data-action="toggle" data-value="${escapeHtml(key)}" role="button" tabindex="0" aria-expanded="${expanded}">
+      return `<div class="row ${table === "files" ? "files" : "states"}" data-action="toggle" data-value="${escapeHtml(key)}" role="button" tabindex="0" aria-expanded="${expanded}">
           <div class="name">
             <div class="title"><svg class="chev" viewBox="0 0 24 24"><path fill="currentColor" d="M8.59,16.58L13.17,12L8.59,7.41L10,6L16,12L10,18L8.59,16.58Z"></path></svg>
               <span>${escapeHtml(name)}</span></div>
@@ -1087,7 +1111,7 @@ class IntegrationInsightsPanel extends HTMLElement {
       )
       .join("");
     const fileRows = sorted(saving, this._filesSort, this._filesAscending)
-      .map((item) => row("files", item, [rate(item.store_writes_per_min), amount(item.store_kib_per_min || 0), ""]))
+      .map((item) => row("files", item, [rate(item.store_writes_per_min), amount(item.store_kib_per_min || 0)]))
       .join("");
     const logs = logged.length
       ? `<div class="card">
@@ -1099,10 +1123,10 @@ class IntegrationInsightsPanel extends HTMLElement {
       : `<div class="card"><div class="message">Nothing logged in this window.</div></div>`;
     const files = saving.length
       ? `<div class="card">
-        <div class="card-head states"><div>Saved files</div>${header("sort-files", this._filesSort, this._filesAscending, [
+        <div class="card-head files"><div>Saved files</div>${header("sort-files", this._filesSort, this._filesAscending, [
           ["store_writes_per_min", "Saves"],
           ["store_kib_per_min", "KiB"],
-        ])}<div></div></div>${fileRows}</div>`
+        ])}</div>${fileRows}</div>`
       : `<div class="card"><div class="message">${
           storesCounted
             ? "No files saved in this window."
@@ -1172,7 +1196,7 @@ class IntegrationInsightsPanel extends HTMLElement {
     const banner = `<div class="verdict ${verdict}" role="status">
         <div class="mark" aria-hidden="true">${mark}</div>
         <div><div class="head">${escapeHtml(head)}</div>
-        <div class="sub">Checked: time on the event loop, background threads and jobs${this._memory?.memory?.latest ? ", memory snapshots" : ""}.</div></div>
+        <div class="sub">Checked: time on the event loop, background threads and jobs, state writes, logs and saved files${this._memory?.memory?.latest ? ", memory snapshots" : ""}.</div></div>
       </div>`;
     const cards = findings
       .map((finding, index) => {
@@ -1184,7 +1208,7 @@ class IntegrationInsightsPanel extends HTMLElement {
         const actions = finding.domain
           ? `<div class="actions">
               <button data-action="copyfinding" data-value="${index}">Copy report for the developer</button>
-              <button data-action="show" data-value="${escapeHtml(finding.domain)}">Show details</button>
+              <button data-action="show" data-view="${FINDING_VIEWS[finding.key]?.[0] || "cpu"}" data-value="${escapeHtml(`${FINDING_VIEWS[finding.key]?.[1] || ""}${finding.domain}`)}">Show details</button>
             </div>`
           : "";
         return `<section class="finding ${escapeHtml(finding.severity)}">
@@ -1196,7 +1220,7 @@ class IntegrationInsightsPanel extends HTMLElement {
       .join("");
     const error = this._error ? `<div class="message error">${escapeHtml(this._error)}</div>` : "";
     return `${error}${banner}${cards}
-      <div class="footer">Findings use the same numbers as the CPU and Memory views. A snapshot under Memory adds checks for leaks.</div>`;
+      <div class="footer">Findings use the same numbers as the other views. A snapshot under Memory adds checks for leaks.</div>`;
   }
 
   _renderMemory() {
@@ -1205,7 +1229,7 @@ class IntegrationInsightsPanel extends HTMLElement {
     const latest = this._memory.memory.latest;
     if (!latest) {
       return `${error}<div class="card"><div class="message">No snapshot yet. A snapshot walks the Python heap once and splits it into what each integration holds, its code and the parts of Home Assistant core. Take two some time apart to see what grows.</div>
-        <div class="actions"><button class="action" data-action="snapshot" ${this._snapshotting ? "disabled" : ""}>${this._snapshotting ? "Taking snapshot…" : "Take snapshot"}</button></div></div>`;
+        <div class="actions snapshot"><button class="action" data-action="snapshot" ${this._snapshotting ? "disabled" : ""}>${this._snapshotting ? "Taking snapshot…" : "Take snapshot"}</button></div></div>`;
     }
     const delta = (value, unit = "") => {
       if (value === undefined || value === null || value === 0) return "";

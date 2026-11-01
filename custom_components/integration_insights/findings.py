@@ -50,7 +50,8 @@ ATTRIBUTES_PROBLEM_KIB = 1_000
 LOG_NOTICE_PER_MIN = 10
 LOG_PROBLEM_PER_MIN = 100
 # Debug lines per minute: debug logging that was left on. Info lines do not
-# count, Home Assistant logs them by default.
+# count: the root level is WARNING, so they only appear where a level was set
+# on purpose.
 DEBUG_NOTICE_PER_MIN = 300
 # Files written through the storage helper per minute. Each write replaces a
 # whole file, which wears out the SD card of a Raspberry Pi.
@@ -66,8 +67,8 @@ RESOURCES = ("listeners", "dispatcher", "timers", "tasks")
 # Built-in integrations run reviewed background work by design, such as the
 # recorder writing to its database, so only a lot of it is worth a word.
 BUILT_IN_BACKGROUND_FACTOR = 5
-# Built-in integrations that run what a user configured: their attributes and
-# log messages come from that configuration, not from the integration.
+# Built-in integrations that run what a user configured: their states,
+# attributes and log messages come from that configuration.
 USER_CONFIGURED = frozenset(
     {"automation", "command_line", "rest", "scrape", "script", "sql", "template"}
 )
@@ -201,7 +202,7 @@ def _cpu_findings(
         and background < background_notice * HOLD
         and item.get("jobs_per_min", 0) < JOBS_NOTICE_PER_MIN * factor * HOLD
         and blocked < LOOP_BLOCK_NOTICE_MS * HOLD
-        and writes < STATE_WRITES_NOTICE_PER_MIN * factor * HOLD
+        and writes < STATE_WRITES_NOTICE_PER_MIN * output_factor * HOLD
         and attribute_kib < ATTRIBUTES_NOTICE_KIB * output_factor * HOLD
         and log_warnings < LOG_NOTICE_PER_MIN * HOLD
         and log_debug < DEBUG_NOTICE_PER_MIN * HOLD
@@ -211,13 +212,18 @@ def _cpu_findings(
     if (info := detail(domain)) is None:
         return []
     findings = []
-    if writes >= STATE_WRITES_NOTICE_PER_MIN * factor * hold("busy_states", domain):
+    if writes >= STATE_WRITES_NOTICE_PER_MIN * output_factor * hold(
+        "busy_states", domain
+    ):
         states = info.get("state_writes", {})
         findings.append(
             Finding(
                 "busy_states",
                 hold.severity(
-                    "busy_states", domain, writes, STATE_WRITES_PROBLEM_PER_MIN * factor
+                    "busy_states",
+                    domain,
+                    writes,
+                    STATE_WRITES_PROBLEM_PER_MIN * output_factor,
                 ),
                 domain,
                 {

@@ -297,8 +297,33 @@ async def test_findings_are_rendered_with_where_to_act(
         await client.send_json_auto_id({"type": f"{DOMAIN}/findings", "language": "en"})
         (item,) = (await client.receive_json())["result"]["findings"]
     assert item["title"] == "Automation logs many warnings"
-    assert "what you configured in Automation" in item["description"]
+    assert "your own configuration of Automation" in item["description"]
     assert "newer Home Assistant" not in item["description"]
+
+    # Without an issue tracker or documentation the link text stays, no link
+    nowhere = SimpleNamespace(
+        name="Foo",
+        is_built_in=False,
+        version="1",
+        issue_tracker=None,
+        documentation=None,
+    )
+    with (
+        patch(
+            "custom_components.integration_insights.insights.Insights.findings",
+            return_value=[
+                Finding("busy_thread", NOTICE, "foo", {"ms": "510", "minutes": "15"})
+            ],
+        ),
+        patch(
+            "custom_components.integration_insights.websocket.async_get_loaded_integration",
+            return_value=nowhere,
+        ),
+    ):
+        await client.send_json_auto_id({"type": f"{DOMAIN}/findings", "language": "en"})
+        (item,) = (await client.receive_json())["result"]["findings"]
+    assert "]()" not in item["description"]
+    assert "at the issue tracker" in item["description"]
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 
@@ -609,6 +634,10 @@ def test_configured_integrations_have_no_built_in_allowance() -> None:
         find(_summary([{**item, "domain": "recorder"}]), lambda _: detail, {}, built_in)
         == []
     )
+    writes = {**_item("template"), "state_changes_per_min": 700}
+    assert _keys(find(_summary([writes]), lambda _: _detail(), {}, built_in)) == [
+        ("busy_states", NOTICE, "template")
+    ]
 
 
 def test_frequent_storage_writes_are_found() -> None:
