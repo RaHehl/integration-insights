@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.integration_insights import outputs
 from custom_components.integration_insights.const import DOMAIN
 from custom_components.integration_insights.outputs import (
     RECORDER_SCHEMA_LOGGER,
@@ -286,3 +287,28 @@ def test_a_record_logged_while_counting_does_not_deadlock() -> None:
     assert not thread.is_alive()
     (row,) = counter.drain(lambda name: "chatty")
     assert row.error == 1
+
+
+def test_counter_locks_are_renewed_in_a_forked_child() -> None:
+    """A lock held at fork time would hang the child on its first count."""
+    logs = LogCounter()
+    assert logs._lock is logs.lock  # noqa: SLF001
+    stores = StoreCounter()
+    before = stores._lock  # noqa: SLF001
+    outputs._renew_store_locks()  # noqa: SLF001
+    assert stores._lock is not before  # noqa: SLF001
+
+
+def test_the_store_wrapper_looks_like_the_original() -> None:
+    """Executor jobs of a save are charged by the callable's module."""
+    original = getattr(Store, SAVE_STEP)
+    counter = StoreCounter()
+    counter.install()
+    try:
+        wrapper = getattr(Store, SAVE_STEP)
+        assert wrapper is not original
+        assert wrapper.__module__ == original.__module__
+        assert wrapper.__qualname__ == original.__qualname__
+        assert wrapper.__code__ is counter.wrapper_code
+    finally:
+        counter.uninstall()

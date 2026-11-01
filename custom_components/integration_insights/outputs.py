@@ -8,15 +8,28 @@ mapped to integrations on the loop.
 from collections import Counter
 from collections.abc import Callable, Mapping
 from contextlib import suppress
+import functools
 import logging
+import os
 import threading
 from typing import Any
+import weakref
 
 from homeassistant.helpers.storage import Store
 
 from .collector import LogCounts, StoreWrites
 
 DEBUG, INFO, WARNING, ERROR = 0, 1, 2, 3
+# Store counters whose lock a forked child must not inherit held
+_STORE_COUNTERS: weakref.WeakSet[StoreCounter] = weakref.WeakSet()
+
+
+def _renew_store_locks() -> None:
+    for counter in _STORE_COUNTERS:
+        counter._lock = threading.RLock()  # noqa: SLF001
+
+
+os.register_at_fork(after_in_child=_renew_store_locks)
 # The recorder warns for every state whose attributes it will not store; the
 # entity's integration wrote them, so the warning counts for it
 RECORDER_SCHEMA_LOGGER = "homeassistant.components.recorder.db_schema"
@@ -29,9 +42,9 @@ class LogCounter(logging.Handler):
     def __init__(self) -> None:
         """Initialize; install() attaches the handler."""
         super().__init__(logging.NOTSET)
-        # Reentrant: a finalizer that logs can run inside emit on the same
-        # thread, during garbage collection or a signal handler
-        self._lock = threading.RLock()
+        # logging's own handler lock: reentrant, since a finalizer that logs
+        # can run inside emit on the same thread, and renewed after a fork
+        self._lock = self.lock or threading.RLock()
         # logger name -> [debug, info, warning, error and up]
         self._counts: dict[str, list[int]] = {}
         # entity_id -> recorder warnings about its attributes
@@ -150,6 +163,8 @@ class StoreCounter:
         self._wrapper: Callable[..., Any] | None = None
         self._name = ""
         self._active = [False]
+        self.wrapper_code: Any = None
+        _STORE_COUNTERS.add(self)
 
     def install(self) -> bool:
         """Wrap the step every save goes through; return whether one was found.
@@ -161,14 +176,14 @@ class StoreCounter:
         if self._wrapper is not None:
             return True
         counts = self._counts_ref
-        lock = self._lock
         active = self._active = [True]
+        counter = self
 
         def note(store: Any, prepared: Any) -> None:
             try:
                 # Characters of a str: json.dumps escapes everything else
                 size = len(prepared[1])
-                with lock:
+                with counter._lock:
                     table = counts[0]
                     if (row := table.get(store.key)) is None:
                         row = table[store.key] = [0, 0]
@@ -206,6 +221,10 @@ class StoreCounter:
         else:
             active[0] = False
             return False
+        # Executor jobs and samples of a save belong to whoever saves, not to
+        # us: the wrapper takes the original's name and the sampler skips it
+        functools.update_wrapper(wrapper, original)
+        self.wrapper_code = wrapper.__code__
         self._name = name
         self._original = original
         self._wrapper = wrapper

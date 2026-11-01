@@ -72,6 +72,8 @@ MAX_CACHED_ENTITIES = 50_000
 RECORDED_WITH_MATCH_ALL = frozenset(
     {"device_class", "friendly_name", "state_class", "unit_of_measurement"}
 )
+# What the recorder never keeps
+NEVER_RECORDED = frozenset({"attribution", "restored", "supported_features"})
 KEPT_SNAPSHOTS = 10
 # Left out of findings after a start.
 STARTUP_MINUTES = 5
@@ -185,7 +187,11 @@ class Insights:
         if not self.stores.install():
             _LOGGER.debug("This Home Assistant saves files in a way not counted here")
         self.sampler.skip_codes = frozenset(
-            {self.loop_timing.wrapper_code, *self.background.wrapper_codes}
+            {
+                self.loop_timing.wrapper_code,
+                *self.background.wrapper_codes,
+                *([self.stores.wrapper_code] if self.stores.wrapper_code else []),
+            }
         )
         self._listen_state_writes()
         self._wall_ns = time.perf_counter_ns()
@@ -350,6 +356,8 @@ class Insights:
         pending.clear()
         recorder = self.hass.data.get(RECORDER)
         included = getattr(recorder, "entity_filter", None)
+        if EVENT_STATE_CHANGED in (getattr(recorder, "exclude_event_types", ()) or ()):
+            return
         for platform, entity_id, state in batch:
             try:
                 # What the recorder serializes: nothing of an entity it
@@ -358,14 +366,20 @@ class Insights:
                 if included is not None and not included(entity_id):
                     continue
                 attributes = state.attributes
-                if (info := state.state_info) and (
-                    unrecorded := info["unrecorded_attributes"]
-                ):
-                    keep = RECORDED_WITH_MATCH_ALL if MATCH_ALL in unrecorded else None
+                unrecorded = NEVER_RECORDED
+                if (info := state.state_info) and info["unrecorded_attributes"]:
+                    unrecorded = unrecorded | info["unrecorded_attributes"]
+                if MATCH_ALL in unrecorded:
                     attributes = {
                         key: value
                         for key, value in attributes.items()
-                        if (key in keep if keep is not None else key not in unrecorded)
+                        if key in RECORDED_WITH_MATCH_ALL
+                    }
+                elif not unrecorded.isdisjoint(attributes):
+                    attributes = {
+                        key: value
+                        for key, value in attributes.items()
+                        if key not in unrecorded
                     }
                 size = len(json_bytes(attributes))
             except Exception:  # noqa: BLE001

@@ -234,6 +234,8 @@ async def websocket_findings(
     if (insights := _insights(hass, connection, msg["id"])) is None:
         return
     findings = insights.findings(msg["minutes"])
+    # Read before the await: another request may judge another window
+    minutes = insights.findings_minutes
     translations = await async_get_translations(
         hass, msg.get("language") or hass.config.language, "issues", {DOMAIN}
     )
@@ -241,7 +243,7 @@ async def websocket_findings(
         msg["id"],
         {
             "verdict": verdict(findings),
-            "minutes": insights.findings_minutes,
+            "minutes": minutes,
             "findings": [_render(hass, finding, translations) for finding in findings],
         },
     )

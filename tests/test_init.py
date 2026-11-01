@@ -511,21 +511,31 @@ async def test_attribute_size_is_what_the_recorder_serializes(
     registry = er.async_get(hass)
     kept = registry.async_get_or_create("sensor", "solar", "kept").entity_id
     skipped = registry.async_get_or_create("sensor", "solar", "skipped").entity_id
-    hass.data["recorder_instance"] = SimpleNamespace(
-        entity_filter=lambda entity_id: entity_id != skipped
+    recorder = SimpleNamespace(
+        entity_filter=lambda entity_id: entity_id != skipped,
+        exclude_event_types=set(),
     )
+    hass.data["recorder_instance"] = recorder
     try:
         hass.states.async_set(
             kept,
             "1",
-            {"forecast": "x" * 1000, "unit_of_measurement": "W"},
+            {"forecast": "x" * 1000, "unit_of_measurement": "W", "attribution": "x"},
             state_info={"unrecorded_attributes": frozenset({"forecast"})},
         )
         hass.states.async_set(skipped, "1", {"forecast": "x" * 1000})
         insights.drain()
+        solar = insights.collector._buckets[-1].domains["solar"]  # noqa: SLF001
+        assert solar.attribute_bytes == len(b'{"unit_of_measurement":"W"}')
+        assert list(solar.attribute_entities) == [kept]
+        # A recorder that stores no state changes serializes nothing
+        recorder.exclude_event_types = {"state_changed"}
+        hass.states.async_set(kept, "2", {"unit_of_measurement": "kW"})
+        insights.drain()
+        assert solar.attribute_bytes == len(b'{"unit_of_measurement":"W"}')
     finally:
         del hass.data["recorder_instance"]
-    solar = insights.collector._buckets[-1].domains["solar"]  # noqa: SLF001
-    assert solar.attribute_bytes == len(b'{"unit_of_measurement":"W"}')
-    assert list(solar.attribute_entities) == [kept]
+    # Saves belong to whoever saves: the wrapper looks like the original and
+    # the sampler looks through it
+    assert insights.stores.wrapper_code in insights.sampler.skip_codes
     assert await hass.config_entries.async_unload(entry.entry_id)
