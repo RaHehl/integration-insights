@@ -61,6 +61,7 @@ def test_recorder_warnings_about_attributes_count_for_the_entity() -> None:
         )
     }
     assert rows["solar"].warning == 2
+    assert rows["solar"].oversized == 2
     assert rows["solar"].loggers == {RECORDER_SCHEMA_LOGGER: 2}
     # Without an integration for the entity it stays with the recorder
     assert rows["recorder"].warning == 2

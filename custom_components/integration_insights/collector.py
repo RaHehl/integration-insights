@@ -55,6 +55,8 @@ class LogCounts(NamedTuple):
     warning: int
     error: int  # error and critical
     loggers: Counter[str]  # warnings and errors by logger
+    # Of the warnings: the recorder's about attributes too large to store
+    oversized: int = 0
 
 
 class StoreWrites(NamedTuple):
@@ -134,6 +136,7 @@ class _Domain:
     log_info: int = 0
     log_warning: int = 0
     log_error: int = 0
+    log_oversized: int = 0
     log_loggers: Counter[str] = field(default_factory=Counter)
     # Files written through the storage helper
     store_writes: int = 0
@@ -183,6 +186,7 @@ class _Domain:
         self.log_info += other.log_info
         self.log_warning += other.log_warning
         self.log_error += other.log_error
+        self.log_oversized += other.log_oversized
         self.log_loggers.update(other.log_loggers)
         self.store_writes += other.store_writes
         self.store_bytes += other.store_bytes
@@ -212,6 +216,7 @@ class _Domain:
         self.log_info += sign * other.log_info
         self.log_warning += sign * other.log_warning
         self.log_error += sign * other.log_error
+        self.log_oversized += sign * other.log_oversized
         self.store_writes += sign * other.store_writes
         self.store_bytes += sign * other.store_bytes
 
@@ -402,6 +407,7 @@ class Collector:
             stats.log_info += record.info
             stats.log_warning += record.warning
             stats.log_error += record.error
+            stats.log_oversized += record.oversized
             stats.log_loggers = _capped(stats.log_loggers, record.loggers)
 
     def add_store_writes(self, writes: list[StoreWrites], now: float) -> None:
@@ -597,7 +603,7 @@ class Collector:
         sums: dict[str, list[int]] = {}
         for part in parts:
             for domain, stats in part.domains.items():
-                row = sums.setdefault(domain, [0] * 17)
+                row = sums.setdefault(domain, [0] * 18)
                 row[0] += stats.cpu_ns
                 row[1] += stats.executor_cpu_ns + stats.thread_cpu_ns
                 row[2] += stats.samples
@@ -615,7 +621,8 @@ class Collector:
                 row[14] += stats.store_writes
                 row[15] += stats.store_bytes
                 row[16] += stats.log_info
-        idle = sums.pop("idle", [0] * 17)
+                row[17] += stats.log_oversized
+        idle = sums.pop("idle", [0] * 18)
         longest = self._longest(now, minutes)
         integrations = []
         for domain, (
@@ -636,6 +643,7 @@ class Collector:
             store_writes,
             store_bytes,
             log_info,
+            log_oversized,
         ) in sorted(
             sums.items(), key=lambda item: (-(item[1][0] + item[1][1]), item[0])
         ):
@@ -668,6 +676,8 @@ class Collector:
                 item["log_info_per_min"] = round(log_info / span, 2)
                 item["log_warnings_per_min"] = round(log_warning / span, 2)
                 item["log_errors_per_min"] = round(log_error / span, 2)
+                if log_oversized:
+                    item["log_oversized_per_min"] = round(log_oversized / span, 2)
             if store_writes:
                 item["store_writes_per_min"] = round(store_writes / span, 2)
                 item["store_kib_per_min"] = round(store_bytes / 1024 / span, 2)
@@ -872,6 +882,7 @@ def _item(domain: str, stats: _Domain, span: float) -> dict[str, Any]:
             "info_per_min": round(stats.log_info / span, 2),
             "warnings_per_min": round(stats.log_warning / span, 2),
             "errors_per_min": round(stats.log_error / span, 2),
+            "oversized_per_min": round(stats.log_oversized / span, 2),
             "loggers": {
                 name: round(count / span, 2)
                 for name, count in _ranked(stats.log_loggers, TOP_LOGGERS)

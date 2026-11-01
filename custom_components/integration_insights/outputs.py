@@ -108,7 +108,8 @@ class LogCounter(logging.Handler):
         """Return the counts since the last drain, by integration.
 
         Recorder warnings about an entity's attributes count for the
-        integration of the entity, if it has one.
+        integration of the entity, if it has one, and apart as oversized:
+        the integration did not log them.
         """
         with self._lock:
             counts, self._counts = self._counts, {}
@@ -117,7 +118,7 @@ class LogCounter(logging.Handler):
 
         def add(domain: str, name: str, levels: list[int]) -> None:
             if (row := rows.get(domain)) is None:
-                row = rows[domain] = [0, 0, 0, 0, Counter()]
+                row = rows[domain] = [0, 0, 0, 0, Counter(), 0]
             for slot, count in enumerate(levels):
                 row[slot] += count
             if noted := levels[WARNING] + levels[ERROR]:
@@ -126,11 +127,9 @@ class LogCounter(logging.Handler):
         for name, levels in counts.items():
             add(owner_of(name), name, levels)
         for entity_id, warnings in oversized.items():
-            add(
-                entity_owner(entity_id) or owner_of(RECORDER_SCHEMA_LOGGER),
-                RECORDER_SCHEMA_LOGGER,
-                [0, 0, warnings, 0],
-            )
+            domain = entity_owner(entity_id) or owner_of(RECORDER_SCHEMA_LOGGER)
+            add(domain, RECORDER_SCHEMA_LOGGER, [0, 0, warnings, 0])
+            rows[domain][5] += warnings
         return [LogCounts(domain, *row) for domain, row in rows.items()]
 
 

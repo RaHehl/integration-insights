@@ -53,7 +53,15 @@ const ms = (value) =>
   value >= 10 ? Math.round(value).toLocaleString() : value.toFixed(1);
 
 // Less than one in ten minutes still shows as more than nothing
-const amount = (value) => (value > 0 && value < 0.1 ? "<0.1" : ms(value));
+const amount = (value) => (!value ? "0" : value > 0 && value < 0.1 ? "<0.1" : ms(value));
+
+// One sentence for an integration's log records, the same in every view
+const logSummary = (lg) =>
+  `${amount(lg.warnings_per_min)} warnings, ${amount(lg.errors_per_min)} errors, ` +
+  `${amount(lg.debug_per_min)} debug and ${amount(lg.info_per_min)} info lines per min` +
+  (lg.oversized_per_min
+    ? `. ${amount(lg.oversized_per_min)} of the warnings are the recorder's, about attributes too large to store`
+    : "");
 
 // A rate that may be missing: an empty cell is clearer than a zero
 const rate = (value) => (value ? amount(value) : "");
@@ -399,6 +407,8 @@ const STYLE = `
   }
   @media (max-width: 360px) {
     .card-head.cpu, .row.cpu { grid-template-columns: 1fr 64px 56px; }
+    .card-head.states, .row.states { grid-template-columns: 1fr 48px 48px 48px; gap: 6px; }
+    .card-head.files, .row.files { grid-template-columns: 1fr 52px 52px; gap: 6px; }
     .col-bg { display: none; }
   }
 `;
@@ -776,7 +786,7 @@ class IntegrationInsightsPanel extends HTMLElement {
     if (item.logs) {
       const lg = item.logs;
       lines.push(
-        `Log records: ${lg.warnings_per_min} warnings and ${lg.errors_per_min} errors per min, ${lg.debug_per_min} debug and ${lg.info_per_min} info`
+        `Log records: ${logSummary(lg)}`
       );
       for (const [name, value] of Object.entries(lg.loggers)) {
         lines.push(`- ${name}: ${value} per min`);
@@ -975,10 +985,7 @@ class IntegrationInsightsPanel extends HTMLElement {
     const rows = sorted
       .map((item) => {
         const expanded = this._expanded.has(item.domain);
-        const name =
-          item.domain === "core"
-            ? "Home Assistant core and unassigned work"
-            : this._data.names[item.domain] || item.domain;
+        const name = this._displayName(item.domain);
         const width = top ? Math.max((item.cpu_ms_per_min / top) * 100, 1) : 0;
         const badge = item.low_confidence
           ? `<span class="badge" title="Fewer than 20 samples: the number is rough">few samples</span>`
@@ -1034,12 +1041,12 @@ class IntegrationInsightsPanel extends HTMLElement {
         <div class="sub">same state, other attributes. Costs as much as a change</div></div>
       <div class="tile"><div class="label">Repeated</div>
         <div class="value">${ms(repeated)} per min</div>
-        <div class="sub">nothing changed. Cheap, only the last reported time moves and state_reported fires</div></div>
+        <div class="sub">nothing changed. Cheap, only the last reported time moves</div></div>
       <div class="tile"><div class="label">Changed attributes</div>
         <div class="value">${ms(attributeKib)} KiB per min</div>
         <div class="sub">serialized for the recorder and sent to dashboards on each change</div></div>
       <div class="tile"><div class="label">Busiest</div>
-        <div class="value">${busiest ? escapeHtml(this._data.names[busiest.domain] || busiest.domain) : "none"}</div>
+        <div class="value">${busiest ? escapeHtml(this._displayName(busiest.domain)) : "none"}</div>
         <div class="sub">${busiest ? `${ms(busiest.state_writes_per_min)} writes per min` : "no state writes yet"}</div></div>
       <div class="tile"><div class="label">Window</div>
         <div class="value">${report.window_minutes} min</div>
@@ -1052,7 +1059,7 @@ class IntegrationInsightsPanel extends HTMLElement {
     const rows = integrations
       .map((item) => {
         const expanded = this._expanded.has(item.domain);
-        const name = this._data.names[item.domain] || item.domain;
+        const name = this._displayName(item.domain);
         const width = Math.max(((item[key] || 0) / top) * 100, 1);
         return `<div class="row states" data-action="toggle" data-value="${escapeHtml(item.domain)}" role="button" tabindex="0" aria-expanded="${expanded}">
             <div class="name">
@@ -1138,7 +1145,7 @@ class IntegrationInsightsPanel extends HTMLElement {
     const row = (table, item, cells) => {
       const key = `${table}:${item.domain}`;
       const expanded = this._expanded.has(key);
-      const name = this._data.names[item.domain] || item.domain;
+      const name = this._displayName(item.domain);
       return `<div class="row ${table === "files" ? "files" : "states"}" data-action="toggle" data-value="${escapeHtml(key)}" role="button" tabindex="0" aria-expanded="${expanded}">
           <div class="name">
             <div class="title"><svg class="chev" viewBox="0 0 24 24"><path fill="currentColor" d="M8.59,16.58L13.17,12L8.59,7.41L10,6L16,12L10,18L8.59,16.58Z"></path></svg>
@@ -1198,12 +1205,12 @@ class IntegrationInsightsPanel extends HTMLElement {
     const item = detail.item || {};
     const chips = (entries, unit) =>
       Object.entries(entries || {})
-        .map(([name, value]) => `<span class="chip">${escapeHtml(name)} · ${value}${unit}</span>`)
+        .map(([name, value]) => `<span class="chip">${escapeHtml(name)} · ${amount(value)}${unit}</span>`)
         .join("");
     const parts = [];
     if (table === "logs" && item.logs) {
       const lg = item.logs;
-      parts.push(`<p class="note">${lg.warnings_per_min} warnings, ${lg.errors_per_min} errors, ${lg.debug_per_min} debug and ${lg.info_per_min} info lines per minute.</p>`);
+      parts.push(`<p class="note">${logSummary(lg)}.</p>`);
       parts.push(`<h3>Loggers with the most warnings and errors</h3><div class="pairs">${chips(item.logs.loggers, "/min") || "none"}</div>`);
     }
     if (table === "files" && item.storage) {
@@ -1222,6 +1229,12 @@ class IntegrationInsightsPanel extends HTMLElement {
     const active = this._sort === key;
     const arrow = active ? (this._sortAscending ? " ▲" : " ▼") : "";
     return `<button class="num sort${active ? " active" : ""} ${extra}" data-action="sort" data-value="${key}" aria-sort="${active ? (this._sortAscending ? "ascending" : "descending") : "none"}">${sortLabel(label)}${arrow}</button>`;
+  }
+
+  _displayName(domain) {
+    return domain === "core"
+      ? "Home Assistant core and unassigned work"
+      : this._data.names[domain] || domain;
   }
 
   _ownerName(owner) {
@@ -1379,7 +1392,7 @@ class IntegrationInsightsPanel extends HTMLElement {
         .map(([name, value]) => `<span class="chip">${escapeHtml(name)} · ${value}/min</span>`)
         .join("");
       parts.push(
-        `<h3>Log</h3><p class="note">${lg.warnings_per_min} warnings and ${lg.errors_per_min} errors per minute, ${lg.debug_per_min} debug and ${lg.info_per_min} info lines.</p><div class="pairs">${chips}</div>`
+        `<h3>Log</h3><p class="note">${logSummary(lg)}.</p><div class="pairs">${chips}</div>`
       );
     }
     if (item.storage) {

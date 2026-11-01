@@ -663,3 +663,19 @@ def test_frequent_storage_writes_are_found() -> None:
     )
     # Built-in integrations save what the user set up, such as the entity registry
     assert find(_summary([item]), lambda _: detail, {}, built_in=lambda _d: True) == []
+
+
+def test_recorder_warnings_back_large_attributes_not_noisy_logs() -> None:
+    """The integration did not log the recorder's warnings about its attributes."""
+    item = {
+        **_item("foo"),
+        "attribute_kib_per_min": 150,
+        "log_warnings_per_min": 12,
+        "log_oversized_per_min": 12,
+    }
+    detail = _detail(state_writes={"attribute_entities": {"sensor.foo": 150}})
+    findings = find(_summary([item]), lambda _: detail, {})
+    assert _keys(findings) == [("big_attributes", NOTICE, "foo")]
+    assert findings[0].evidence[-1] == (
+        "recorder warnings about attributes too large to store: 12/min"
+    )

@@ -461,6 +461,7 @@ async def test_entities_without_a_registry_entry_count_for_their_integration(
     assert row["logs"]["loggers"] == {
         "homeassistant.components.recorder.db_schema": row["logs"]["warnings_per_min"]
     }
+    assert row["logs"]["oversized_per_min"] == row["logs"]["warnings_per_min"]
     assert "recorder" not in {item["domain"] for item in report["integrations"]}
     assert await hass.config_entries.async_unload(entry.entry_id)
 
