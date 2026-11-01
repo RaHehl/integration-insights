@@ -64,6 +64,8 @@ from .sampler import Sampler, SamplerError
 _LOGGER = logging.getLogger(__name__)
 DRAIN_INTERVAL = timedelta(seconds=10)
 TOP_ENTITIES = 20
+# States set by hand under made-up entity ids must not grow the cache forever
+MAX_CACHED_ENTITIES = 50_000
 KEPT_SNAPSHOTS = 10
 # Left out of findings after a start.
 STARTUP_MINUTES = 5
@@ -227,18 +229,29 @@ class Insights:
         update per write.
         """
         loop = self.hass.loop
+        loop_thread = threading.get_ident()
         owner = self._entity_owner
-        # entity_id -> integration, cached for the hot path; entities not
-        # known yet are looked up again
-        platforms: dict[str, str] = {}
+        sources = entity_sources(self.hass)
+        # entity_id -> integration or None, cached for the hot path. Entities
+        # without a registry entry come and go without an event, so the cache
+        # starts over whenever the number of entity sources changes.
+        platforms: dict[str, str | None] = {}
+        known = [len(sources)]
         pending = self._pending_attributes
         row_of = self._state_row
 
         def count(entity_id: str, slot: int) -> str | None:
-            if (platform := platforms.get(entity_id)) is None:
-                if (platform := owner(entity_id)) is None:
-                    return None
-                platforms[entity_id] = platform
+            if len(sources) != known[0]:
+                platforms.clear()
+                known[0] = len(sources)
+            if entity_id in platforms:
+                platform = platforms[entity_id]
+            else:
+                if len(platforms) >= MAX_CACHED_ENTITIES:
+                    platforms.clear()
+                platform = platforms[entity_id] = owner(entity_id)
+            if platform is None:
+                return None
             row = row_of(platform)
             row[slot] += 1
             if slot != 1:
@@ -250,27 +263,37 @@ class Insights:
 
         @callback
         def changed(data: Any) -> bool:
-            # The same state with other attributes still reaches every
-            # listener and the recorder like a change
-            old, new = data["old_state"], data["new_state"]
-            same = old is not None and new is not None and old.state == new.state
-            entity_id = data["entity_id"]
-            platform = count(entity_id, 2 if same else 0)
-            # Core keeps the old attributes object when nothing in it changed,
-            # so only new attributes are measured
-            if (
-                platform is not None
-                and new is not None
-                and (old is None or new.attributes is not old.attributes)
-            ):
-                if not pending:
-                    loop.call_soon(measure)
-                pending.append((platform, entity_id, new.attributes))
+            # Events fired by hand can hold anything; a filter must not raise
+            try:
+                # The same state with other attributes still reaches every
+                # listener and the recorder like a change
+                old, new = data["old_state"], data["new_state"]
+                same = old is not None and new is not None and old.state == new.state
+                entity_id = data["entity_id"]
+                platform = count(entity_id, 2 if same else 0)
+                # Core keeps the old attributes object when nothing in it
+                # changed, so only new attributes are measured. A state set
+                # from another thread is counted but not measured.
+                if (
+                    platform is not None
+                    and new is not None
+                    and (old is None or new.attributes is not old.attributes)
+                    and threading.get_ident() == loop_thread
+                ):
+                    if not pending:
+                        loop.call_soon(measure)
+                    pending.append((platform, entity_id, new.attributes))
+            except Exception:  # noqa: BLE001
+                pass
             return False
 
         @callback
         def reported(data: Any) -> bool:
-            count(data["entity_id"], 1)
+            # A plain try: suppress() costs a context manager on every write
+            try:  # noqa: SIM105
+                count(data["entity_id"], 1)
+            except Exception:  # noqa: BLE001
+                pass
             return False
 
         @callback

@@ -463,3 +463,38 @@ async def test_entities_without_a_registry_entry_count_for_their_integration(
     }
     assert "recorder" not in {item["domain"] for item in report["integrations"]}
     assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_state_filters_survive_odd_events_and_threads(
+    hass: HomeAssistant,
+) -> None:
+    """Events fired by hand and states set from a thread never raise in a filter."""
+    entry = MockConfigEntry(domain=DOMAIN)
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    insights = entry.runtime_data
+    entity_id = (
+        er.async_get(hass).async_get_or_create("sensor", "solar", "u1").entity_id
+    )
+    with patch("homeassistant.core._LOGGER.exception") as logged:
+        hass.bus.async_fire(
+            "state_changed",
+            {"entity_id": entity_id, "old_state": None, "new_state": {"state": "1"}},
+        )
+        hass.bus.async_fire("state_changed", {"entity_id": entity_id})
+        await hass.async_block_till_done()
+    assert not logged.called
+    # From a worker thread: counted, not measured, nothing scheduled off-loop
+    await hass.async_add_executor_job(
+        hass.states.async_set, entity_id, "2", {"big": "x" * 100}
+    )
+    await hass.async_block_till_done()
+    insights.drain()
+    row = insights._state_writes.get("solar")  # noqa: SLF001
+    assert row is None  # moved into the collector by the drain
+    sw = next(
+        item for item in insights.report()["integrations"] if item["domain"] == "solar"
+    )["state_writes"]
+    assert sw["changes_per_min"] > 0
+    assert "attribute_entities" not in sw
+    assert await hass.config_entries.async_unload(entry.entry_id)
