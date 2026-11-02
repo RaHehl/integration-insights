@@ -37,8 +37,8 @@ _LOGGER = logging.getLogger(__name__)
 
 # Only code compiled at runtime can add rows without bound
 MAX_ROWS = 10_000
-# Coroutines remembered between two drains
-MAX_COROUTINES = 50_000
+# Entries in one generation of a cache; two generations are kept
+MAX_COROUTINES = 25_000
 
 
 # A callback this long is a block: the watchdog looks at the stack
@@ -123,6 +123,14 @@ class BlockRecord(NamedTuple):
     blocker: tuple[str, str] | None  # (domain, function) from the stack, if seen
 
 
+def _turn_over(gens: list[dict[Any, Any]]) -> None:
+    """Make the new generation the old one, and the emptied old one new."""
+    old = gens[1]
+    old.clear()
+    gens[1] = gens[0]
+    gens[0] = old
+
+
 class _Row:
     """What one owner did on the loop."""
 
@@ -165,16 +173,26 @@ class LoopTiming:
         self._loop = loop
         self._blocker = blocker
         self._rows: dict[_Key, _Row] = {}
-        # Coroutine -> its row, cleared with the rows; a coroutine that
-        # finished stays referenced until the next drain, nothing else
-        self._coro_rows: dict[Any, _Row] = {}
+        # Two generations of each cache, [new, old]: entries hit since the
+        # last drain, and those of the drain before. A hit in the old one
+        # moves the entry to the new one. A drain swaps them and empties the
+        # one that becomes new, so an object, a coroutine or a row nobody used
+        # for a whole drain interval is let go, and a drain never walks the
+        # entries in use.
+        # Coroutine -> its row
+        self._coro_gens: list[dict[Any, _Row]] = [{}, {}]
         # (function, id(object), entry) -> (object, row); the object is kept
-        # so the id stays its own until the next drain
-        self._method_rows: dict[tuple[Any, int, str | None], tuple[Any, _Row]] = {}
+        # so the id stays its own while the entry is
+        self._method_gens: list[dict[tuple[Any, int, str | None], tuple[Any, _Row]]] = [
+            {},
+            {},
+        ]
         self._blocks: deque[BlockRecord] = deque(maxlen=MAX_BLOCKS)
-        # Start and row of the callback running now; the watchdog reads the
-        # start, a drain keeps the row of the callback that drains
-        self._running: list[Any] = [0, None]
+        # Start of the callback running now, read by the watchdog
+        self._running = [0]
+        # Rows of the callbacks running now, the innermost last: a drain from
+        # inside one keeps them, they have not counted themselves yet
+        self._running_rows: list[_Row | None] = []
         self._seen: dict[int, tuple[str, str] | None] = {}
         self._active = [False]
         self._overhead = [0]
@@ -209,8 +227,9 @@ class LoopTiming:
         original = events.Handle._run  # noqa: SLF001
         loop = self._loop
         rows = self._rows
-        coro_rows = self._coro_rows
-        method_rows = self._method_rows
+        coro_gens = self._coro_gens
+        method_gens = self._method_gens
+        running_rows = self._running_rows
         kinds = _KINDS
         resolves = self._resolves
         function_type = FunctionType
@@ -323,7 +342,11 @@ class LoopTiming:
                     # Every step of a task runs the same coroutine for the same
                     # object in the same context: resolved once
                     coro = owner.get_coro()
-                    row = coro_rows.get(coro)
+                    coro_rows = coro_gens[0]
+                    if (row := coro_rows.get(coro)) is None and (
+                        row := coro_gens[1].get(coro)
+                    ) is not None:
+                        coro_rows[coro] = row
                 else:
                     # The same row for every call in the same context. A
                     # partial or a HassJob passed as argument is often a
@@ -390,7 +413,12 @@ class LoopTiming:
                         id(pin),
                         entry.entry_id if entry is not None else None,
                     )
-                    if (hit := method_rows.get(mkey)) is not None and hit[0] is pin:
+                    method_rows = method_gens[0]
+                    if (hit := method_rows.get(mkey)) is None and (
+                        hit := method_gens[1].get(mkey)
+                    ) is not None:
+                        method_rows[mkey] = hit
+                    if hit is not None and hit[0] is pin:
                         row = hit[1]
                 if row is None:
                     resolves[0] += 1
@@ -414,15 +442,15 @@ class LoopTiming:
                         "Could not attribute a callback of the event loop",
                         exc_info=True,
                     )
-            outer, outer_row = running
-            running[1] = row
+            outer = running[0]
+            running_rows.append(row)
             start = running[0] = perf()
             try:
                 original(handle)
             finally:
                 end = perf()
                 running[0] = outer
-                running[1] = outer_row
+                running_rows.pop()
                 elapsed = end - start
                 if row is not None:
                     row.count += 1
@@ -501,29 +529,23 @@ class LoopTiming:
         """Return what ran since the last drain and start over.
 
         Runs on the loop, like the wrapper, and works in place: the wrapper
-        holds the same dicts. Rows that ran stay, with their counts reset,
-        so the caches pointing at them stay valid; rows that did not run are
-        dropped together with their cache entries, which also lets go of
-        the objects those entries hold.
+        holds the same rows and generation lists. Rows that ran stay, with
+        their counts reset; rows that did not run are dropped. The caches
+        turn over a generation, which costs only the entries let go.
         """
         rows = self._rows
-        # The callback that drains has not counted itself yet
-        busy = self._running[1]
-        idle = {id(row) for row in rows.values() if not row.count and row is not busy}
-        if idle:
-            coro_rows = self._coro_rows
-            for coro in [c for c, row in coro_rows.items() if id(row) in idle]:
-                del coro_rows[coro]
-            method_rows = self._method_rows
-            for mkey in [k for k, (_, row) in method_rows.items() if id(row) in idle]:
-                del method_rows[mkey]
-            for key in [k for k, row in rows.items() if id(row) in idle]:
-                del rows[key]
-        # A coroutine that finished keeps nothing but itself alive; still,
-        # there is no point in remembering it
-        coro_rows = self._coro_rows
-        for coro in [c for c in coro_rows if getattr(c, "cr_frame", False) is None]:
-            del coro_rows[coro]
+        # The new generation becomes the old one. Every entry in it was hit
+        # since the last drain, so its row ran or is running; the entries of
+        # rows that did not run go with the old generation, before those rows
+        # are dropped.
+        _turn_over(self._coro_gens)
+        _turn_over(self._method_gens)
+        # The callbacks running now have not counted themselves yet
+        busy = {id(row) for row in self._running_rows}
+        for key in [
+            key for key, row in rows.items() if not row.count and id(row) not in busy
+        ]:
+            del rows[key]
         records = [
             CallbackRecord(
                 row.label, key[2], row.count, row.total_ns, row.max_ns, row.max_at

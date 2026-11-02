@@ -4,10 +4,12 @@ import asyncio
 from asyncio import events
 import contextvars
 import functools
+import gc
 import time
 from types import FrameType, SimpleNamespace
 from typing import Any
 from unittest.mock import patch
+import weakref
 
 import pytest
 
@@ -432,6 +434,93 @@ def test_a_callback_that_drains_keeps_its_own_time() -> None:
         mine = [r for r in [*seen, *records] if r.label.endswith("drain_and_work")]
         assert sum(r.calls for r in mine) == 3
         assert sum(r.total_ns for r in mine) >= 3 * 0.02 * 1e9 * 0.9
+    finally:
+        timing.stop()
+        loop.close()
+
+
+class _OneShot:
+    def run(self) -> None:
+        pass
+
+
+def test_caches_let_go_of_what_nobody_used_for_a_drain_interval() -> None:
+    """An entry hit again moves back without a new resolve; an unused one is let go."""
+    loop = asyncio.new_event_loop()
+    timing = LoopTiming(loop)
+    worker = _Worker()
+    try:
+        timing.start()
+        shots = [_OneShot() for _ in range(50)]
+        alive = [weakref.ref(shot) for shot in shots]
+        for shot in shots:
+            loop.call_soon(shot.run)
+        loop.call_soon(worker.tick)
+        loop.run_until_complete(asyncio.sleep(0))
+        del shot, shots
+        timing.drain()
+        resolved = timing.resolves
+        # Hit in the old generation: counted on its row without a new resolve
+        loop.call_soon(worker.tick)
+        loop.run_until_complete(asyncio.sleep(0))
+        # Only the new task that runs the loop is resolved
+        assert timing.resolves == resolved + 1
+        records = _records(timing)
+        assert records[(f"{__name__}._Worker.tick", None)] == 1
+        # The one-shot objects were not used for a whole interval: let go
+        timing.drain()
+        gc.collect()
+        assert not any(ref() for ref in alive)
+        # A method used again after an idle interval counts from scratch
+        loop.call_soon(worker.tick)
+        loop.run_until_complete(asyncio.sleep(0))
+        assert _records(timing)[(f"{__name__}._Worker.tick", None)] == 1
+        assert timing.errors == 0
+    finally:
+        timing.stop()
+        loop.close()
+
+
+class _Nesting:
+    """Runs another handle inside its own, as nest_asyncio's loop does."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, inner: Any) -> None:
+        self.loop = loop
+        self.inner = inner
+        self.nest = False
+
+    def run(self) -> None:
+        if self.nest:
+            events.Handle(self.inner, (), self.loop)._run()  # noqa: SLF001
+
+
+def test_a_drain_inside_a_nested_callback_keeps_the_outer_row() -> None:
+    """Every running callback keeps its row, not only the innermost one."""
+    loop = asyncio.new_event_loop()
+    timing = LoopTiming(loop)
+    inside: list[Any] = []
+    nesting = _Nesting(loop, lambda: inside.extend(timing.drain()))
+    label = f"{__name__}._Nesting.run"
+
+    def calls(records: list[Any]) -> int:
+        return sum(r.calls for r in records if r.label == label)
+
+    def step(nest: bool = False) -> None:
+        nesting.nest = nest
+        loop.call_soon(nesting.run)
+        loop.run_until_complete(asyncio.sleep(0))
+
+    try:
+        timing.start()
+        step()
+        assert calls(timing.drain()) == 1
+        step(nest=True)
+        step()
+        assert calls(timing.drain()) == 2
+        # Later calls keep counting on a row that is still reported
+        for _ in range(3):
+            step()
+            assert calls(timing.drain()) == 1
     finally:
         timing.stop()
         loop.close()
