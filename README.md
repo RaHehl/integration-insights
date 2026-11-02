@@ -28,9 +28,13 @@ Measuring begins once Home Assistant has started, so the set-up of integrations 
 
 ## Install
 
-1. Search for Integration Insights in HACS and download it. Until it is listed there, add `https://github.com/RaHehl/integration-insights` as a custom repository of type Integration first.
+[![Open in HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=RaHehl&repository=integration-insights&category=integration)
+
+1. Download Integration Insights in HACS, with the button above or by searching for it.
 2. Restart Home Assistant.
-3. Settings > Devices & services > Add integration > Integration Insights.
+3. Add the integration:
+
+   [![Add integration](https://my.home-assistant.io/badges/config_flow_start.svg)](https://my.home-assistant.io/redirect/config_flow_start/?domain=integration_insights)
 
 A sidebar entry "Integration Insights" appears for admins.
 
